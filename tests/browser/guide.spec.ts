@@ -31,7 +31,7 @@ test('使用指南：侧栏分组、五步流程、铺设与朝向规则、FAQ�
  const h=await mock(page);await expect(page.locator('.nav-group-label')).toHaveText(['作业','资源']);
  await page.locator('.sidebar').getByRole('button',{name:'使用指南',exact:true}).click();await expect(page.getByRole('heading',{name:'使用指南',exact:true})).toBeVisible();
  await expect(page.getByTestId('user-guide')).toBeVisible();await expect(page.locator('.guide-flow>li')).toHaveCount(5);await expect(page.locator('.sidebar .nav-item.active')).toHaveText('使用指南');
- await expect(page.getByTestId('user-guide')).toContainText('同一行共线');await expect(page.getByTestId('user-guide')).toContainText('至少相距 8 cm');await expect(page.getByTestId('user-guide')).toContainText('约 5.7°');
+ await expect(page.getByTestId('user-guide')).toContainText('同一行共线');await expect(page.getByTestId('user-guide')).toContainText('至少相距 8 cm');await expect(page.getByTestId('user-guide')).toContainText('约 5.7°');await expect(page.getByTestId('user-guide')).toContainText('每到下一码纠正一次');await expect(page.getByTestId('user-guide')).toContainText('橙色偏离码');
  await page.getByText('地图点位草稿已保存，为什么没有导航地图？',{exact:true}).click();await expect(page.locator('.guide-faq')).toContainText('只保存点位草稿');
  await page.locator('.guide-page').evaluate(el=>{el.scrollTop=0;});await readyFonts(page);await page.screenshot({path:'logs/ui-commercial-guide.png',fullPage:true});
  await page.getByRole('button',{name:'前往扫描',exact:true}).click();await expect(page.locator('.left-panel .panel-title')).toHaveText('扫描控制');await expect(page.getByTestId('workflow-steps')).toBeVisible();

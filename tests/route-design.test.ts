@@ -6,7 +6,7 @@ import {compileDesignedRoute} from '../web/backend/src/route-design';
 import {createApp} from '../web/backend/src/server';
 import {defaults,generate,mapSchema,validate,distance,exitPoint,type FieldMap,type Point} from '../web/shared/model';
 import {generateBoards} from '../web/shared/boards';
-import {orthogonalRoute,routeCorners,snapRoutePoint} from '../web/shared/route-design';
+import {orthogonalRoute,routeCorners,snapRoutePoint,chainRouteGroups} from '../web/shared/route-design';
 const positions=[{x:0,y:0},{x:1,y:0},{x:1,y:1},{x:0,y:1}];
 function fixture(points=positions):FieldMap {
  const map=generate({...defaults,count:1,startRow:1});map.id='scan-path-editor-test';
@@ -48,11 +48,34 @@ test('编译器：直线途经组中心也切分，非组起终点被截去',()=
  const result=compileDesignedRoute(fixture([{x:0,y:0},{x:1,y:0},{x:2,y:0}]),[{x:-.5,y:0},{x:2.5,y:0}],0);
  assertMissionShape(result.map);assert.equal(result.map.motionSegments!.length,2);assert.deepEqual(result.trimmed,{startM:.5,endM:.5});assert.equal(result.lengthM,2);
 });
-test('编译器：端点3厘米容差保留正交，不把中心强行投影改成斜线',()=>{
- const source=fixture([{x:0,y:.03},{x:1,y:.029999}]);
+test('编译器：起终点自动吸附精确组中心，超过3cm也不阻碍编辑',()=>{
+ const source=fixture([{x:0,y:.09},{x:1,y:.09},{x:2,y:.09}]);
+ const result=compileDesignedRoute(source,[{x:-.4,y:0},{x:2.4,y:0}],0);assertMissionShape(result.map);
+ assert.deepEqual(result.routeGroups.usedIds,[0,1,2]);assert.equal(result.map.motionSegments!.length,2);
+ for(const segment of result.map.motionSegments!)for(const [id,p] of [[segment.fromId,segment.points[0]!],[segment.toId,segment.points.at(-1)!]] as const)assert.equal(distance(source.tags.find(t=>t.id===id)!,p),0);
+ const distant=compileDesignedRoute(source,[{x:-.4,y:-1},{x:2.4,y:-1}],0);assertMissionShape(distant.map);
+ assert.deepEqual(distant.routeGroups.usedIds,[0,1,2]);assert.equal(distant.map.motionSegments!.length,2);
+});
+test('编译器：沿途所有共线中途码独立切分，偏离码跳过并报告厘米距离',()=>{
+ const source=fixture([{x:0,y:0},{x:.5,y:0},{x:1,y:0},{x:1.5,y:0},{x:2,y:0},{x:.75,y:.09}]);
+ const result=compileDesignedRoute(source,[{x:-.2,y:0},{x:2.2,y:0}],0);assertMissionShape(result.map);
+ assert.deepEqual(result.map.motionSegments!.map(s=>[s.fromId,s.toId]),[[0,1],[1,2],[2,3],[3,4]]);
+ assert.deepEqual(result.routeGroups.usedIds,[0,1,2,3,4]);assert.equal(result.routeGroups.skipped.length,1);
+ assert.equal(result.routeGroups.skipped[0]!.id,5);assert.equal(result.routeGroups.skipped[0]!.distanceM,.09);
+ assert.ok(result.map.motionSegments!.every(s=>s.points.every(p=>p.y===0)));
+});
+test('编译器：10cm包含边界、超出不标记，偏离最近端点选择可串联网格节点',()=>{
+ const source=fixture([{x:0,y:0},{x:.5,y:0},{x:1,y:0},{x:.25,y:.1},{x:.75,y:.10001}]);
  const result=compileDesignedRoute(source,[{x:0,y:0},{x:1,y:0}],0);assertMissionShape(result.map);
- assert.deepEqual(result.map.tags.map(t=>({x:t.x,y:t.y})),[{x:0,y:.03},{x:1,y:.029999}]);
- assert.throws(()=>compileDesignedRoute(fixture([{x:0,y:.030001},{x:1,y:0}]),[{x:0,y:0},{x:1,y:0}],0),/两个定位组/);
+ assert.deepEqual(result.routeGroups.skipped.map(node=>node.id),[3]);assert.equal(result.routeGroups.skipped[0]!.distanceM,.1);
+ const endpoint=compileDesignedRoute(fixture([{x:0,y:0},{x:1,y:0},{x:2,y:0},{x:0,y:.09}]),[{x:0,y:.08},{x:2,y:.08}],0);assertMissionShape(endpoint.map);
+ assert.deepEqual(endpoint.routeGroups.usedIds,[0,1,2]);assert.deepEqual(endpoint.routeGroups.skipped.map(node=>node.id),[3]);
+});
+test('编译器：二维网格按原折线顺序串码，转弯处独立切分，不用远端捷径',()=>{
+ const nodes=[{x:0,y:0},{x:.5,y:0},{x:1,y:0},{x:1,y:.5},{x:1,y:1},{x:.5,y:1},{x:0,y:1}];
+ const result=compileDesignedRoute(fixture(nodes),[{x:0,y:.05},{x:1,y:.05},{x:1,y:1},{x:0,y:1}],0);assertMissionShape(result.map);
+ assert.deepEqual(result.routeGroups.usedIds,[0,1,2,3,4,5,6]);assert.equal(result.map.motionSegments!.length,6);
+ assert.deepEqual(result.map.motionSegments!.map(s=>s.direction),['forward','forward','lateral','lateral','reverse','reverse']);
 });
 test('编译器：拒绝斜线、重复点、非有限值、点数/长度超限、缺定位组拐角与过短区间',()=>{
  const source=fixture();
@@ -83,7 +106,8 @@ test('编译器：同组折返与100段/1001点上限',()=>{
 });
 test('交叉验证：编译产物通过真实 Python validate_segments 与 Mission.start（含返回路径）',()=>{
  const maps=[compileDesignedRoute(fixture(),positions,0).map,compileDesignedRoute(fixture(),positions,90).map,
-  compileDesignedRoute(fixture([{x:0,y:0},{x:1,y:0}]),[{x:0,y:0},{x:1,y:0}],60).map];
+  compileDesignedRoute(fixture([{x:0,y:0},{x:1,y:0}]),[{x:0,y:0},{x:1,y:0}],60).map,
+  compileDesignedRoute(fixture([{x:0,y:.09},{x:.5,y:.09},{x:1,y:.09},{x:.75,y:0}]),[{x:0,y:0},{x:1,y:0}],0).map];
  const script=`import json,sys,yaml
 from pathlib import Path
 from greenhouse_navigation.segment_execution import validate_segments
@@ -109,7 +133,7 @@ test('实际API：保存新版本/接纳/任务创建与更新/版本冲突/错�
   const payload={mapId:map.id,baseVersion:1,points:positions,bodyYawDeg:0};
   const saved=await app.inject({method:'POST',url:'/api/route/design',payload});assert.equal(saved.statusCode,200,saved.body);
   const value=saved.json();assert.equal(value.version,2);assert.equal(value.map.coordinateStatus,'reviewed');assert.equal(value.acceptance.kind,'office_test');assert.equal(value.acceptance.accepted,true);assert.equal(value.acceptance.digestValid,true);
-  assertMissionShape(value.map);assert.equal(value.task.mapVersion,2);assert.deepEqual(value.task.rowOrder,value.map.order);
+  assertMissionShape(value.map);assert.deepEqual(value.routeGroups.usedIds,[0,1,2,3]);assert.deepEqual(value.routeGroups.skipped,[]);assert.equal(value.task.mapVersion,2);assert.deepEqual(value.task.rowOrder,value.map.order);
   const custom={...value.task,id:'task-second',forwardSpeed:.12,returnToStart:true};assert.equal((await app.inject({method:'POST',url:'/api/tasks',payload:custom})).statusCode,200);
   const again=await app.inject({method:'POST',url:'/api/route/design',payload:{...payload,baseVersion:2}});assert.equal(again.statusCode,200,again.body);assert.equal(again.json().updatedTasks.length,2);
   const updated=(await app.inject('/api/tasks')).json();assert.ok(updated.every((t:any)=>t.mapVersion===3&&JSON.stringify(t.rowOrder)===JSON.stringify(value.map.order)));assert.equal(updated.find((t:any)=>t.id==='task-second').forwardSpeed,.12);
@@ -120,4 +144,31 @@ test('实际API：保存新版本/接纳/任务创建与更新/版本冲突/错�
   const invalid=await app.inject({method:'POST',url:'/api/route/design',payload:{...payload,bodyYawDeg:999}});assert.equal(invalid.statusCode,400);assert.match(invalid.json().error,/路径参数无效/);
   assert.equal((await app.inject('/api/robot/status')).json().running,false);
  }finally{await app.close();}
+});
+
+test('自动串码预览：10cm沿途投影、精确中心、最近端点与重复经过',()=>{
+ const centers=[{id:0,x:0,y:.08},{id:1,x:.5,y:.08},{id:2,x:1,y:.08},{id:3,x:.5,y:.10001}];
+ const linked=chainRouteGroups([{x:-.4,y:0},{x:1.4,y:0}],centers);
+ assert.deepEqual(linked.nodes.map(n=>n.id),[0,1,2]);
+ assert.deepEqual(linked.points,[{x:0,y:.08},{x:.5,y:.08},{x:1,y:.08}]);
+ const distant=chainRouteGroups([{x:-2,y:-1},{x:3,y:-1}],centers);
+ assert.deepEqual(distant.nodes.map(n=>n.id),[0,1,2]);
+ const returning=chainRouteGroups([{x:0,y:0},{x:1,y:0},{x:0,y:0}],centers.slice(0,3));
+ assert.deepEqual(returning.nodes.map(n=>n.id),[0,1,2,1,0]);
+ const corner=chainRouteGroups([{x:0,y:0},{x:1,y:0},{x:1,y:1}],[{id:0,x:0,y:0},{id:1,x:1,y:0},{id:2,x:1,y:1}]);
+ assert.deepEqual(corner.nodes.map(n=>n.id),[0,1,2]);
+});
+
+test('自动串码预览：偏离码保留提示，输出不含投影内部字段',()=>{
+ const chain=chainRouteGroups([{x:0,y:0},{x:1,y:0}],[{id:0,x:0,y:0},{id:1,x:.5,y:0},{id:2,x:1,y:0},{id:3,x:.25,y:.09}]);
+ assert.deepEqual(chain.nodes.map(n=>n.id),[0,1,2]);assert.deepEqual(chain.skipped,[{id:3,x:.25,y:.09,distanceM:.09}]);
+ assert.ok(chain.points.every(p=>Object.keys(p).sort().join(',')==='x,y'));
+ assert.ok(chain.points.every((p,i)=>!i||p.x===chain.points[i-1]!.x||p.y===chain.points[i-1]!.y));
+});
+
+test('自动串码：原草线上无法接入端点所在网格行的码也标记跳过',()=>{
+ const centers=[{id:0,x:0,y:.08},{id:1,x:2,y:.08},{id:2,x:1,y:0}];
+ const result=chainRouteGroups([{x:0,y:0},{x:2,y:0}],centers);
+ assert.deepEqual(result.nodes.map(node=>node.id),[0,1]);assert.deepEqual(result.skipped.map(node=>node.id),[2]);
+ const snapped=chainRouteGroups(result.points,centers);assert.equal(snapped.skipped[0]!.distanceM,.08);
 });
