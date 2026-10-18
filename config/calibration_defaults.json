@@ -1,0 +1,13 @@
+{
+  "target": {
+    "type": "aprilgrid",
+    "family": "auto",
+    "rows": 6,
+    "columns": 6,
+    "tagSizeMm": 22,
+    "gapMm": 6.6,
+    "layoutMode": "auto",
+    "firstId": 0,
+    "idOrder": "row-major"
+  }
+}

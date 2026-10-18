@@ -1,0 +1,104 @@
+<script setup lang="ts">
+import Konva from 'konva';
+import {onMounted,onBeforeUnmount,ref,watch} from 'vue';
+import type {FieldMap,Point} from '../../../shared/model';
+import {exitPoint,heading,distance} from '../../../shared/model';
+import {orthogonalRoute,snapRoutePoint} from '../../../shared/route-design';
+import {Plus,Minus,Scan,MousePointer2} from 'lucide-vue-next';
+import Button from './ui/Button.vue';
+const props=defineProps<{map:FieldMap,selected:number[],rowId:string,tool:string,editable:boolean,drawing:Point[],measurement?:number[],vehicle?:{x:number,y:number,yaw:number},trail?:Point[],routeAnchors?:Point[],routeSelected?:number}>();
+const emit=defineEmits<{select:[id:number,multi:boolean],row:[id:string],blank:[point:Point],move:[ids:number[],dx:number,dy:number],point:[rowId:string,index:number,point:Point],zone:[index:number,point:Point],designSelect:[index:number],designMove:[index:number,point:Point]}>();
+const container=ref<HTMLDivElement>();let stage:Konva.Stage;let layer:Konva.Layer;let observer:ResizeObserver;let isMounted=false;const coordinate=ref('X 0.00 · Y 0.00 m'),zoom=ref(100);
+const px=(p:Point)=>[p.x*100,-p.y*100];
+let hoverMarker:Konva.Circle|undefined;
+let suppressDesignClick=false;
+function redraw() {
+ // Font readiness and queued resize callbacks can run after Konva destroys its stage.
+ if(!isMounted||!layer||layer.getStage()!==stage)return;layer.destroyChildren();
+ const bounds=stage.getRelativePointerPosition();void bounds;
+ const scale=stage.scaleX(),minX=-stage.x()/scale/100,maxX=(stage.width()-stage.x())/scale/100,minY=-(stage.height()-stage.y())/scale/100,maxY=stage.y()/scale/100;
+ const step=props.tool==='route-design'&&scale>=.65?.05:scale<0.3?2:scale<0.65?1:0.5;
+ for(let x=Math.floor(minX/step)*step;x<=maxX;x+=step)layer.add(new Konva.Line({points:[x*100,-minY*100,x*100,-maxY*100],stroke:Math.abs(x)<0.01?'#c9d0d7':'#eef1f4',strokeWidth:1/scale,listening:false}));
+ for(let y=Math.floor(minY/step)*step;y<=maxY;y+=step)layer.add(new Konva.Line({points:[minX*100,-y*100,maxX*100,-y*100],stroke:Math.abs(y)<0.01?'#c9d0d7':'#eef1f4',strokeWidth:1/scale,listening:false}));
+ if(props.map.routeMode!=='waypoints')layer.add(new Konva.Line({points:props.map.zone.flatMap(px),closed:true,fill:'#eef1f4',opacity:0.7,stroke:'#56616d',strokeWidth:1.5/scale,dash:[6/scale,5/scale],listening:false}));
+ props.map.zone.forEach((p,i)=>{if(props.editable&&props.tool==='zone'){const [x,y]=px(p);const handle=new Konva.Circle({x,y,radius:6/scale,fill:'#2563a6',stroke:'white',strokeWidth:2/scale,draggable:true});handle.on('dragend',()=>emit('zone',i,{x:handle.x()/100,y:-handle.y()/100}));layer.add(handle);}});
+ for(const row of props.map.rows) {
+  const office=props.map.routeMode==='waypoints',route=office?[exitPoint(row),...row.points]:row.points;
+  const line=new Konva.Line({points:route.flatMap(px),stroke:row.id===props.rowId?'#c9d0d7':'#eef1f4',strokeWidth:office?8/scale:row.width*100,lineCap:'butt',hitStrokeWidth:row.width*100});line.on('click tap',()=>{if(props.tool==='select')emit('row',row.id);else if(props.editable&&props.tool!=='measure')emit('blank',pointer());});layer.add(line);
+  layer.add(new Konva.Line({points:route.flatMap(px),stroke:row.id===props.rowId?'#2563a6':'#727d88',strokeWidth:1.8/scale,dash:[6/scale,4/scale],listening:false}));
+  const e=exitPoint(row);if(!office)layer.add(new Konva.Line({points:[...px(e),...px(row.points[0]!)],stroke:'#2563a6',strokeWidth:2/scale,dash:[5/scale,4/scale],listening:false}));
+  const mid=row.points[Math.floor(row.points.length/2)]!;layer.add(new Konva.Text({fontFamily:"QR Sans, QR CJK, sans-serif",x:mid.x*100+12/scale,y:-mid.y*100-26/scale,text:row.name,fontSize:16/scale,fill:'#56616d',listening:false}));
+  if(props.editable&&props.tool!=='measure'&&props.rowId===row.id)row.points.forEach((p,i)=>{const [x,y]=px(p),handle=new Konva.Circle({x,y,radius:5/scale,fill:'#f7f8f9',stroke:'#2563a6',strokeWidth:2/scale,draggable:true});handle.on('dragend',()=>emit('point',row.id,i,{x:handle.x()/100,y:-handle.y()/100}));layer.add(handle);});
+ }
+ for(const [i,segment] of (props.map.motionSegments??[]).entries()){
+  const color=segment.mode==='crab'?'#2563a6':'#2563a6',p=segment.points[Math.floor(segment.points.length/2)]!;
+  layer.add(new Konva.Line({points:segment.points.flatMap(px),stroke:color,strokeWidth:3/scale,listening:false}));
+  layer.add(new Konva.Text({fontFamily:'QR Sans, QR CJK, sans-serif',x:p.x*100+8/scale,y:-p.y*100+8/scale,text:(i+1)+' · '+(segment.mode==='crab'?'平移':segment.direction==='reverse'?'4T4D 倒车':'4T4D 前进'),fontSize:13/scale,fill:color,listening:false}));
+ }
+ if(props.trail?.length)layer.add(new Konva.Line({points:props.trail.flatMap(px),stroke:'#727d88',strokeWidth:2/scale,listening:false}));
+ const measurementIds=props.tool==='measure'?(props.measurement??[]):[];
+ const measurementTags=[...new Set(measurementIds)].slice(0,2).map(id=>props.map.tags.find(t=>t.id===id)).filter((t):t is FieldMap['tags'][number]=>!!t&&Number.isFinite(t.x)&&Number.isFinite(t.y));
+ const measurementPair=measurementIds.length===2&&measurementIds[0]!==measurementIds[1]&&measurementTags.length===2?measurementTags:[];
+ if(measurementPair.length===2){const points=measurementPair.flatMap(px);
+  layer.add(new Konva.Line({points,stroke:'#f7f8f9',strokeWidth:6/scale,listening:false}));
+  layer.add(new Konva.Line({points,stroke:'#2563a6',strokeWidth:3/scale,dash:[8/scale,8/scale],listening:false}));
+  layer.add(new Konva.Line({points,stroke:'#2563a6',strokeWidth:3/scale,dash:[8/scale,8/scale],dashOffset:8/scale,listening:false}));
+ }
+ for(const t of props.map.tags){const selected=props.selected.includes(t.id),[x,y]=px(t);const group=new Konva.Group({name:'tag-'+t.id,x,y,draggable:props.editable&&props.tool==='select'});
+  const size=Math.max(t.size*100,9/scale);group.add(new Konva.Rect({x:-size/2,y:-size/2,width:size,height:size,cornerRadius:2/scale,fill:selected?'#2563a6':t.kind==='end'?'#2563a6':'#39444f',stroke:selected?'#c9d0d7':'white',strokeWidth:2/scale}));
+  group.add(new Konva.Arrow({points:[0,0,Math.cos(t.angle*Math.PI/180)*16/scale,-Math.sin(t.angle*Math.PI/180)*16/scale],pointerLength:4/scale,pointerWidth:4/scale,stroke:'#2563a6',fill:'#2563a6',strokeWidth:1/scale,listening:false}));
+  group.add(new Konva.Text({fontFamily:"QR Sans, QR CJK, sans-serif",x:-40/scale,y:14/scale,width:80/scale,align:'center',text:t.groupId??`Q${String(t.id).padStart(3,'0')}`,fontSize:16/scale,fill:selected?'#2563a6':'#56616d',listening:false}));
+  group.on('click tap',e=>{e.cancelBubble=true;if(props.tool==='route-design'){if(props.editable)emit('blank',{x:t.x,y:t.y});}else emit('select',t.id,!!e.evt.shiftKey);});
+  group.on('dragend',()=>emit('move',selected?props.selected:[t.id],(group.x()-x!)/100,-(group.y()-y!)/100));layer.add(group);
+ }
+ if(props.tool==='route-design'){
+  const color='#2563eb';
+  const preview=new Konva.Line({name:'designed-route',points:props.drawing.flatMap(px),stroke:color,strokeWidth:3/scale,dash:[9/scale,5/scale],listening:false});layer.add(preview);
+  const decorations=new Konva.Group({listening:false});layer.add(decorations);
+  const updatePreview=(points:Point[])=>{
+   preview.points(points.flatMap(px));decorations.destroyChildren();
+   for(let i=1;i<points.length;i++){
+    const a=points[i-1]!,b=points[i]!,length=distance(a,b);if(length<.001)continue;
+    const ux=(b.x-a.x)/length,uy=(b.y-a.y)/length,half=Math.min(length*50,12/scale),cx=(a.x+b.x)*50,cy=-(a.y+b.y)*50;
+    decorations.add(new Konva.Arrow({points:[cx-ux*half,cy+uy*half,cx+ux*half,cy-uy*half],stroke:color,fill:color,strokeWidth:2/scale,pointerLength:7/scale,pointerWidth:7/scale,listening:false}));
+   }
+   for(const p of points){const [x,y]=px(p);decorations.add(new Konva.Rect({x:x!-3/scale,y:y!-3/scale,width:6/scale,height:6/scale,fill:color,listening:false}));}
+   for(const tag of props.map.tags){if(!points.some(p=>distance(p,tag)<=.04))continue;const [x,y]=px(tag);
+    decorations.add(new Konva.Circle({x,y,radius:13/scale,stroke:'#2563a6',strokeWidth:3/scale,listening:false}));
+    decorations.add(new Konva.Text({x:x!+16/scale,y:y!-23/scale,text:'已吸附',fontFamily:'QR Sans, QR CJK, sans-serif',fontSize:12/scale,fill:'#2563a6',listening:false}));
+   }
+  };
+  updatePreview(props.drawing);
+  hoverMarker=new Konva.Circle({radius:17/scale,stroke:'#2563a6',strokeWidth:2/scale,dash:[4/scale,3/scale],visible:false,listening:false});layer.add(hoverMarker);
+  (props.routeAnchors??[]).forEach((p,i)=>{const [x,y]=px(p),selected=i===props.routeSelected;
+   const handle=new Konva.Rect({name:'route-waypoint-'+i,x,y,offsetX:6/scale,offsetY:6/scale,width:12/scale,height:12/scale,fill:selected?'#eef1f4':'#39444f',stroke:color,strokeWidth:2/scale,draggable:props.editable});
+   handle.on('click tap',e=>{e.cancelBubble=true;if(props.editable)emit('designSelect',i);});
+   handle.on('dragmove',()=>{const snapped=snapRoutePoint({x:handle.x()/100,y:-handle.y()/100},props.map.tags);handle.position({x:snapped.x*100,y:-snapped.y*100});const anchors=(props.routeAnchors??[]).map((a,j)=>j===i?snapped:a);updatePreview(orthogonalRoute(anchors));layer.batchDraw();});
+   handle.on('dragend',()=>{suppressDesignClick=true;setTimeout(()=>{suppressDesignClick=false;},0);emit('designMove',i,{x:handle.x()/100,y:-handle.y()/100});redraw();});layer.add(handle);
+   layer.add(new Konva.Text({x:x!+9/scale,y:y!-18/scale,text:String(i+1),fontSize:12/scale,fontFamily:'monospace',fill:'#39444f',listening:false}));
+  });
+ }else if(props.drawing.length) {layer.add(new Konva.Line({points:props.drawing.flatMap(px),stroke:'#2563a6',strokeWidth:2/scale,listening:false}));for(const p of props.drawing){const [x,y]=px(p);layer.add(new Konva.Circle({x,y,radius:4/scale,fill:'#2563a6',listening:false}));}}
+ if(props.vehicle){const [x,y]=px(props.vehicle);const vehicle=new Konva.Group({x,y,rotation:-props.vehicle.yaw*180/Math.PI});vehicle.add(new Konva.Rect({x:-props.map.vehicle.length*50,y:-props.map.vehicle.width*50,width:props.map.vehicle.length*100,height:props.map.vehicle.width*100,cornerRadius:5,fill:'#2563a6',stroke:'white',strokeWidth:2/scale}));vehicle.add(new Konva.Arrow({points:[0,0,props.map.vehicle.length*50,0],stroke:'white',fill:'white',strokeWidth:2/scale,pointerWidth:6/scale,pointerLength:6/scale}));layer.add(vehicle);}
+ measurementTags.forEach((t,i)=>{const [x,y]=px(t),radius=Math.max(t.size*100,9/scale)/2+5/scale;
+  layer.add(new Konva.Circle({x,y,radius,stroke:'#f7f8f9',strokeWidth:5/scale,listening:false}));
+  layer.add(new Konva.Circle({x,y,radius,stroke:i===0?'#2563a6':'#2563a6',strokeWidth:3/scale,listening:false}));
+ });
+ if(measurementPair.length===2){const a=measurementPair[0]!,b=measurementPair[1]!;
+  const label=new Konva.Group({name:'measurement-label',x:(a.x+b.x)*50,y:-(a.y+b.y)*50,scaleX:1/scale,scaleY:1/scale,listening:false});
+  const text=new Konva.Text({fontFamily:"QR Sans, QR CJK, sans-serif",text:`中心距 ${Math.hypot(b.x-a.x,b.y-a.y).toFixed(3)} m`,fontSize:14,fontStyle:'bold',fill:'#2563a6',padding:8,listening:false});
+  label.add(new Konva.Rect({x:-text.width()/2,y:-text.height()/2,width:text.width(),height:text.height(),fill:'#f7f8f9',stroke:'#2563a6',strokeWidth:1,cornerRadius:6,listening:false}));
+  text.position({x:-text.width()/2,y:-text.height()/2});label.add(text);layer.add(label);
+ }
+ layer.draw();zoom.value=Math.round(scale*100);
+}
+function pointer():Point{const p=stage.getRelativePointerPosition()!;return {x:p.x/100,y:-p.y/100};}
+function fit(){if(!isMounted||!stage)return;const ps=[...props.map.zone,...props.map.rows.flatMap(r=>r.points),...props.map.tags,...(props.tool==='route-design'?props.drawing:[])];if(!ps.length)return;const xs=ps.map(p=>p.x*100),ys=ps.map(p=>-p.y*100),minX=Math.min(...xs),minY=Math.min(...ys),width=Math.max(...xs)-minX,height=Math.max(...ys)-minY;const scale=Math.min((stage.width()-140)/Math.max(width,100),(stage.height()-120)/Math.max(height,100));stage.scale({x:scale,y:scale});stage.position({x:(stage.width()-width*scale)/2-minX*scale,y:(stage.height()-height*scale)/2-minY*scale});redraw();}
+function scaleBy(factor:number,center?:Point){if(!isMounted||!stage)return;center??={x:stage.width()/2,y:stage.height()/2};const old=stage.scaleX(),next=Math.max(0.08,Math.min(8,old*factor));const point={x:(center.x-stage.x())/old,y:(center.y-stage.y())/old};stage.scale({x:next,y:next});stage.position({x:center.x-point.x*next,y:center.y-point.y*next});redraw();}
+onMounted(()=>{stage=new Konva.Stage({container:container.value!,width:container.value!.clientWidth,height:container.value!.clientHeight,draggable:props.tool==='pan'||props.tool==='measure'});layer=new Konva.Layer();stage.add(layer);isMounted=true;stage.on('wheel',e=>{e.evt.preventDefault();scaleBy(e.evt.deltaY>0?0.9:1.1,stage.getPointerPosition()!);});stage.on('dragend',e=>{if(e.target===stage)redraw();});stage.on('mousemove',()=>{const p=pointer();coordinate.value=`X ${p.x.toFixed(2)} · Y ${p.y.toFixed(2)} m`;if(props.tool==='route-design'&&hoverMarker){const nearest=props.map.tags.filter(t=>distance(t,p)<=.04).sort((a,b)=>distance(a,p)-distance(b,p))[0];hoverMarker.visible(!!nearest);if(nearest)hoverMarker.position({x:nearest.x*100,y:-nearest.y*100});layer.batchDraw();}});stage.on('click tap',e=>{if(e.target===stage&&props.editable&&!suppressDesignClick)emit('blank',pointer());});observer=new ResizeObserver(()=>{if(!isMounted||!container.value)return;stage.size({width:container.value.clientWidth,height:container.value.clientHeight});if(props.tool==='measure'||props.tool==='route-design')fit();else redraw();});observer.observe(container.value!);fit();void document.fonts.ready.then(redraw);});
+watch(()=>[props.map,props.selected,props.rowId,props.drawing,props.measurement,props.vehicle,props.trail,props.routeAnchors,props.routeSelected,props.editable],redraw,{deep:true});watch(()=>props.tool,()=>{if(!isMounted)return;stage.draggable(props.tool==='pan'||props.tool==='measure');if(props.tool==='route-design')fit();else redraw();});watch(()=>props.map.id,fit);onBeforeUnmount(()=>{isMounted=false;observer?.disconnect();stage?.off();stage?.destroy();});defineExpose({fit});
+</script>
+<template><div class="canvas-wrap"><div ref="container" class="map-container" data-testid="map-canvas"/><div class="canvas-caption"><span class="dot"></span> 单位 m</div><div class="canvas-controls"><Button variant="outline" size="icon" aria-label="放大地图" @click="scaleBy(1.2)"><Plus :size="16"/></Button><Button variant="outline" size="icon" aria-label="缩小地图" @click="scaleBy(0.8)"><Minus :size="16"/></Button><Button variant="outline" size="icon" aria-label="适应地图" @click="fit"><Scan :size="16"/></Button></div><div class="canvas-footer"><span>{{coordinate}}</span><span>{{zoom}}%</span></div><div v-if="tool==='route-design'" class="draw-hint"><MousePointer2 :size="14"/> 单击追加路点 · 方块可拖动 · 组中心自动吸附</div><div v-if="tool==='row'" class="draw-hint"><MousePointer2 :size="14"/> 点击画布添加路线控制点，再点击“完成绘制”</div></div></template>
+
+<style scoped>
+.draw-hint{position:absolute;left:14px;bottom:60px;max-width:calc(100% - 90px);display:flex;align-items:center;gap:6px;padding:6px 9px;background:var(--background)ed;border:1px solid var(--line);border-radius:8px;color:var(--muted);font-size:12px;line-height:1.5;pointer-events:none}.draw-hint svg{flex-shrink:0}
+</style>

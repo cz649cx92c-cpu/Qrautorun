@@ -1,0 +1,16 @@
+qr_camera_stream:
+  ros__parameters:
+    stream_url: ws://127.0.0.1:3080/ws/camera
+    frame_id: qr_camera_optical
+    calibration_file: /home/orangepi/ugv/QRautorun/qr_navigation_ws/config/camera_calibration.json
+    extrinsics_file: /home/orangepi/ugv/QRautorun/qr_navigation_ws/config/camera_extrinsics.json
+    max_publish_hz: 15.0
+    max_age_s: 0.25
+    capture_timestamp_verified: false
+    capture_delay_s: 0.021
+    # 两段实车运动交叉验证的相机/局部里程计相对延迟；不声明硬件曝光触发时间。
+    capture_timing_calibration_file: /home/orangepi/ugv/QRautorun/qr_navigation_ws/config/camera_timing_calibration.json
+    # 旧雷达网页已确认仅用于预览；共享同一张真实JPEG，不启用其视觉定位。
+    compat_preview_topic: /autorun_final/uvc_preview/compressed
+    # 只允许已核实的uvc_preview_publisher.py，其他占用者不停止。
+    handoff_legacy_preview: true

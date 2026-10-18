@@ -1,0 +1,1214 @@
+{
+  "map": {
+    "schemaVersion": 1,
+    "id": "greenhouse-example",
+    "name": "温室作物行地图",
+    "frame": "map",
+    "family": "tag36h11",
+    "source": "design",
+    "coordinateStatus": "draft",
+    "rows": [
+      {
+        "id": "row-1",
+        "name": "第 1 行",
+        "width": 0.6,
+        "points": [
+          {
+            "x": 0,
+            "y": 0
+          },
+          {
+            "x": 4.898587196589413e-16,
+            "y": 8
+          }
+        ],
+        "exitDistance": 0.8
+      },
+      {
+        "id": "row-2",
+        "name": "第 2 行",
+        "width": 0.6,
+        "points": [
+          {
+            "x": -1.2,
+            "y": 7.347880794884119e-17
+          },
+          {
+            "x": -1.1999999999999995,
+            "y": 8
+          }
+        ],
+        "exitDistance": 0.8
+      },
+      {
+        "id": "row-3",
+        "name": "第 3 行",
+        "width": 0.6,
+        "points": [
+          {
+            "x": -2.4,
+            "y": 1.4695761589768238e-16
+          },
+          {
+            "x": -2.3999999999999995,
+            "y": 8
+          }
+        ],
+        "exitDistance": 0.8
+      },
+      {
+        "id": "row-4",
+        "name": "第 4 行",
+        "width": 0.6,
+        "points": [
+          {
+            "x": -3.5999999999999996,
+            "y": 2.2043642384652356e-16
+          },
+          {
+            "x": -3.599999999999999,
+            "y": 8
+          }
+        ],
+        "exitDistance": 0.8
+      },
+      {
+        "id": "row-5",
+        "name": "第 5 行",
+        "width": 0.6,
+        "points": [
+          {
+            "x": -4.8,
+            "y": 2.9391523179536476e-16
+          },
+          {
+            "x": -4.799999999999999,
+            "y": 8
+          }
+        ],
+        "exitDistance": 0.8
+      }
+    ],
+    "tags": [
+      {
+        "id": 0,
+        "rowId": "row-1",
+        "x": 0,
+        "y": 0,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "entry",
+        "rules": [
+          {
+            "id": "1be138d1-84fa-4e09-bc43-d40603165b0f",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "271f600c-140c-41f5-b7db-944ca719d4e0",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 1,
+        "rowId": "row-1",
+        "x": 1.2246467991473532e-16,
+        "y": 2,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "735f711a-6ecb-42d3-b13d-67f31db8b368",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "390ac322-311d-4bdc-9315-bfb9540b825e",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "rowId": "row-1",
+        "x": 2.4492935982947064e-16,
+        "y": 4,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "5317542a-81a0-4c9d-900c-e06c9a7a1588",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "aca3dc6f-5a64-4a8a-9225-a3da105b2a6d",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "rowId": "row-1",
+        "x": 3.6739403974420594e-16,
+        "y": 6,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "371639d8-c626-4512-8d6c-e67e662d430c",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "92cef7bf-884a-4df3-b664-c051a31f8ad2",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "rowId": "row-1",
+        "x": 4.898587196589413e-16,
+        "y": 8,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "end",
+        "rules": [
+          {
+            "id": "1fac99b5-9f7b-41c6-9e48-9e195f8d0102",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "END_REVERSE",
+            "speed": 0.12,
+            "waitSeconds": 2,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "rowId": "row-1",
+        "x": -4.898587196589413e-17,
+        "y": -0.8,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "exit",
+        "rules": [
+          {
+            "id": "a2a04f87-8c87-4f3c-be98-782caf175d18",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "EXIT_SHIFT",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "rowId": "row-2",
+        "x": -1.2,
+        "y": 7.347880794884119e-17,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "entry",
+        "rules": [
+          {
+            "id": "25ac8849-58ca-472e-b6f3-7e4d7b307c88",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "a526903a-442b-4989-9bfb-8b8ab4f6652b",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "rowId": "row-2",
+        "x": -1.1999999999999997,
+        "y": 2,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "fc0678c5-322d-42ef-95e9-5a7bae65c376",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "65228eb9-6ef8-4746-ac74-466ede679313",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "rowId": "row-2",
+        "x": -1.1999999999999997,
+        "y": 4,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "7be067f5-d106-4b9c-9942-9ce71851de7e",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "eb4f73ab-82e0-4023-962e-2119c86793a2",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "rowId": "row-2",
+        "x": -1.1999999999999995,
+        "y": 6,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "5484a26e-3da4-43cd-a541-87b37c247511",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "b0314f7d-a10c-43d2-8fc0-8801e7da1e0d",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "rowId": "row-2",
+        "x": -1.1999999999999995,
+        "y": 8,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "end",
+        "rules": [
+          {
+            "id": "ad707b83-e35e-4e9c-bbaf-fd17af0972f5",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "END_REVERSE",
+            "speed": 0.12,
+            "waitSeconds": 2,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 11,
+        "rowId": "row-2",
+        "x": -1.2,
+        "y": -0.7999999999999999,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "exit",
+        "rules": [
+          {
+            "id": "be8eb1fd-63e4-479f-9558-61d207266e83",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "EXIT_SHIFT",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 12,
+        "rowId": "row-3",
+        "x": -2.4,
+        "y": 1.4695761589768238e-16,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "entry",
+        "rules": [
+          {
+            "id": "c45017f0-91f8-459a-8eb8-724efdd45518",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "d4f3f166-24db-4616-8c46-88d6d8f767e9",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 13,
+        "rowId": "row-3",
+        "x": -2.4,
+        "y": 2,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "c93a14d6-b919-49ce-955c-1b2d75bac28a",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "df3aac23-ca52-4ac4-bae5-9b6b0fc2784e",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 14,
+        "rowId": "row-3",
+        "x": -2.3999999999999995,
+        "y": 4,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "edffb15a-34b3-408a-ac14-51497fe185ae",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "730fa3b3-b6b0-468b-9838-bb1ccc46d139",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 15,
+        "rowId": "row-3",
+        "x": -2.3999999999999995,
+        "y": 6,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "37663090-fc86-46e7-b22f-17ebfa8eb468",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "a7a10ae8-935f-4227-9486-3933cee9df6c",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 16,
+        "rowId": "row-3",
+        "x": -2.3999999999999995,
+        "y": 8,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "end",
+        "rules": [
+          {
+            "id": "f6baa8bb-c8cc-4e78-82e7-0888f379b3dd",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "END_REVERSE",
+            "speed": 0.12,
+            "waitSeconds": 2,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 17,
+        "rowId": "row-3",
+        "x": -2.4,
+        "y": -0.7999999999999999,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "exit",
+        "rules": [
+          {
+            "id": "7d5c09d8-483c-4f72-9790-eca98067d21b",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "EXIT_SHIFT",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 18,
+        "rowId": "row-4",
+        "x": -3.5999999999999996,
+        "y": 2.2043642384652356e-16,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "entry",
+        "rules": [
+          {
+            "id": "25155a7b-da5c-4233-88b7-d86624701f33",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "5c369050-1864-4154-b733-0ef9a8dc54fc",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 19,
+        "rowId": "row-4",
+        "x": -3.5999999999999996,
+        "y": 2,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "442fbc6e-3c3e-4b3c-9681-25d11becfb5a",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "16ed0fed-aad4-4ff2-a0c3-ae5cf1938ed5",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 20,
+        "rowId": "row-4",
+        "x": -3.599999999999999,
+        "y": 4,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "2e766ba1-9319-4919-8dbc-baa818bc6005",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "28999ef3-df1f-4708-ab3a-9422daeb35c3",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 21,
+        "rowId": "row-4",
+        "x": -3.599999999999999,
+        "y": 6,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "d1de5e1e-d4b1-45ad-8320-4f485cb6289b",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "b0f60449-7c1f-431c-80ab-c315b161e572",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 22,
+        "rowId": "row-4",
+        "x": -3.599999999999999,
+        "y": 8,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "end",
+        "rules": [
+          {
+            "id": "c44ed15a-9ea7-4f4c-b36a-68f115c93d17",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "END_REVERSE",
+            "speed": 0.12,
+            "waitSeconds": 2,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 23,
+        "rowId": "row-4",
+        "x": -3.5999999999999996,
+        "y": -0.7999999999999998,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "exit",
+        "rules": [
+          {
+            "id": "faca17a6-20e9-42c6-8251-bbf5e35c7106",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "EXIT_SHIFT",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 24,
+        "rowId": "row-5",
+        "x": -4.8,
+        "y": 2.9391523179536476e-16,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "entry",
+        "rules": [
+          {
+            "id": "fca1580c-6531-4688-906f-9280d0dbcbcd",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "587eeeb5-40f9-422e-a0b9-9719d1dca558",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 25,
+        "rowId": "row-5",
+        "x": -4.8,
+        "y": 2.0000000000000004,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "b21f9a39-76ea-4b1e-84f1-306817480797",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "f68edca8-f84e-4bdb-b7ab-c68182280721",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 26,
+        "rowId": "row-5",
+        "x": -4.8,
+        "y": 4,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "f41a6890-3c23-4a88-ae93-d6fcba074019",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "1ac80566-9e28-4468-b60d-48c57efcc56e",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 27,
+        "rowId": "row-5",
+        "x": -4.8,
+        "y": 6,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "waypoint",
+        "rules": [
+          {
+            "id": "e39708c9-909d-4ba8-8122-02ccd2932622",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          },
+          {
+            "id": "c4a34e69-b2ab-467d-b98e-4457420714ef",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "LOCALIZE",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 28,
+        "rowId": "row-5",
+        "x": -4.799999999999999,
+        "y": 8,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "end",
+        "rules": [
+          {
+            "id": "07413ad7-ed21-402f-be5f-702688c581c0",
+            "state": "FORWARD",
+            "direction": "forward",
+            "action": "END_REVERSE",
+            "speed": 0.12,
+            "waitSeconds": 2,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      },
+      {
+        "id": 29,
+        "rowId": "row-5",
+        "x": -4.8,
+        "y": -0.7999999999999997,
+        "angle": 90,
+        "size": 0.08,
+        "kind": "exit",
+        "rules": [
+          {
+            "id": "08ad9fd0-4776-44c6-89a9-ee87bc66ec70",
+            "state": "REVERSE",
+            "direction": "reverse",
+            "action": "EXIT_SHIFT",
+            "speed": 0.12,
+            "waitSeconds": 0,
+            "radius": 0.12,
+            "task": "default",
+            "customTask": ""
+          }
+        ]
+      }
+    ],
+    "order": [
+      "row-1",
+      "row-2",
+      "row-3",
+      "row-4",
+      "row-5"
+    ],
+    "zone": [
+      {
+        "x": 0.5499999999999999,
+        "y": -1.35
+      },
+      {
+        "x": 0.55,
+        "y": -0.25000000000000006
+      },
+      {
+        "x": -5.35,
+        "y": -0.24999999999999967
+      },
+      {
+        "x": -5.35,
+        "y": -1.3499999999999999
+      }
+    ],
+    "vehicle": {
+      "width": 0.4,
+      "length": 0.8,
+      "margin": 0.05
+    },
+    "notes": "车辆长度 0.8m 为设计占位值，实测后修改。正式导航前需现场坐标验收。"
+  },
+  "routes": [
+    {
+      "rowId": "row-1",
+      "forward": [
+        {
+          "x": -4.898587196589413e-17,
+          "y": -0.8
+        },
+        {
+          "x": 0,
+          "y": 0
+        },
+        {
+          "x": 4.898587196589413e-16,
+          "y": 8
+        }
+      ],
+      "reverse": [
+        {
+          "x": 4.898587196589413e-16,
+          "y": 8
+        },
+        {
+          "x": 0,
+          "y": 0
+        },
+        {
+          "x": -4.898587196589413e-17,
+          "y": -0.8
+        }
+      ],
+      "lateral": [
+        {
+          "x": -4.898587196589413e-17,
+          "y": -0.8
+        },
+        {
+          "x": -1.2,
+          "y": -0.7999999999999999
+        }
+      ],
+      "bodyYaw": 1.5707963267948966,
+      "reverseBodyYaw": 1.5707963267948966
+    },
+    {
+      "rowId": "row-2",
+      "forward": [
+        {
+          "x": -1.2,
+          "y": -0.7999999999999999
+        },
+        {
+          "x": -1.2,
+          "y": 7.347880794884119e-17
+        },
+        {
+          "x": -1.1999999999999995,
+          "y": 8
+        }
+      ],
+      "reverse": [
+        {
+          "x": -1.1999999999999995,
+          "y": 8
+        },
+        {
+          "x": -1.2,
+          "y": 7.347880794884119e-17
+        },
+        {
+          "x": -1.2,
+          "y": -0.7999999999999999
+        }
+      ],
+      "lateral": [
+        {
+          "x": -1.2,
+          "y": -0.7999999999999999
+        },
+        {
+          "x": -2.4,
+          "y": -0.7999999999999999
+        }
+      ],
+      "bodyYaw": 1.5707963267948966,
+      "reverseBodyYaw": 1.5707963267948966
+    },
+    {
+      "rowId": "row-3",
+      "forward": [
+        {
+          "x": -2.4,
+          "y": -0.7999999999999999
+        },
+        {
+          "x": -2.4,
+          "y": 1.4695761589768238e-16
+        },
+        {
+          "x": -2.3999999999999995,
+          "y": 8
+        }
+      ],
+      "reverse": [
+        {
+          "x": -2.3999999999999995,
+          "y": 8
+        },
+        {
+          "x": -2.4,
+          "y": 1.4695761589768238e-16
+        },
+        {
+          "x": -2.4,
+          "y": -0.7999999999999999
+        }
+      ],
+      "lateral": [
+        {
+          "x": -2.4,
+          "y": -0.7999999999999999
+        },
+        {
+          "x": -3.5999999999999996,
+          "y": -0.7999999999999998
+        }
+      ],
+      "bodyYaw": 1.5707963267948966,
+      "reverseBodyYaw": 1.5707963267948966
+    },
+    {
+      "rowId": "row-4",
+      "forward": [
+        {
+          "x": -3.5999999999999996,
+          "y": -0.7999999999999998
+        },
+        {
+          "x": -3.5999999999999996,
+          "y": 2.2043642384652356e-16
+        },
+        {
+          "x": -3.599999999999999,
+          "y": 8
+        }
+      ],
+      "reverse": [
+        {
+          "x": -3.599999999999999,
+          "y": 8
+        },
+        {
+          "x": -3.5999999999999996,
+          "y": 2.2043642384652356e-16
+        },
+        {
+          "x": -3.5999999999999996,
+          "y": -0.7999999999999998
+        }
+      ],
+      "lateral": [
+        {
+          "x": -3.5999999999999996,
+          "y": -0.7999999999999998
+        },
+        {
+          "x": -4.8,
+          "y": -0.7999999999999997
+        }
+      ],
+      "bodyYaw": 1.5707963267948966,
+      "reverseBodyYaw": 1.5707963267948966
+    },
+    {
+      "rowId": "row-5",
+      "forward": [
+        {
+          "x": -4.8,
+          "y": -0.7999999999999997
+        },
+        {
+          "x": -4.8,
+          "y": 2.9391523179536476e-16
+        },
+        {
+          "x": -4.799999999999999,
+          "y": 8
+        }
+      ],
+      "reverse": [
+        {
+          "x": -4.799999999999999,
+          "y": 8
+        },
+        {
+          "x": -4.8,
+          "y": 2.9391523179536476e-16
+        },
+        {
+          "x": -4.8,
+          "y": -0.7999999999999997
+        }
+      ],
+      "lateral": [],
+      "bodyYaw": 1.5707963267948966,
+      "reverseBodyYaw": 1.5707963267948966
+    }
+  ]
+}

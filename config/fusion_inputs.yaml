@@ -1,0 +1,21 @@
+qr_fusion_inputs:
+  ros__parameters:
+    source: chassis
+    odom_topic: /qr/chassis/odom
+    # 依据用户对现成底盘运动反馈的明确确认，噪声仍保留现有保守先验。
+    existing_chassis_confirmed: true
+    imu_topic: /odin1/imu
+    feedback_topic: /chassis_info_fb
+    imu_frame: imu_link
+    input_timeout_s: 0.25
+    calibration_duration_s: 5.0
+    calibration_min_samples: 500
+    # 本次遥控实测停车反馈档位为0；只在全部速度为零且IMU稳定时用于启动校零。
+    # 不改变原协议或导航档位定义，不允许在横移模式下校零。
+    stationary_feedback_gears: [0, 1, 2]
+    # 待验证的速度噪声先验，不代表已经实测到3cm精度。
+    wheel_velocity_sigma_mps: 0.03
+    lateral_constraint_sigma_mps: 0.05
+    wheel_calibration_verified: false
+    noise_calibration_verified: false
+    imu_projection_verified: false

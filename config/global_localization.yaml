@@ -1,0 +1,18 @@
+qr_global_localization:
+  ros__parameters:
+    map_file: /home/orangepi/ugv/QRautorun/qr_navigation_ws/maps/office-confirmed.json
+    local_odom_topic: /qr/odometry/local
+    # 精度尚未实测，不冒充测量验收；2026-10-15用户明确要求先进行实机导航测试。
+    covariance_calibrated: false
+    synchronized_navigation_confirmed: true
+    # 二维码间使用轮式/IMU连续推算，到下一定位板校正；如实报告估计误差。
+    qr_interval_navigation: true
+    process_noise_m_sqrt_s: 0.01
+    process_noise_rad_sqrt_s: 0.02
+    max_observation_age_s: 0.25
+    max_innovation_m: 0.2
+    # 在二维码间导航模式下用于误差诊断，不冒充实测精度。
+    max_position_sigma_m: 0.03
+    # 接收时戳只在确认静止时用于二维码地图锚定，不冒充运动同步。
+    enable_stationary_anchor: true
+    publish_tf: false

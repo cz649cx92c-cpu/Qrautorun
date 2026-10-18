@@ -1,0 +1,19 @@
+{
+  "parentFrame": "base_link",
+  "childFrame": "qr_camera_optical",
+  "translationM": [
+    0,
+    0,
+    0.14
+  ],
+  "quaternionXyzw": [
+    0.7071067811865476,
+    -0.7071067811865476,
+    0,
+    0
+  ],
+  "extrinsicsVerified": true,
+  "source": "用户填写并确认实测安装参数",
+  "measuredAt": "2026-10-13T12:08:54.172Z",
+  "baseDefinition": "平面导航：X前、Y左、Z=0地面；镜头竖直朝下，画面上方对应车头"
+}

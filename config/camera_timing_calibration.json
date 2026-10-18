@@ -1,0 +1,146 @@
+{
+  "schemaVersion": 1,
+  "method": "ground_board_motion_to_local_odometry",
+  "timestampSource": "server_receive_minus_calibrated_relative_delay",
+  "relativeTimingVerified": true,
+  "hardwareExposureTimestampMeasured": false,
+  "appliedDelayS": 0.021,
+  "delayUncertaintyS": 0.02,
+  "reference": "/qr/odometry/local, host ROS clock",
+  "cameraProfile": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30
+  },
+  "configurationSha256": {
+    "camera_calibration.json": "f2e49deea4dfdb52c46267e9f60c63a925bd1937738b9ff2f5e629a4fe4799a4",
+    "camera_extrinsics.json": "4b0797026f071b5e3cd055d201a2cc2374b3d12cc5fd8a24230d9f3c497c3b9e",
+    "camera_preview.json": "cf7bb7e51849bd21c8d836185fda3c53788187167dacd672f16cd4ebec12095e"
+  },
+  "runs": [
+    {
+      "source": "/home/orangepi/ugv/QRautorun/qr_navigation_ws/logs/forward-50cm-timing-20261015.json",
+      "sha256": "3d014594a60cb31c997fbd0b7be27ffec0dff51bc6ff849459e40cba4936acfd",
+      "epoch": "0bd6608c0e344db293caf25f6de58e94",
+      "boardGroup": "B000",
+      "eligibleFrames": 53,
+      "translationSpanM": 0.020444952195210975,
+      "maximumOdomGapS": 0.05031752586364746,
+      "fixedScaleFit": {
+        "delayS": 0.014562319510955279,
+        "scale": 1.0,
+        "center": [
+          -0.030836126640778703,
+          0.010694877937006632
+        ],
+        "rmsM": 0.0001369047655064833
+      },
+      "scaleSensitivityFit": {
+        "delayS": 0.02361691944934306,
+        "scale": 1.0240021700299748,
+        "center": [
+          -0.030836014499258945,
+          0.010695152343162664
+        ],
+        "rmsM": 0.0001299423700580596
+      },
+      "interleavedHoldout": [
+        {
+          "delayS": 0.012754845962759389,
+          "heldOutCoordinateRmsM": 0.000143508830641785
+        },
+        {
+          "delayS": 0.016202930869792114,
+          "heldOutCoordinateRmsM": 0.00013869384977515875
+        },
+        {
+          "delayS": 0.01501753077665385,
+          "heldOutCoordinateRmsM": 0.0001363932886001575
+        }
+      ],
+      "speedMaximumMps": 0.039000000804662704,
+      "experimentOutcome": "ABORTED",
+      "experimentStopReason": "timed out",
+      "otherRunDelayValidation": {
+        "delayS": 0.0264704305616648,
+        "coordinateRmsM": 0.0001727721651430549,
+        "radialP95M": 0.00042914633829619096
+      },
+      "appliedDelayValidation": {
+        "delayS": 0.021,
+        "coordinateRmsM": 0.00015869409252841724,
+        "radialP95M": 0.00041520775950217655
+      },
+      "zeroDelayBaseline": {
+        "coordinateRmsM": 0.00022346875720698594,
+        "radialP95M": 0.0005755946572333855
+      }
+    },
+    {
+      "source": "/home/orangepi/ugv/QRautorun/qr_navigation_ws/logs/forward-50cm-timing-continuation-20261015.json",
+      "sha256": "51511fed99b7c0b292365fd3485d2ad01b969685001b0e5676701d26fe631555",
+      "epoch": "2531ddf4277944c5a65d3d62e5514504",
+      "boardGroup": "B000",
+      "eligibleFrames": 104,
+      "translationSpanM": 0.029903763911639854,
+      "maximumOdomGapS": 0.05197882652282715,
+      "fixedScaleFit": {
+        "delayS": 0.0264704305616648,
+        "scale": 1.0,
+        "center": [
+          -0.05846348168694875,
+          0.013580357730338874
+        ],
+        "rmsM": 0.00020944336005020256
+      },
+      "scaleSensitivityFit": {
+        "delayS": 0.02707963861931033,
+        "scale": 1.008958769495382,
+        "center": [
+          -0.05837174462099155,
+          0.013579561185406552
+        ],
+        "rmsM": 0.00018892985909638757
+      },
+      "interleavedHoldout": [
+        {
+          "delayS": 0.026211343737316886,
+          "heldOutCoordinateRmsM": 0.00020503383629252855
+        },
+        {
+          "delayS": 0.02688073604027828,
+          "heldOutCoordinateRmsM": 0.00020962685367832465
+        },
+        {
+          "delayS": 0.0261748945830496,
+          "heldOutCoordinateRmsM": 0.000213930170636124
+        }
+      ],
+      "speedMaximumMps": 0.03500000014901161,
+      "experimentOutcome": "ABORTED",
+      "experimentStopReason": "Motion is not straight forward",
+      "otherRunDelayValidation": {
+        "delayS": 0.014562319510955279,
+        "coordinateRmsM": 0.0002471987465680597,
+        "radialP95M": 0.0006678868538332825
+      },
+      "appliedDelayValidation": {
+        "delayS": 0.021,
+        "coordinateRmsM": 0.000232051600705826,
+        "radialP95M": 0.0006567287925637294
+      },
+      "zeroDelayBaseline": {
+        "coordinateRmsM": 0.0003051915069810373,
+        "radialP95M": 0.0009036031622214682
+      }
+    }
+  ],
+  "rejectionReasons": [],
+  "validatedMaximumObservedSpeedMps": 0.039000000804662704,
+  "notes": [
+    "Calibration estimates the effective relative offset of the existing camera and local-odometry pipeline.",
+    "This does not measure a hardware exposure trigger, absolute map accuracy or navigation covariance.",
+    "Source trials stopped early on interlocks; only their recorded, covered motion frames are used.",
+    "Do not add detector processing time: frame headers already preserve the image timestamp."
+  ]
+}

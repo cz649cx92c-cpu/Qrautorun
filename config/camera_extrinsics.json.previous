@@ -1,0 +1,9 @@
+{
+  "parentFrame": "base_link",
+  "childFrame": "qr_camera_optical",
+  "translationM": [0.0, 0.0, 0.14],
+  "quaternionXyzw": [0.7071067811865476, -0.7071067811865476, 0.0, 0.0],
+  "extrinsicsVerified": false,
+  "source": "用户提供：画面上方对应前进，镜头离地14cm，大致在车体中心",
+  "note": "平面base_link的Z=0位于地面；X/Y为待实测的近似零值，尚未作为已验证外参发布。"
+}

@@ -1,0 +1,2 @@
+from setuptools import setup
+setup(name='chassis_adapter',version='0.1.0',packages=['chassis_adapter'],data_files=[('share/ament_index/resource_index/packages',['resource/chassis_adapter']),('share/chassis_adapter',['package.xml'])],install_requires=['setuptools'],zip_safe=True,maintainer='QR navigation',maintainer_email='local@example.invalid',description='Read-only existing chassis feedback adapter',license='MIT',entry_points={'console_scripts':['read_only = chassis_adapter.read_only:main']})

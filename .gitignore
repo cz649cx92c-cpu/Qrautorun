@@ -1,0 +1,17 @@
+node_modules/
+logs/
+.browser-cache/
+backups/
+config/bridge.key
+maps/*.db
+maps/*.db-wal
+maps/*.db-shm
+*.pyc
+__pycache__/
+.agent/
+build/
+install/
+log/
+python_deps/
+test-results/
+# Keep web/frontend/dist/ tracked for ready-to-serve frontend assets.

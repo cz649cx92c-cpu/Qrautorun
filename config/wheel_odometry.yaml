@@ -1,0 +1,12 @@
+qr_wheel_odometry:
+  ros__parameters:
+    calibration_verified: false
+    field_freshness_verified: false
+    # 2026-10-14用户提供：轴距350mm、轮距250mm；按前后/左右对称布局。
+    # base_link位于四轮轮心矩形中点，X向前、Y向左，单位米。
+    # 顺序LF、RF、LR、RR，每个轮子依次为[x,y]。
+    wheel_positions: [0.175, 0.125, 0.175, -0.125, -0.175, 0.125, -0.175, -0.125]
+    wheel_angle_signs: [0.0, 0.0, 0.0, 0.0]
+    wheel_angle_offsets: [0.0, 0.0, 0.0, 0.0]
+    wheel_speed_signs: [0.0, 0.0, 0.0, 0.0]
+    max_residual_mps: 0.03

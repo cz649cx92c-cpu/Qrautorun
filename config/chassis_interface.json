@@ -1,0 +1,13 @@
+{
+  "mode": "read_only",
+  "hardware_motion_enabled": false,
+  "reuse": {"reference_project": "/home/orangepi/ugv/autorunlida", "motion_api": "/home/orangepi/ugv/control/fw_mini_controller.py", "driver": "/home/orangepi/ugv/control/FW-mini-ros2/yhs_can_control", "teleop": "/home/orangepi/ugv/controlxbox", "compat": "/home/orangepi/ugv/control/official_fwmini_compat.py"},
+  "api_units": {"BodyCommand.vx": "m/s", "BodyCommand.vy": "m/s", "BodyCommand.wz": "rad/s", "SteeringCommand.angle": "deg"},
+  "transport": {"type": "existing_ros2_topics", "can_interface": "can0", "bitrate": 500000},
+  "topics": {"body_command": "/ctrl_cmd", "steering_command": "/steering_ctrl_cmd", "feedback": "/chassis_info_fb", "legacy_odom": "/odom", "imu": "/odin1/imu"},
+  "imu": {"node":"odin_imu_only","mode":"raw_imu_only","timestamp_source":"host_receive","orientation_available":false,"other_sensor_streams_enabled":false},
+  "source_verified": {"body_gear_4t4d": 6, "body_gear_crab": 8, "steering_gear_4t4d": 5, "steering_gear_crab": 7, "neutral": 2, "linear_unit": "m/s", "body_yaw_rate_unit": "deg/s", "steering_angle_unit": "deg", "signed_reverse_velocity": true},
+  "unverified": ["NIR设备身份与标定", "IMU外参、零偏、噪声和设备采样时间同步", "四轮角度符号与90°到位判定", "横移速度反馈缩放及四轮反馈新鲜度", "车长、轴距与扫掠包络", "底盘固件通信超时停车", "手柄与自动控制权仲裁"],
+  "legacy_odom_suitable_for_lateral": false,
+  "warning": "本配置是源码检查结果，不是可直接启用的实体导航配置。"
+}

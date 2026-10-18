@@ -1,0 +1,21 @@
+{
+  "source": "现有Odin ROS驱动SDK，原文件未修改",
+  "files": {
+    "lidar_api.h": {
+      "source": "/home/orangepi/ugv/ros2_ws/src/odin_ros_driver/include/lidar_api.h",
+      "sha256": "df4a4764fface3c1eaf0376f122dca5dd10be1b0d8581b4be01e33e9d789c426"
+    },
+    "lidar_api_type.h": {
+      "source": "/home/orangepi/ugv/ros2_ws/src/odin_ros_driver/include/lidar_api_type.h",
+      "sha256": "abf60efd8bd9a17f518882ffda4d62a9a084cbb57aea2ed803cfae1f4e8fedfa"
+    },
+    "liblydHostApi_arm.a": {
+      "source": "/home/orangepi/ugv/ros2_ws/src/odin_ros_driver/lib/liblydHostApi_arm.a",
+      "sha256": "e4ffa59a2d5ee04720f079e575e91009ae13fc3e9e3752454fffa03cc599d0bc"
+    },
+    "LICENSE": {
+      "source": "/home/orangepi/ugv/ros2_ws/src/odin_ros_driver/LICENSE",
+      "sha256": "332527ae8a7dcd44e0db0830cff90664d87646d00c1c1565560cb23dfca05080"
+    }
+  }
+}

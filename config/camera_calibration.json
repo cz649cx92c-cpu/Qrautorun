@@ -1,0 +1,80 @@
+{
+  "width": 1280,
+  "height": 720,
+  "cameraMatrix": [
+    [
+      740.5639631496164,
+      0.0,
+      616.7036691933787
+    ],
+    [
+      0.0,
+      740.661649906133,
+      343.3300085647242
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "distortion": [
+    0.114599178860371,
+    -0.21248382294910323,
+    -0.0005169591266250642,
+    5.643437010946257e-05,
+    0.07140255496458071
+  ],
+  "rmsPixels": 0.21367296540777023,
+  "validationRmsPixels": [
+    0.18994072576580756,
+    0.17460848056692851,
+    0.24145240847928015,
+    0.20654116996037633,
+    0.2177777143096531
+  ],
+  "trainingCount": 15,
+  "validationCount": 5,
+  "calibrationVerified": true,
+  "diversityRatio": 0.06647246811582831,
+  "tiltDiversity": [
+    0.13399847677773735,
+    0.090625942646768
+  ],
+  "target": {
+    "type": "aprilgrid",
+    "family": "tag36h11",
+    "rows": 6,
+    "columns": 6,
+    "tagSizeMm": 22,
+    "gapMm": 6.6,
+    "layoutMode": "auto",
+    "firstId": 0,
+    "idOrder": "row-major"
+  },
+  "images": [
+    "frame-dd7d8b0c-bff6-4775-869a-5e07c4a82a96.jpg",
+    "frame-5cd3d35d-294e-4b68-a5f0-2b0e5dc131d5.jpg",
+    "frame-01a1a009-c68e-4269-bacb-aecd8dd17030.jpg",
+    "frame-c22deab5-b524-4746-a96a-9057414309a3.jpg",
+    "frame-0009a486-8e9a-4370-a99d-11f606b2c60e.jpg",
+    "frame-4109c6ca-d9bb-4fed-9742-edc1cea0e376.jpg",
+    "frame-d38f9fae-4824-4323-9c7d-982cc87e724f.jpg",
+    "frame-b0ab57b8-e813-4181-9fa2-8a772f5193dd.jpg",
+    "frame-6a7e3d86-ceb5-42a4-8e60-462ba1afa314.jpg",
+    "frame-1ad563ae-7c06-476f-8ea6-184d85ce3911.jpg",
+    "frame-a21ef4aa-ee63-4fdf-a65b-3714b38cd465.jpg",
+    "frame-9066d4d1-2f76-4df4-b8fe-3cbecd02a44a.jpg",
+    "frame-ffb420ad-2a90-4815-bf32-6a583cf647db.jpg",
+    "frame-1a435fea-f129-422f-bb51-0db922eef7f0.jpg",
+    "frame-5c4ae9ae-1d8e-43f9-b780-f3af8c485e04.jpg",
+    "frame-34b80a63-0715-44d6-bf48-0a3c75804595.jpg",
+    "frame-25062611-34fe-452e-a2d6-731273f72a12.jpg",
+    "frame-8c6ddc4a-f33e-4074-b381-a8a0957ead09.jpg",
+    "frame-b07f5732-4c91-4e44-a57f-a0e697379ee2.jpg",
+    "frame-317c5717-82be-4064-821c-09d4752b7d09.jpg"
+  ],
+  "createdAt": "2026-10-14T01:56:51.570Z",
+  "source": "aprilgrid-multi-view",
+  "physicalScaleConfirmed": true
+}

@@ -1,0 +1,11 @@
+{
+  "profile": "recorded_slow_trial",
+  "maxCurvature": 6.0,
+  "maxSpeed": 0.2,
+  "acceleration": 0.1,
+  "maxYawRate": 0.25,
+  "yawAcceleration": 0.3,
+  "maxOpposedTravel": 0.03,
+  "maxOffAxisTravel": 0.01,
+  "braking": 0.2
+}

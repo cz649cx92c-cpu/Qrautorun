@@ -1,0 +1,10 @@
+qr_ground_detector:
+  ros__parameters:
+    map_file: ""
+    camera_calibration_verified: false
+    camera_topic: /qr/camera/image
+    camera_info_topic: /qr/camera/camera_info
+    tag_size_m: 0.08
+    max_reprojection_px: 1.5
+    max_image_age_s: 0.25
+    max_tag_distance_m: 1.0

@@ -1,0 +1,8 @@
+odin_imu_only:
+  ros__parameters:
+    imu_topic: /odin1/imu
+    frame_id: imu_link
+    pid_file: /home/orangepi/ugv/QRautorun/qr_navigation_ws/logs/imu.pid
+    # 沿用现有Odin驱动的SDK倍率和轴变换，未将其视为已完成车体外参标定。
+    gyro_scale: 1.0
+    accel_scale: 1.0

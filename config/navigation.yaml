@@ -1,0 +1,40 @@
+greenhouse_navigation:
+  ros__parameters:
+    execution_enabled: false
+    backend_url: "http://127.0.0.1:3080"
+    bridge_key_file: "/home/orangepi/ugv/QRautorun/qr_navigation_ws/config/bridge.key"
+    feedback_topic: "/chassis_info_fb"
+    imu_topic: "/odin1/imu"
+    fused_pose_topic: "/qr/localization/pose"
+    localization_preview_topic: "/qr/localization/provisional"
+    observation_topic: "/qr/tags/observations"
+    feedback_calibration_verified: true
+    existing_chassis_confirmed: true
+    # 用户明确不要求重复验收现成底盘运行条件，保留实时反馈/急停/接管检查。
+    existing_runtime_conditions_accepted: true
+    field_freshness_verified: false
+    hardware_watchdog_verified: false
+    manual_takeover_verified: false
+    vehicle_dimensions_verified: false
+    wheel_angle_signs: [0.0, 0.0, 0.0, 0.0]
+    wheel_angle_offsets: [0.0, 0.0, 0.0, 0.0]
+    feedback_timeout_s: 0.3
+    localization_timeout_s: 0.25
+    command_timeout_s: 0.25
+    tag_timeout_s: 25.0
+    mode_timeout_s: 8.0
+    stopped_speed_mps: 0.015
+    angle_tolerance_deg: 3.0
+    stable_feedback_samples: 5
+    forward_speed_mps: 0.12
+    reverse_speed_mps: 0.10
+    lateral_speed_mps: 0.06
+    # 实机测试允许起点前后15cm；侧偏与航向上限仍由路径跟踪检查。
+    start_position_tolerance_m: 0.15
+    max_cross_track_m: 0.05
+    max_heading_rad: 0.15
+    # 二维码之间使用有效轮式/IMU推算；未标定sigma作诊断，不中断正常跨码。
+    qr_interval_navigation: true
+    max_position_sigma_m: 0.03
+    acceleration_mps2: 0.10
+    braking_mps2: 0.20

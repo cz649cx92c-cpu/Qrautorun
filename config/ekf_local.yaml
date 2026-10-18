@@ -1,0 +1,16 @@
+ekf_filter_node:
+  ros__parameters:
+    frequency: 30.0
+    sensor_timeout: 0.2
+    two_d_mode: true
+    publish_tf: true
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+    odom0: /qr/wheel/odom
+    # x,y,z,roll,pitch,yaw,vx,vy,vz,vroll,vpitch,vyaw,ax,ay,az
+    odom0_config: [false, false, false, false, false, false, true, true, false, false, false, true, false, false, false]
+    odom0_differential: false
+    odom0_queue_size: 20
+    # IMU实际topic确认后，通过专用参数文件填写imu0与imu0_config；不猜测现有接口。

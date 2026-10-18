@@ -1,0 +1,9 @@
+qr_chassis_odometry:
+  ros__parameters:
+    # 用户2026-10-14确认现成运动反馈准确，复用原body反馈，不猜测逐轮安装方向。
+    motion_confirmed: true
+    # 原ROS驱动横向字段除100，原协议/手柄除1000，适配层修正，不修改成熟驱动。
+    lateral_velocity_scale: 0.1
+    input_timeout_s: 0.25
+    velocity_sigma_mps: 0.03
+    yaw_sigma_rad_s: 0.02

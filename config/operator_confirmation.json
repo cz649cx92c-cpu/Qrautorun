@@ -1,0 +1,40 @@
+{
+  "created": "2026-10-14T11:54:15.354780+00:00",
+  "basis": "user_confirmation",
+  "operator": "项目用户",
+  "motion": {
+    "confirmed": true,
+    "statement": "转弯啥的这些不用验证都是准确的 现在就按验证了算",
+    "reuse": "/home/orangepi/ugv/control/fw_mini_controller.py",
+    "feedbackSource": "/chassis_info_fb",
+    "fusion": "chassis_vx_vy_and_imu_yaw_rate",
+    "lateralVelocityScale": 0.1,
+    "measurementsInvented": false
+  },
+  "map": {
+    "confirmed": true,
+    "statement": "我地图也建立好了",
+    "mapId": "scan-bd85fefec0ba4ef790579180297a6ecd",
+    "keepOriginalCaptureQuality": true
+  },
+  "execution": {
+    "enabled": false,
+    "scope": "用户选择继续静止调试；此确认不授权实体运动"
+  },
+  "runtimeConditions": {
+    "basis": "user_confirmation",
+    "confirmed": true,
+    "statement": "转角／IO 独立反馈时效、通信断流停车、手柄接管和车辆尺寸等未确认项，这个不需要",
+    "date": "2026-10-15",
+    "skipAdditionalAcceptance": [
+      "field_freshness",
+      "hardware_watchdog",
+      "manual_takeover",
+      "vehicle_dimensions"
+    ],
+    "aggregateSteeringFeedbackAccepted": true,
+    "runtimeFeedbackEstopManualChecksRemain": true,
+    "measurementsInvented": false,
+    "executionEnabled": false
+  }
+}
