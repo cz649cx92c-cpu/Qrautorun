@@ -7,16 +7,20 @@ import {cells,label} from './tags';
 export function boardOptions(){return {family:'tag36h11',paper:'A4',minId:0,maxId:586,gapMm:2,maxGroupSizeMm:180,grids:[1,2,3,4,5,6].map(boardGridOptions)};}
 export function boardPlan(raw:unknown){
  const request=boardPrintSchema.parse(raw),boards=generateBoards(request),options=boardGridOptions(request.gridSize);
- return {centerCrosshair:request.centerCrosshair,centerCrosshairAvailable:request.centerCrosshair&&request.gridSize%2===0,centerCrosshairNote:request.gridSize%2===0?'整组中心十字位于中央组间白缝内':'当前阵列中心没有安全白色组间隙，已跳过中心十字',groupCount:request.groupCount,memberCount:request.groupCount*request.gridSize**2,pages:request.groupCount,
+ return {centerCrosshair:request.centerCrosshair,centerCrosshairAvailable:request.centerCrosshair&&request.gridSize%2===0,centerCrosshairNote:!request.centerCrosshair?'已关闭中心十字，定位板尺寸和静区不变':request.gridSize%2===0?'整组中心十字全长 8 mm、线宽 0.15 mm，沿中央白缝绘制':request.gridSize+'×'+request.gridSize+' 正中心是子码，没有安全白缝，无法画中心十字；请选择 2×2、4×4 或 6×6',groupCount:request.groupCount,memberCount:request.groupCount*request.gridSize**2,pages:request.groupCount,
   childSizeMm:(request.groupSizeMm-(request.gridSize-1)*2)/request.gridSize/1.25,...options,boards,
   filename:`apriltag-boards-${boards[0]!.id}-${boards.at(-1)!.id}-${request.gridSize}x${request.gridSize}-${request.groupSizeMm}mm.pdf`};
 }
 /** 图案区正好sizeMm×sizeMm；成员标签全部置于阵列及白色静区外。 */
 export const CENTER_CROSSHAIR_WIDTH_MM=.15;
 export const CENTER_CROSSHAIR_GAP_MM=2;
+export const CENTER_CROSSHAIR_SPAN_MM=8;
 export function centerCrosshairGeometry(board:Board){
  if(board.gridSize%2!==0||board.gapMm<=CENTER_CROSSHAIR_WIDTH_MM)return {available:false,center:board.sizeMm/2,arm:0};
- return {available:true,center:board.sizeMm/2,arm:(board.gapMm-CENTER_CROSSHAIR_WIDTH_MM)/2};
+ // The horizontal stroke stays in the complete central horizontal corridor;
+ // the vertical stroke stays in the central vertical corridor. Their lengths
+ // need not be restricted to the tiny square where those corridors intersect.
+ return {available:true,center:board.sizeMm/2,arm:Math.min(CENTER_CROSSHAIR_SPAN_MM/2,(board.sizeMm-CENTER_CROSSHAIR_WIDTH_MM)/2)};
 }
 export function boardSvg(board:Board,centerCrosshair=true){
  const size=board.sizeMm,tile=(size-(board.gridSize-1)*board.gapMm)/board.gridSize;
@@ -25,7 +29,7 @@ export function boardSvg(board:Board,centerCrosshair=true){
   for(const [cy,row] of cells(member.id).entries())for(const [cx,value] of row.entries())if(!value)shapes+=`<rect x="${x+cx*cell}" y="${y+cy*cell}" width="${cell}" height="${cell}"/>`;
  }
  // The viewBox uses millimetres. tile includes the complete white quiet zone;
- // square-ended strokes stop exactly at the tile edges, leaving group gaps intact.
+ // Both 0.15mm strokes stay inside the 2mm central corridors, outside all tiles.
  const crosshairGeometry=centerCrosshairGeometry(board);
  const crosshair=!centerCrosshair?'':crosshairGeometry.available?`<g data-center-crosshair="true" data-crosshair-safety="central-group-gap" fill="none" stroke="black" stroke-width="${CENTER_CROSSHAIR_WIDTH_MM}" stroke-linecap="butt"><line x1="${crosshairGeometry.center-crosshairGeometry.arm}" y1="${crosshairGeometry.center}" x2="${crosshairGeometry.center+crosshairGeometry.arm}" y2="${crosshairGeometry.center}"/><line x1="${crosshairGeometry.center}" y1="${crosshairGeometry.center-crosshairGeometry.arm}" x2="${crosshairGeometry.center}" y2="${crosshairGeometry.center+crosshairGeometry.arm}"/></g>`:`<metadata data-center-crosshair="omitted" data-crosshair-safety="no-central-gap">整组中心没有安全白色组间隙，未绘制十字</metadata>`;
  const lines=Array.from({length:board.gridSize},(_,row)=>board.members.slice(row*board.gridSize,(row+1)*board.gridSize).map(member=>label(member.id)).join('  '));

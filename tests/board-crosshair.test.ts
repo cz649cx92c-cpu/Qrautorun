@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {inflateSync} from 'node:zlib';
 import {mkdirSync,writeFileSync} from 'node:fs';
-import {boardSvg,boardPdf,boardPlan,CENTER_CROSSHAIR_WIDTH_MM,CENTER_CROSSHAIR_GAP_MM,centerCrosshairGeometry} from '../web/backend/src/boards';
+import {boardSvg,boardPdf,boardPlan,CENTER_CROSSHAIR_WIDTH_MM,CENTER_CROSSHAIR_GAP_MM,CENTER_CROSSHAIR_SPAN_MM,centerCrosshairGeometry} from '../web/backend/src/boards';
 import {boardPrintSchema,generateBoards} from '../web/shared/boards';
 import {createApp} from '../web/backend/src/server';
 const request={gridSize:2,groupSizeMm:140,groupCount:1,startId:16};
@@ -23,7 +23,15 @@ test('定位板十字线：每整组仅中心白缝一枚，奇数阵列无安�
   assert.equal(lines.length,gridSize%2===0?2:0);assert.doesNotMatch(off,/data-center-crosshair|<line /);assert.equal(on.replace(/<g data-center-crosshair="true"[^>]*>[\s\S]*?<\/g>/,'').replace(/<metadata[^>]*>[\s\S]*?<\/metadata>/,''),off);
   if(gridSize%2){assert.match(on,/data-center-crosshair="omitted"/);assert.match(on,/data-crosshair-safety="no-central-gap"/);assert.equal(centerCrosshairGeometry(board).available,false);continue;}
   assert.match(on,/data-crosshair-safety="central-group-gap"/);const geometry=centerCrosshairGeometry(board);assert.equal(geometry.available,true);
-  const horizontal=lines[0]!,vertical=lines[1]!;close(horizontal.y1!,board.sizeMm/2);close(horizontal.y2!,board.sizeMm/2);close(vertical.x1!,board.sizeMm/2);close(vertical.x2!,board.sizeMm/2);close(horizontal.x2!-horizontal.x1!,board.gapMm-CENTER_CROSSHAIR_WIDTH_MM);close(vertical.y2!-vertical.y1!,board.gapMm-CENTER_CROSSHAIR_WIDTH_MM);assert.ok(tile>board.members[0]!.size*1000);
+  const horizontal=lines[0]!,vertical=lines[1]!;close(horizontal.y1!,board.sizeMm/2);close(horizontal.y2!,board.sizeMm/2);close(vertical.x1!,board.sizeMm/2);close(vertical.x2!,board.sizeMm/2);close(horizontal.x2!-horizontal.x1!,CENTER_CROSSHAIR_SPAN_MM);close(vertical.y2!-vertical.y1!,CENTER_CROSSHAIR_SPAN_MM);assert.ok(tile>board.members[0]!.size*1000);
+  for(const line of lines){
+   const half=CENTER_CROSSHAIR_WIDTH_MM/2;
+   const stroke={left:Math.min(line.x1!,line.x2!)-half,right:Math.max(line.x1!,line.x2!)+half,top:Math.min(line.y1!,line.y2!)-half,bottom:Math.max(line.y1!,line.y2!)+half};
+   for(let row=0;row<gridSize;row++)for(let column=0;column<gridSize;column++){
+    const x=column*(tile+board.gapMm),y=row*(tile+board.gapMm);
+    assert.ok(stroke.right<=x||stroke.left>=x+tile||stroke.bottom<=y||stroke.top>=y+tile,'十字不得接触任何子码及完整静区');
+   }
+  }
  }
 });
 test('PDF内容流：开启包含0.15mm十字笔画，关闭不包含，50mm尺与100% ACTUAL SIZE保持一致',async()=>{
