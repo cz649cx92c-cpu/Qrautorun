@@ -5,7 +5,7 @@ import Button from './ui/Button.vue';
 
 type BoardMember={id:number;x:number;y:number;angle:number;size:number};
 type Board={id:string;referenceId:number;gridSize:number;sizeMm:number;gapMm:number;members:BoardMember[]};
-type Plan={groupCount:number;memberCount:number;pages:number;childSizeMm:number;minGroupSizeMm:number;maxGroupSizeMm:number;boards:Board[];filename:string};
+type Plan={groupCount:number;memberCount:number;pages:number;childSizeMm:number;minGroupSizeMm:number;maxGroupSizeMm:number;boards:Board[];filename:string;centerCrosshairAvailable?:boolean;centerCrosshairNote?:string};
 type GridOption={gridSize:number;minGroupSizeMm:number;maxGroupSizeMm:number;minChildSizeMm:number};
 const emit=defineEmits<{generated:[result:Plan]}>();
 const gridOptions=ref<GridOption[]>([]),gridSize=ref(2),groupSizeMm=ref(140),groupCount=ref(3),startId=ref(0),centerCrosshair=ref(true);
@@ -28,6 +28,7 @@ const payload=()=>({gridSize:gridSize.value,groupSizeMm:groupSizeMm.value,groupC
 const label=(id:number)=>'Q'+String(id).padStart(3,'0');
 const previewUrl=computed(()=>'/api/boards/preview.svg?'+new URLSearchParams({gridSize:String(gridSize.value),groupSizeMm:String(groupSizeMm.value),startId:String(startId.value),centerCrosshair:String(centerCrosshair.value)}).toString());
 const firstBoard=computed(()=>plan.value?.boards[0]);
+const centerCrosshairNote=computed(()=>plan.value?.centerCrosshairNote??(gridSize.value%2===0?'整组中心十字只画在中央组间白缝内':'当前阵列中心没有安全白色组间隙，开启时也不会绘制十字'));
 const boardLabel=computed(()=>firstBoard.value?.id??'B'+String(startId.value).padStart(3,'0'));
 let timer:ReturnType<typeof setTimeout>|undefined,sequence=0,closed=false;
 async function responseError(response:Response){try{return (await response.json()).error??'请求失败';}catch{return '请求失败';}}
@@ -88,7 +89,7 @@ onBeforeUnmount(()=>{closed=true;clearTimeout(timer);sequence++;});
     <div class="size-status">{{gridOption?minSizeMm+'–'+maxSizeMm+' mm':'正在读取规格…'}}</div>
     <label>生成组数<input v-model.number="groupCount" type="number" min="1" :max="maxGroups" step="1"/></label>
     <label>起始子码编号<input v-model.number="startId" type="number" min="0" max="586" step="1"/></label>
-   <label class="crosshair-option"><input v-model="centerCrosshair" type="checkbox"/>中心十字对位线</label>
+   <label class="crosshair-option"><input v-model="centerCrosshair" type="checkbox"/>整组中心十字对位线</label><small class="crosshair-note" data-testid="crosshair-note">{{centerCrosshairNote}}</small>
    </fieldset>
    <div class="pdf-summary"><div><span>子码总数</span><strong>{{plan?.memberCount??memberCount}} 个</strong></div><div><span>A4 页数</span><strong>{{plan?.pages??groupCount}} 页</strong></div><div v-if="plan"><span>子码黑边尺寸</span><strong>{{plan.childSizeMm.toFixed(2)}} mm</strong></div><div><span>子码编号</span><strong>{{label(startId)}} – {{label(endId)}}</strong></div></div>
    <div v-if="localError||error" class="pdf-error" role="alert"><AlertTriangle :size="20"/>{{localError||error}}</div>
@@ -105,7 +106,7 @@ onBeforeUnmount(()=>{closed=true;clearTimeout(timer);sequence++;});
  </section>
 </template>
 <style scoped>
-.crosshair-option{display:flex;flex-direction:row;align-items:center;gap:8px}.crosshair-option input{width:16px;height:16px;padding:0;accent-color:var(--accent)}
+.crosshair-option{display:flex;flex-direction:row;align-items:center;gap:8px}.crosshair-note{display:block;margin-top:7px;color:var(--muted);font-size:11px;line-height:1.6}.crosshair-option input{width:16px;height:16px;padding:0;accent-color:var(--accent)}
 
 .pdf-workspace{display:flex;flex:1;min-height:0;overflow:hidden}
 .pdf-controls{width:350px;flex-shrink:0;padding:14px;overflow-y:auto;background:var(--background);border-right:1px solid var(--panel)}

@@ -5,7 +5,7 @@ import trial from '../../../src/greenhouse_navigation/greenhouse_navigation/reco
 
 export const routeDesignSchema=z.object({
  mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),baseVersion:z.number().int().positive(),
- points:z.array(pointSchema).min(2).max(501),bodyYawDeg:z.number().finite().min(-180).max(180)
+ points:z.array(pointSchema).min(2).max(501),bodyYawDeg:z.number().finite().min(-180).max(180),routeId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),routeName:z.string().trim().min(1).max(100).optional(),saveAs:z.boolean().default(false),routeUpdated:z.string().datetime().optional()
 }).strict();
 const wrap=(a:number)=>Math.atan2(Math.sin(a),Math.cos(a));
 const EPS=1e-8;

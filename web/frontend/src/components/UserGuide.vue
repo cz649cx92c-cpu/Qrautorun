@@ -3,7 +3,7 @@ import {ArrowRight,Printer,Grid2X2,ScanLine,Route,Navigation,Lightbulb,MoveRight
 import Button from './ui/Button.vue';
 const emit=defineEmits<{navigate:[page:'scan'|'navigate'|'print'|'camera']}>();
 const steps=[
- {name:'打印二维码',icon:Printer,text:'选择定位组规格与尺寸，生成 PDF。以 100% / ACTUAL SIZE 打印，核对 50 mm 校对尺；中心十字对位线默认开启。',action:'前往打印',page:'print' as const},
+ {name:'打印二维码',icon:Printer,text:'选择定位组规格与尺寸，生成 PDF。以 100% / ACTUAL SIZE 打印，核对 50 mm 校对尺；整组中心十字对位线默认开启；仅偶数阵列在整组中央白色组间隙绘制一枚，中心没有安全空隙时自动跳过。',action:'前往打印',page:'print' as const},
  {name:'铺设',icon:Grid2X2,text:'按水平和垂直网格铺设定位板，实测并记录组中心。转弯、折返处布置定位组，完成相机内参与安装参数标定。',action:'检查相机',page:'camera' as const},
  {name:'扫描建图',icon:ScanLine,text:'开始扫描后使用手柄示教，沿计划路径经过各定位组。记录完整档位与轨迹，停稳后完成扫描并生成地图。',action:'前往扫描',page:'scan' as const},
  {name:'编辑路径',icon:Route,text:'选择已生成的导航地图，点击“编辑路径”。尽量沿码连线绘制，点击“自动串码”预览逐码纠正节点，确认车头朝向并保存新地图版本。',action:'查看导航地图',page:'navigate' as const},
@@ -16,7 +16,7 @@ const questions=[
  {q:'保存后为什么路线两端缩短了？',a:'起终点会自动吸附到最近可直线串联的组中心，组外多余路线会截去。无需手动满足端点 3 cm 容差；编译产物直接使用精确组中心，仍须至少两个可串联定位组。'},
  {q:'为什么有些定位组是橙色、没有被串联？',a:'系统检查沿途 10 cm 内的码，只串联插入后仍能保持码间水平或垂直直线的中心。偏离码用橙色标记并显示偏离距离；建议把路线画过此码或调整铺码，不会为串码擅自在两码间加入直角换向。'},
  {q:'编辑提示地图版本冲突怎么办？',a:'其他页面已保存新版本。先保留当前设计信息，退出编辑并重新选择地图加载最新版本，再继续编辑；系统不会覆盖另一页面的新版本。'},
- {q:'十字线开关会改变定位板尺寸吗？',a:'不会。开关只改变打印对位线，子码、静区、组间距和校对尺保持一致。打印后仍应核对实际尺寸，并现场验证识别效果。'}
+ {q:'整组中心十字为什么有时不显示？',a:'十字只允许画在整组几何中心的白色组间隙内。偶数阵列有中央组间白缝时只绘制一枚；1×1或奇数阵列中心落在子码区域，没有安全空隙就自动跳过，避免覆盖子码和静区。开关不改变尺寸、编号、组间距或50 mm校对尺。'}
 ];
 </script>
 <template>

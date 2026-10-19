@@ -16,7 +16,7 @@ async function mock(page:Page,{withMap=false,accepted=false,url='/'}:{withMap?:b
   const request=route.request(),path=new URL(request.url()).pathname;calls.push(request.method()+' '+path);
   if(path==='/api/surveys')return route.fulfill({json:withMap?[record]:[]});
   if(path==='/api/surveys/'+record.id)return route.fulfill({json:record});
-  if(path==='/api/tasks')return route.fulfill({json:withMap?[task]:[]});
+  if(path==='/api/routes')return route.fulfill({json:[]});if(path==='/api/tasks')return route.fulfill({json:withMap?[task]:[]});
   if(path==='/api/boards')return route.fulfill({json:groups});
   if(path==='/api/maps/'+field.id)return route.fulfill({json:{map:field,version:7,acceptance:{accepted,digestValid:accepted,kind:accepted?'office_test':null}}});
   if(path==='/api/camera/status')return route.fulfill({json:{present:false,running:false}});
@@ -34,17 +34,17 @@ test('使用指南：侧栏分组、五步流程、铺设与朝向规则、FAQ�
  await expect(page.getByTestId('user-guide')).toContainText('同一行共线');await expect(page.getByTestId('user-guide')).toContainText('至少相距 8 cm');await expect(page.getByTestId('user-guide')).toContainText('约 5.7°');await expect(page.getByTestId('user-guide')).toContainText('每到下一码纠正一次');await expect(page.getByTestId('user-guide')).toContainText('橙色偏离码');
  await page.getByText('地图点位草稿已保存，为什么没有导航地图？',{exact:true}).click();await expect(page.locator('.guide-faq')).toContainText('只保存点位草稿');
  await page.locator('.guide-page').evaluate(el=>{el.scrollTop=0;});await readyFonts(page);await page.screenshot({path:'logs/ui-commercial-guide.png',fullPage:true});
- await page.getByRole('button',{name:'前往扫描',exact:true}).click();await expect(page.locator('.left-panel .panel-title')).toHaveText('扫描控制');await expect(page.getByTestId('workflow-steps')).toBeVisible();
+ await page.getByRole('button',{name:'前往扫描',exact:true}).click();await expect(page.locator('.left-panel .panel-title')).toHaveText('扫描控制');
  expect(h.calls.filter(c=>c.startsWith('POST'))).toEqual([]);expect(h.errors).toEqual([]);
 });
 test('商业控制台：步骤与真实统计同步、高级诊断默认隐藏、路径编辑状态、截图',async({page})=>{
  const h=await mock(page,{withMap:true,accepted:true});await expect(page.getByTestId('overview-stats')).toContainText('4 组');await expect(page.getByTestId('overview-stats')).toContainText('5.50');
- await expect(page.locator('.workflow-steps [aria-current="step"]')).toContainText('扫描建图');await expect(page.getByTestId('map-canvas')).toBeVisible();await readyFonts(page);await page.screenshot({path:'logs/ui-commercial-scan.png',fullPage:true});
- await page.locator('.sidebar').getByRole('button',{name:'开始导航',exact:true}).click();await expect(page.getByTestId('overview-stats')).toContainText('v7');await expect(page.getByTestId('global-status')).toContainText('地图 v7');
- await expect(page.locator('.workflow-steps [aria-current="step"]')).toContainText('开始导航');await expect(page.getByTestId('advanced-diagnostics')).not.toHaveAttribute('open','');await expect(page.locator('[data-sensor="detector"]')).toBeHidden();await expect(page.getByTestId('execution-errors')).toBeHidden();
+ await expect(page.getByTestId('map-canvas')).toBeVisible();await readyFonts(page);await page.screenshot({path:'logs/ui-commercial-scan.png',fullPage:true});
+ await page.locator('.sidebar').getByRole('button',{name:'开始导航',exact:true}).click();await expect(page.getByTestId('global-status')).not.toContainText('地图 v7');
+ await expect(page.getByTestId('advanced-diagnostics')).not.toHaveAttribute('open','');await expect(page.locator('[data-sensor="detector"]')).toBeHidden();await expect(page.getByTestId('execution-errors')).toBeHidden();
  await page.getByTestId('advanced-diagnostics').locator('summary').first().click();await expect(page.locator('[data-sensor="detector"]')).toBeVisible();await expect(page.getByTestId('execution-errors')).toBeVisible();await page.getByTestId('advanced-diagnostics').locator('summary').first().click();
- await page.getByTestId('edit-route').click();await expect(page.locator('.workflow-steps [aria-current="step"]')).toContainText('编辑路径');await expect(page.getByTestId('overview-stats')).toContainText('编辑预览');
- await page.getByRole('button',{name:'取消编辑',exact:true}).click();await expect(page.locator('.workflow-steps [aria-current="step"]')).toContainText('开始导航');await expect(page.locator('.navigation-actions').getByRole('button',{name:'停止',exact:true})).toBeInViewport();await readyFonts(page);await page.screenshot({path:'logs/ui-commercial-navigation.png',fullPage:true});
+ await page.getByTestId('edit-route').click();await expect(page.getByTestId('route-editor')).toBeVisible();await expect(page.getByTestId('overview-stats')).toBeHidden();
+ await page.getByRole('button',{name:'退出',exact:true}).click();await expect(page.locator('.navigation-actions').getByRole('button',{name:'停止',exact:true})).toBeInViewport();await readyFonts(page);await page.screenshot({path:'logs/ui-commercial-navigation.png',fullPage:true});
  expect(h.calls.filter(c=>c.startsWith('POST'))).toEqual([]);expect(h.errors).toEqual([]);
 });
 test('无地图引导：从这里开始可到指南及扫描，首次进入诊断折叠',async({page})=>{

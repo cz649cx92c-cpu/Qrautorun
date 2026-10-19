@@ -28,3 +28,5 @@ import './segment-route.test';
 import './route-design.test';
 
 import './board-crosshair.test';
+
+import './routes-persistence.test';

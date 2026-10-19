@@ -9,6 +9,7 @@ async function mock(page:Page){
  await page.routeWebSocket('**/ws/camera',ws=>ws.send(JSON.stringify({type:'camera',name:'HBVCAM',profiles:[],error:'无测试相机'})));
  await page.route('**/api/**',async route=>{
   const url=new URL(route.request().url()),path=url.pathname;
+  if(path==='/api/routes')return route.fulfill({json:[]});
   if(path==='/api/surveys'||path==='/api/tasks')return route.fulfill({json:[]});
   if(path==='/api/boards')return route.fulfill({json:boards});
   if(path==='/api/robot/status')return route.fulfill({json:status});
@@ -40,7 +41,7 @@ test('商业控制台：几何Logo、原选择器保留、页面及标定/记录
  await openPrint(page);await expect(page.locator('.pdf-workspace')).toBeVisible();await expect(page.locator('.board-preview')).toHaveCSS('box-shadow','rgba(15, 23, 42, 0.06) 0px 1px 2px 0px');await page.screenshot({path:'logs/ui-commercial-pdf.png',fullPage:true});expect(h.errors).toEqual([]);
 });
 test('PDF中心十字线：默认开启、预览与计划同步、开关控制实际下载参数',async({page})=>{
- const h=await mock(page);await openPrint(page);const toggle=page.getByRole('checkbox',{name:'中心十字对位线',exact:true});await expect(toggle).toBeChecked();
+ const h=await mock(page);await openPrint(page);const toggle=page.getByRole('checkbox',{name:'整组中心十字对位线',exact:true});await expect(toggle).toBeChecked();
  const image=page.locator('.board-preview img');await expect(image).toHaveAttribute('src',/centerCrosshair=true/);
  for(const enabled of [false,true]){
   await toggle.setChecked(enabled);await expect(image).toHaveAttribute('src',new RegExp('centerCrosshair='+enabled));await expect.poll(()=>h.planRequests.at(-1)?.centerCrosshair).toBe(enabled);
@@ -52,7 +53,7 @@ test('PDF中心十字线：默认开启、预览与计划同步、开关控制�
  expect(h.errors).toEqual([]);
 });
 for(const width of [375,760])test(`商业控制台窄屏${width}：PDF表单/预览及开关不溢出`,async({page})=>{
- await page.setViewportSize({width,height:900});const h=await mock(page);await openPrint(page);await page.getByRole('checkbox',{name:'中心十字对位线',exact:true}).uncheck();
+ await page.setViewportSize({width,height:900});const h=await mock(page);await openPrint(page);await page.getByRole('checkbox',{name:'整组中心十字对位线',exact:true}).uncheck();
  for(const selector of ['.pdf-workspace','.pdf-controls','.preview-toolbar','.board-list','.crosshair-option']){
   const box=await page.locator(selector).boundingBox();expect(box).not.toBeNull();expect(box!.x).toBeGreaterThanOrEqual(-1);expect(box!.x+box!.width).toBeLessThanOrEqual(width+1);
  }

@@ -39,6 +39,7 @@ async function mock(page:Page,{scan=false,maps=[field(),field('other-distance-ma
   if(path==='/api/camera/status')return route.fulfill({json:{running:true,present:true,frameAgeMs:10,error:''}});
   if(path==='/api/camera/calibration')return route.fulfill({json:{}});
   if(path==='/api/boards')return route.fulfill({json:boards});
+  if(path==='/api/routes')return route.fulfill({json:[]});
   if(path==='/api/tasks')return route.fulfill({json:maps.map(m=>({id:'task-scan-'+m.id,name:m.name,mapId:m.id,mapVersion:1,rowOrder:[],enabled:true}))});
   if(path==='/api/surveys')return route.fulfill({json:[...records.values()]});
   if(path.startsWith('/api/surveys/')){
@@ -54,7 +55,7 @@ async function mock(page:Page,{scan=false,maps=[field(),field('other-distance-ma
  await expect(page.locator('[data-sensor="preview"]')).toContainText('在线（预览画面）');
  await page.getByTestId('advanced-diagnostics').locator('summary').first().click();
  if(scan)await expect(page.locator('.state-card>span')).toHaveText('扫描已保存');
- else {await page.locator('.sidebar').getByRole('button',{name:'开始导航',exact:true}).click();await expect(page.getByLabel('导航地图')).toHaveValue('task-scan-'+maps[0]!.id);}
+ else {await page.locator('.sidebar').getByRole('button',{name:'开始导航',exact:true}).click();await expect(page.getByLabel('导航地图')).toHaveValue(maps[0]!.id);}
  await expect(page.getByTestId('map-canvas')).toBeVisible();
  return {records,calls,cameraConnections:()=>cameraConnections};
 }

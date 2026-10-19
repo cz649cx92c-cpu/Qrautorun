@@ -13,6 +13,7 @@ async function mock(page:Page,initial:any[],robot:any=status()){
   const path=new URL(route.request().url()).pathname;calls.push(path);
   if(path==='/api/camera/status')return route.fulfill({json:{running:true,present:true,frameAgeMs:10,error:''}});
   if(path==='/api/boards')return route.fulfill({json:[{id:'B000',referenceId:0}]});
+  if(path==='/api/routes')return route.fulfill({json:[]});
   if(path==='/api/tasks')return route.fulfill({json:[]});
   if(path==='/api/surveys'){
    if(failLists>0){failLists--;return route.fulfill({status:503,json:{error:'临时不可用'}});}

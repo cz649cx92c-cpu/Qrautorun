@@ -7,12 +7,17 @@ import {cells,label} from './tags';
 export function boardOptions(){return {family:'tag36h11',paper:'A4',minId:0,maxId:586,gapMm:2,maxGroupSizeMm:180,grids:[1,2,3,4,5,6].map(boardGridOptions)};}
 export function boardPlan(raw:unknown){
  const request=boardPrintSchema.parse(raw),boards=generateBoards(request),options=boardGridOptions(request.gridSize);
- return {centerCrosshair:request.centerCrosshair,groupCount:request.groupCount,memberCount:request.groupCount*request.gridSize**2,pages:request.groupCount,
+ return {centerCrosshair:request.centerCrosshair,centerCrosshairAvailable:request.centerCrosshair&&request.gridSize%2===0,centerCrosshairNote:request.gridSize%2===0?'整组中心十字位于中央组间白缝内':'当前阵列中心没有安全白色组间隙，已跳过中心十字',groupCount:request.groupCount,memberCount:request.groupCount*request.gridSize**2,pages:request.groupCount,
   childSizeMm:(request.groupSizeMm-(request.gridSize-1)*2)/request.gridSize/1.25,...options,boards,
   filename:`apriltag-boards-${boards[0]!.id}-${boards.at(-1)!.id}-${request.gridSize}x${request.gridSize}-${request.groupSizeMm}mm.pdf`};
 }
 /** 图案区正好sizeMm×sizeMm；成员标签全部置于阵列及白色静区外。 */
 export const CENTER_CROSSHAIR_WIDTH_MM=.15;
+export const CENTER_CROSSHAIR_GAP_MM=2;
+export function centerCrosshairGeometry(board:Board){
+ if(board.gridSize%2!==0||board.gapMm<=CENTER_CROSSHAIR_WIDTH_MM)return {available:false,center:board.sizeMm/2,arm:0};
+ return {available:true,center:board.sizeMm/2,arm:(board.gapMm-CENTER_CROSSHAIR_WIDTH_MM)/2};
+}
 export function boardSvg(board:Board,centerCrosshair=true){
  const size=board.sizeMm,tile=(size-(board.gridSize-1)*board.gapMm)/board.gridSize;
  let shapes='';for(const [index,member] of board.members.entries()){
@@ -21,10 +26,8 @@ export function boardSvg(board:Board,centerCrosshair=true){
  }
  // The viewBox uses millimetres. tile includes the complete white quiet zone;
  // square-ended strokes stop exactly at the tile edges, leaving group gaps intact.
- const crosshair=centerCrosshair?`<g data-center-crosshair="true" fill="none" stroke="black" stroke-width="${CENTER_CROSSHAIR_WIDTH_MM}" stroke-linecap="butt">${board.members.map((member,index)=>{
-  const x=(index%board.gridSize)*(tile+board.gapMm),y=Math.floor(index/board.gridSize)*(tile+board.gapMm),cx=x+tile/2,cy=y+tile/2;
-  return `<line data-tag-id="${member.id}" x1="${x}" y1="${cy}" x2="${x+tile}" y2="${cy}"/><line data-tag-id="${member.id}" x1="${cx}" y1="${y}" x2="${cx}" y2="${y+tile}"/>`;
- }).join('')}</g>`:'';
+ const crosshairGeometry=centerCrosshairGeometry(board);
+ const crosshair=!centerCrosshair?'':crosshairGeometry.available?`<g data-center-crosshair="true" data-crosshair-safety="central-group-gap" fill="none" stroke="black" stroke-width="${CENTER_CROSSHAIR_WIDTH_MM}" stroke-linecap="butt"><line x1="${crosshairGeometry.center-crosshairGeometry.arm}" y1="${crosshairGeometry.center}" x2="${crosshairGeometry.center+crosshairGeometry.arm}" y2="${crosshairGeometry.center}"/><line x1="${crosshairGeometry.center}" y1="${crosshairGeometry.center-crosshairGeometry.arm}" x2="${crosshairGeometry.center}" y2="${crosshairGeometry.center+crosshairGeometry.arm}"/></g>`:`<metadata data-center-crosshair="omitted" data-crosshair-safety="no-central-gap">整组中心没有安全白色组间隙，未绘制十字</metadata>`;
  const lines=Array.from({length:board.gridSize},(_,row)=>board.members.slice(row*board.gridSize,(row+1)*board.gridSize).map(member=>label(member.id)).join('  '));
  const titleFont=Math.min(4,size/8),font=Math.min(3,size/(board.gridSize*10)),lineHeight=font*1.45,labelHeight=16+lines.length*lineHeight;
  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}mm" height="${size+labelHeight}mm" viewBox="0 0 ${size} ${size+labelHeight}"><rect width="${size}" height="${size+labelHeight}" fill="white"/><g fill="black" shape-rendering="crispEdges">${shapes}</g>${crosshair}<g font-family="Helvetica,Arial" fill="black" text-anchor="middle" font-size="${font}"><text x="${size/2}" y="${size+6}" font-size="${titleFont}">${board.id}</text><text x="${size/2}" y="${size+11}" font-size="${Math.min(3,size/10)}">${board.gridSize}x${board.gridSize} · ${size} mm</text>${lines.map((line,index)=>`<text x="${size/2}" y="${size+16+index*lineHeight}">${line}</text>`).join('')}</g></svg>`;
