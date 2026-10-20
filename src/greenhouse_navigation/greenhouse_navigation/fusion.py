@@ -13,6 +13,7 @@ from sensor_msgs.msg import Imu
 from std_msgs.msg import String
 from yhs_can_interfaces.msg import ChassisInfoFb
 from .chassis_odometry import measured_body_twist
+from .imu_source_health import SerialSourceHealth
 
 
 # EKF已随输入适配器启动；校零后允许首帧初始化1秒，后续仍使用输入时效上限。
@@ -27,6 +28,8 @@ class StationaryCalibration:
         self.max_gap = max_gap
         self.samples = deque(maxlen=10000)
         self.result = None
+        self.last_reason = ''
+        self.last_window_statistics = None
 
     def add(self, stamp, gyro, acceleration, stationary):
         gyro = np.asarray(gyro, dtype=float)
@@ -44,9 +47,13 @@ class StationaryCalibration:
             return None
         gyros = np.array([s[1] for s in self.samples])
         accelerations = np.array([s[2] for s in self.samples])
-        if np.max(np.std(gyros, axis=0)) > .005 or np.max(np.std(accelerations, axis=0)) > .15:
+        gs=np.std(gyros,axis=0);ac=np.std(accelerations,axis=0)
+        self.last_window_statistics={'sampleCount':len(gyros),'gyroStdRadS':gs.tolist(),'accelerationStdMps2':ac.tolist()}
+        if np.max(gs) > .005 or np.max(ac) > .15:
+            self.last_reason='Stationary window rejected: gyro std %.6f rad/s, limit 0.005; accel std %.6f m/s2, limit 0.15. Not a hardware fault diagnosis.' % (np.max(gs),np.max(ac))
             self.samples.clear()
             return None
+        self.last_reason=''
         bias = np.mean(gyros, axis=0)
         gravity = np.mean(accelerations, axis=0)
         up = gravity / np.linalg.norm(gravity)
@@ -102,7 +109,7 @@ def usable_odometry(msg):
 class FusionInputs(Node):
     def __init__(self):
         super().__init__('qr_fusion_inputs')
-        defaults = {'source': 'legacy', 'odom_topic': '/odom', 'imu_topic': '/odin1/imu',
+        defaults = {'source': 'legacy', 'odom_topic': '/odom', 'imu_topic': '/qr/imu/raw',
                     'feedback_topic': '/chassis_info_fb', 'imu_frame': 'imu_link',
                     'input_timeout_s': .25, 'calibration_duration_s': 5.,
                     'calibration_min_samples': 500, 'wheel_velocity_sigma_mps': .03,
@@ -134,6 +141,9 @@ class FusionInputs(Node):
         self.stamps = {'imu': None, 'odom': None, 'feedback': None, 'filter': None}
         self.counts = {'imu': 0, 'odom': 0, 'filter': 0, 'provisional': 0, 'local': 0}
         self.feedback = None
+        self.source_health = SerialSourceHealth() if self.config['imu_topic']=='/qr/imu/raw' else None
+        if self.source_health is not None:
+            self.create_subscription(String,'/qr/imu/status',self.imu_source_cb,10)
         self.filtered = None
         self.invalid_reason = ''
         self.started = False
@@ -250,7 +260,22 @@ class FusionInputs(Node):
         self.mark_input_started('odom')
         self.counts['odom'] += 1
 
+    def imu_source_cb(self,msg):
+        try: payload=json.loads(msg.data)
+        except (ValueError,TypeError): payload={}
+        valid,changed=self.source_health.observe(payload,self.now())
+        if not valid or changed:
+            if self.calibration.result is not None or self.session_active():
+                self.invalid_reason=self.invalid_reason or '新IMU来源/连接已变化，旧校零作废'
+            self.calibration.samples.clear()
+
     def imu_cb(self, msg):
+        health=getattr(self,'source_health',None)
+        if health is not None and not health.fresh(self.now()):
+            if self.calibration.result is not None or self.session_active():
+                self.invalid_reason=self.invalid_reason or '新IMU来源状态过期，旧校零作废'
+            self.calibration.samples.clear()
+            return
         if msg.header.frame_id != self.config['imu_frame']:
             return
         gyro = [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z]
@@ -344,6 +369,11 @@ class FusionInputs(Node):
                    'lateralSupported': (self.config['source'] == 'wheels' and self.config['wheel_calibration_verified']
                                         or self.config['source'] == 'chassis' and self.config.get('existing_chassis_confirmed', False)),
                    'absoluteHeading': False, 'hardwareControl': False,
+                   'imuSourceTopic':self.config.get('imu_topic',''),
+                   'imuSourceHealthy':self.source_health.fresh(self.now()) if getattr(self,'source_health',None) is not None else None,
+                   'imuProjectionVerified':self.config.get('imu_projection_verified',False),
+                   'calibrationLastRejection':getattr(self.calibration,'last_reason',''),
+                   'calibrationWindowStatistics':getattr(self.calibration,'last_window_statistics',None),
                    'reason': ('保持静止，正在自动恢复：' + self.invalid_reason
                               + '；等待新鲜传感器数据后重新校零并建立新原点') if self.invalid_reason else
                              ('保持静止，正在静止校零' if state == 'CALIBRATING' else ''),

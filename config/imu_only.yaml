@@ -1,8 +1,11 @@
-odin_imu_only:
+qr_yahboom_imu:
   ros__parameters:
-    imu_topic: /odin1/imu
+    port: /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
+    baud: 115200
+    imu_topic: /qr/imu/raw
     frame_id: imu_link
-    pid_file: /home/orangepi/ugv/QRautorun/qr_navigation_ws/logs/imu.pid
-    # 沿用现有Odin驱动的SDK倍率和轴变换，未将其视为已完成车体外参标定。
-    gyro_scale: 1.0
-    accel_scale: 1.0
+    max_age_s: 0.25
+    reconnect_s: 1.0
+    max_backlog_bytes: 512
+    # Raw sensor axes; physical direction/mounting validation remains outstanding.
+    mounting_direction_verified: false

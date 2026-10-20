@@ -16,6 +16,7 @@ async function setup(page:Page,intermediate=false,offAxis=false,shifted=false){
  await page.route('**/api/**',async route=>{
   const path=new URL(route.request().url()).pathname;
   if(path==='/api/routes')return route.fulfill({json:[]});if(path==='/api/tasks')return route.fulfill({json:[task()]});
+  if(path==='/api/maps')return route.fulfill({json:[{id:map.id,name:map.name,version}]});
   if(path==='/api/surveys'||path==='/api/boards')return route.fulfill({json:[]});
   if(path==='/api/camera/status')return route.fulfill({json:{running:false,present:false}});
   if(path==='/api/maps/'+map.id)return route.fulfill({json:{map,version}});

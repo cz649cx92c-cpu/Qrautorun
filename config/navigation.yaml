@@ -4,7 +4,7 @@ greenhouse_navigation:
     backend_url: "http://127.0.0.1:3080"
     bridge_key_file: "/home/orangepi/ugv/QRautorun/qr_navigation_ws/config/bridge.key"
     feedback_topic: "/chassis_info_fb"
-    imu_topic: "/odin1/imu"
+    imu_topic: "/qr/imu/raw"
     fused_pose_topic: "/qr/localization/pose"
     localization_preview_topic: "/qr/localization/provisional"
     observation_topic: "/qr/tags/observations"

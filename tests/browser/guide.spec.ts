@@ -17,6 +17,7 @@ async function mock(page:Page,{withMap=false,accepted=false,url='/'}:{withMap?:b
   if(path==='/api/surveys')return route.fulfill({json:withMap?[record]:[]});
   if(path==='/api/surveys/'+record.id)return route.fulfill({json:record});
   if(path==='/api/routes')return route.fulfill({json:[]});if(path==='/api/tasks')return route.fulfill({json:withMap?[task]:[]});
+  if(path==='/api/maps')return route.fulfill({json:withMap?[{id:field.id,name:field.name,version:7}]:[]});
   if(path==='/api/boards')return route.fulfill({json:groups});
   if(path==='/api/maps/'+field.id)return route.fulfill({json:{map:field,version:7,acceptance:{accepted,digestValid:accepted,kind:accepted?'office_test':null}}});
   if(path==='/api/camera/status')return route.fulfill({json:{present:false,running:false}});
@@ -32,7 +33,7 @@ test('使用指南：侧栏分组、五步流程、铺设与朝向规则、FAQ�
  await page.locator('.sidebar').getByRole('button',{name:'使用指南',exact:true}).click();await expect(page.getByRole('heading',{name:'使用指南',exact:true})).toBeVisible();
  await expect(page.getByTestId('user-guide')).toBeVisible();await expect(page.locator('.guide-flow>li')).toHaveCount(5);await expect(page.locator('.sidebar .nav-item.active')).toHaveText('使用指南');
  await expect(page.getByTestId('user-guide')).toContainText('同一行共线');await expect(page.getByTestId('user-guide')).toContainText('至少相距 8 cm');await expect(page.getByTestId('user-guide')).toContainText('约 5.7°');await expect(page.getByTestId('user-guide')).toContainText('每到下一码纠正一次');await expect(page.getByTestId('user-guide')).toContainText('橙色偏离码');
- await page.getByText('地图点位草稿已保存，为什么没有导航地图？',{exact:true}).click();await expect(page.locator('.guide-faq')).toContainText('只保存点位草稿');
+ await page.getByText('地图已保存，为什么还不能开始导航？',{exact:true}).click();await expect(page.locator('.guide-faq')).toContainText('不会自动创建路径或任务');
  await page.locator('.guide-page').evaluate(el=>{el.scrollTop=0;});await readyFonts(page);await page.screenshot({path:'logs/ui-commercial-guide.png',fullPage:true});
  await page.getByRole('button',{name:'前往扫描',exact:true}).click();await expect(page.locator('.left-panel .panel-title')).toHaveText('扫描控制');
  expect(h.calls.filter(c=>c.startsWith('POST'))).toEqual([]);expect(h.errors).toEqual([]);

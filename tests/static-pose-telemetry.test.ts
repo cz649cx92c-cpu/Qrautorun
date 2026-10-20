@@ -92,7 +92,7 @@ test('网页正式位姿使用同步来源，静止预览不解除canNavigate条
  const statement=ast.statements.find(s=>ts.isVariableStatement(s)&&s.declarationList.declarations.some(d=>d.name.getText(ast)==='canNavigate'));
  assert.ok(statement);const gate=ts.transpileModule(statement.getText(ast),{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
  const context=vm.createContext({computed:(fn:()=>boolean)=>({get value(){return fn()}}),
-  editingRoute:{value:false},speedDirty:{value:false},
+  editingRoute:{value:false},speedDirty:{value:false},savedStrategyBlockers:{value:[]},lateralStrategyBlocked:{value:false},
   tasks:{value:[{id:'task-scan-office',mapId:'office',mapVersion:2}]},selectedTask:{value:'task-scan-office'},
   field:{value:{id:'office',coordinateStatus:'reviewed',captureQuality:'draft'}},version:{value:2},
   mapApproval:{value:{accepted:true,digestValid:true}},userConfirmedMap:{value:true},robot:{value:status}});

@@ -33,7 +33,9 @@ def heading_degrees(yaw):
 class GreenhouseNode(Node):
     def __init__(self):
         super().__init__('greenhouse_navigation')
-        defaults={'execution_enabled':False,'backend_url':'http://127.0.0.1:3080','bridge_key_file':'','feedback_topic':'/chassis_info_fb','imu_topic':'','fused_pose_topic':'/qr/localization/pose','localization_preview_topic':'/qr/localization/provisional','observation_topic':'/qr/tags/observations','feedback_calibration_verified':False,'field_freshness_verified':False,'hardware_watchdog_verified':False,'manual_takeover_verified':False,'vehicle_dimensions_verified':False,'wheel_angle_signs':[0.,0.,0.,0.],'wheel_angle_offsets':[0.,0.,0.,0.],'feedback_timeout_s':.3,'localization_timeout_s':.25,'command_timeout_s':.25,'tag_timeout_s':25.,'mode_timeout_s':8.,'stopped_speed_mps':.015,'angle_tolerance_deg':3.,'stable_feedback_samples':5,'forward_speed_mps':.12,'reverse_speed_mps':.1,'lateral_speed_mps':.06,'max_cross_track_m':.05,'max_heading_rad':.15,'max_position_sigma_m':.03,'acceleration_mps2':.1,'braking_mps2':.2}
+        defaults={'execution_enabled':False,'backend_url':'http://127.0.0.1:3080','bridge_key_file':'','feedback_topic':'/chassis_info_fb','imu_topic':'/qr/imu/raw','fused_pose_topic':'/qr/localization/pose','localization_preview_topic':'/qr/localization/provisional','observation_topic':'/qr/tags/observations','feedback_calibration_verified':False,'field_freshness_verified':False,'hardware_watchdog_verified':False,'manual_takeover_verified':False,'vehicle_dimensions_verified':False,'wheel_angle_signs':[0.,0.,0.,0.],'wheel_angle_offsets':[0.,0.,0.,0.],'feedback_timeout_s':.3,'localization_timeout_s':.25,'command_timeout_s':.25,'tag_timeout_s':25.,'mode_timeout_s':8.,'stopped_speed_mps':.015,'angle_tolerance_deg':3.,'stable_feedback_samples':5,'forward_speed_mps':.12,'reverse_speed_mps':.1,'lateral_speed_mps':.06,'max_cross_track_m':.05,'max_heading_rad':.15,'max_position_sigma_m':.03,'acceleration_mps2':.1,'braking_mps2':.2}
+        defaults['maintenance_mode']=False
+        defaults['imu_direction_verified']=False
         self.config={}
         self.can_health=CanHealth('can0')
         defaults['existing_chassis_confirmed']=False
@@ -41,6 +43,8 @@ class GreenhouseNode(Node):
         defaults['start_position_tolerance_m']=.05
         defaults['qr_interval_navigation']=False
         for key,value in defaults.items():self.declare_parameter(key,value);self.config[key]=self.get_parameter(key).value
+        if self.config['maintenance_mode'] and self.config['execution_enabled']:
+            raise ValueError('IMU维护模式必须禁用实体执行')
         self.execution_diagnostics=ExecutionDiagnostics();self.mission=Mission(self.config);self.feedback=None;self.received=0.;self.pose=None;self.pose_received=0.;self.imu_received=0.;self.observations=[];self.tag_received=0.;self.camera_received=0.;self.observation_received=0.;self.camera_frame_stamp=None;self.seq=0
         self.boot_id=str(uuid.uuid4());self.commands=queue.Queue();self.acks=queue.Queue();self.survey=queue.Queue(maxsize=500);self.motion_records=queue.Queue(maxsize=3000);self.lock=threading.Lock();self.snapshot={};self.registry_boards=[];self.active_boards=[];self.boards_sent=None;self.fusion=None;self.fusion_received=0.;self.detector=None;self.detector_received=0.;self.pid_file=Path(self.config['bridge_key_file']).parent.parent/'logs/robot.pid';self.pid_file.parent.mkdir(parents=True,exist_ok=True);self.pid_file.write_text(str(os.getpid()));self.closed=threading.Event();self.last_tick=time.monotonic();self.engaged=False
         self.mapping=None;self.mapping_received=0.
@@ -307,6 +311,7 @@ class GreenhouseNode(Node):
             else:tags=collapse_group_observations(tags,self.active_boards)
             if self.active_boards:tags=[t for t in tags if t.get('groupId')]
             self.observations=tags;self.observation_received=time.monotonic();self.camera_received=self.observation_received
+            self.mapping_observation=None
             known={t['id'] for t in self.mission.field['tags']} if self.mission.running and self.mission.field else None
             relevant=[t for t in tags if known is None or t['id'] in known]
             if relevant:self.tag_received=time.monotonic()
@@ -318,6 +323,11 @@ class GreenhouseNode(Node):
                 fusion=getattr(self,'fusion',None) or {}
                 epoch=batch.get('localEpoch') or fusion.get('epoch')
                 if epoch:sample['localEpoch']=epoch
+                # Only accepted synchronized local-pose evidence may enable mapping.
+                if (tags and batch.get('localEpoch') and isinstance(local,dict)
+                        and all(isinstance(local.get(k),(int,float)) and not isinstance(local.get(k),bool)
+                                and math.isfinite(local[k]) for k in ('x','y','yaw'))):
+                    self.mapping_observation={'stamp':stamp,'localEpoch':batch['localEpoch']}
                 try:self.survey.put_nowait(sample)
                 except queue.Full:self.mission.log('采集缓冲已满，停止接收该批观测')
         except (ValueError,TypeError,KeyError):self.mission.log('拒绝无效标记观测')
@@ -346,6 +356,7 @@ class GreenhouseNode(Node):
         fresh=0<=now-self.received<configured['feedback_timeout_s']
         safe_to_request_unlock=GreenhouseNode.motion_feedback_ready(self)
         checks=[('execution','实体执行许可',configured['execution_enabled']),('feedback','底盘反馈时效',fresh),('calibration','底盘反馈倍率与轮角标定',configured['feedback_calibration_verified'] and all(abs(s)==1 for s in configured['wheel_angle_signs'])),('freshness','四轮角与IO独立新鲜度验证',configured['field_freshness_verified']),('watchdog','底盘通信看门狗验证',configured['hardware_watchdog_verified']),('takeover','手柄接管互斥验证',configured['manual_takeover_verified']),('dimensions','整车尺寸与扫掠验收',configured['vehicle_dimensions_verified']),('ownership','底盘命令发布者独占',ownership),('unlock','底盘安全状态可请求解锁',safe_to_request_unlock),('estop','硬件急停释放',not fb.get('estop',True)),('remote','人工接管未占用',not fb.get('remote_control',True)),('pose','实时融合位姿与误差',GreenhouseNode.navigation_pose_ready(self,now)),('imu','真实IMU数据',bool(configured['imu_topic']) and now-self.imu_received<.5),('camera','实时标定相机观测',now-self.camera_received<.5)]
+        checks.append(('imu_direction','新IMU实物方向标定',configured.get('imu_direction_verified',False)))
         if getattr(self,'can_health',None) is not None:
             can=self.can_health.status()
             checks.append(('can','CAN发送链路'+('' if can['ready'] else '（'+can['state']+'）'),can['ready']))
@@ -409,6 +420,7 @@ class GreenhouseNode(Node):
         return True
 
     def request_start(self,command,conditions):
+        if self.config.get('maintenance_mode',False):raise ValueError('IMU维护模式拒绝导航启动')
         if self.pending_start or self.mission.running:raise ValueError('已有启动中或运行中任务')
         missing=[v['label'] for v in conditions if not v['ready']]
         if missing:raise ValueError('ROS2安全条件不满足：'+'、'.join(missing))
@@ -497,6 +509,7 @@ class GreenhouseNode(Node):
             telemetry['executionDiagnostics']=self.execution_diagnostics.finalize(diagnostic_sample,self.mission)
         except Exception:
             telemetry['executionDiagnostics']={'status':'unavailable','reason':'执行诊断数据暂不可用','sampledAt':diagnostic_time}
+        telemetry['maintenance']={'active':self.config.get('maintenance_mode',False),'executionEnabled':self.config['execution_enabled'],'pendingStart':self.pending_start is not None,'queuedLocalCommands':self.commands.qsize(),'taskCommandPolling':not self.config.get('maintenance_mode',False),'imuDirectionVerified':self.config.get('imu_direction_verified',False)}
         telemetry['markerTracking']=GreenhouseNode.marker_tracking(self,start)
         telemetry.update(self.sensor_status(start,telemetry['sensors']))
         telemetry['pose'],telemetry['localization']=self.localization_telemetry(start)
@@ -582,7 +595,14 @@ class GreenhouseNode(Node):
         if fusion_fresh and fusion.get('mappingReady') and detector_fresh and detected.get('captureTimestampVerified') is True:
             mapping_quality='verified';mapping_epoch=fusion.get('epoch','')
             observation_fresh=0<=now-getattr(self,'observation_received',0.)<.25
-            mapping_ready=bool(detected.get('localPoseReady') and observation_fresh and mapping_epoch)
+            evidence=getattr(self,'mapping_observation',None) or {}
+            evidence_stamp=evidence.get('stamp',float('-inf'))
+            now_ros=self.get_clock().now().nanoseconds/1e9
+            mapping_ready=bool(observation_fresh and mapping_epoch
+                and evidence.get('localEpoch')==mapping_epoch and 0<=now_ros-evidence_stamp<.25)
+            if mapping_ready:
+                sensors['camera']='定位观测已同步'
+                if detector_reason=='局部轮式/IMU融合位姿未验证，扫描尚未就绪':detector_reason=''
             mapping_reason='' if mapping_ready else '等待新鲜的正式同步定位观测'
         if fusion_fresh and fusion.get('state')=='INVALID':
             # Keep the actual cause while removing the obsolete manual-restart advice.
@@ -600,6 +620,11 @@ class GreenhouseNode(Node):
                 'mapping':{'ready':bool(mapping_ready and fusion_fresh and fusion.get('ready') and fusion.get('state')!='INVALID' and detector_fresh),
                     'quality':mapping_quality,'reason':mapping_reason,'localEpoch':mapping_epoch,
                     'lateralSupported':bool(fusion_fresh and fusion.get('ready') and fusion.get('lateralSupported'))}}
+
+    def fetch_task_commands(self,request):
+        # Maintenance observes telemetry but never fetches/consumes queued jobs.
+        if self.config.get('maintenance_mode',False):return []
+        return request('/api/robot/commands')
 
     def web_worker(self):
         seen=set();url=self.config['backend_url'];key_path=Path(self.config['bridge_key_file']);opener=build_opener(ProxyHandler({}));last_error=0.
@@ -622,7 +647,7 @@ class GreenhouseNode(Node):
                     last_sent_snapshot=snapshot_key
                     if log_path.exists() and log_path.stat().st_size>20*1024*1024:log_path.replace(log_path.with_suffix('.previous.jsonl'))
                     with log_path.open('a') as file:file.write(json.dumps({'recorded':time.time(),'status':status},ensure_ascii=False)+'\n')
-                for c in request('/api/robot/commands'):
+                for c in self.fetch_task_commands(request):
                     if c['id'] not in seen:self.commands.put(c);seen.add(c['id'])
                 while not self.acks.empty():request('/api/robot/ack',self.acks.get_nowait())
                 motion=[]

@@ -1,4 +1,5 @@
 import {pointDraftMap} from './survey';
+import {mapOnlyRequestSchema,createSurveyPointMap} from './map-only';
 import {appendMotionRecords} from './survey';
 import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
@@ -19,7 +20,9 @@ import {zipSync,strToU8} from 'fflate';
 import {batchPlan,exportBatch} from './batch-print';
 import {compileScan,scanSettings} from './scan-map';
 import {compileDesignedRoute,routeDesignSchema} from './route-design';
-import {boardOptions,boardPlan,boardSvg,boardPdf,boardTables,listBoards,checkBoardRegistration,registerBoards} from './boards';
+import {segmentExecutionBlockers} from '../../shared/segment-strategy';
+import {registerTagReprintRoutes} from './tag-reprint';
+import {boardOptions,boardPlan,boardRegistrationPlan,boardSvg,boardPdf,boardTables,listBoards,checkBoardRegistration,registerBoards} from './boards';
 import {boardPrintSchema} from '../../shared/boards';
 import {CameraPreview} from './camera';
 import {CameraCalibration} from './calibration';
@@ -95,9 +98,10 @@ export async function createApp(database?:string) {
  app.get<{Params:{id:string}}>('/api/robot/commands/:id',(req,reply)=>{reply.header('Cache-Control','no-store');const result=robot.commandResult(req.params.id);return result??reply.code(404).send({error:'命令结果不存在或已过期'});});
  app.post('/api/robot/ack',req=>{authorized(req);const b=z.object({id:z.string(),ok:z.boolean().optional(),message:z.string().max(1000).optional()}).parse(req.body);robot.ack(b.id,b.ok,b.message);log(`${b.id} ${b.ok===undefined?'UNCONFIRMED':b.ok?'OK':'REJECTED'} ${b.message??''}`);return {ok:true};});
  app.get('/api/maps',()=>store.list());
+ registerTagReprintRoutes(app,store);
  app.get('/api/boards/options',()=>boardOptions());
  app.get('/api/boards',()=>listBoards(store));
- app.post('/api/boards/plan',req=>boardPlan(req.body));
+ app.post('/api/boards/plan',req=>boardRegistrationPlan(store,req.body));
  const boardCrosshairQuery=z.object({centerCrosshair:z.enum(['true','false']).default('true').transform(value=>value==='true')});
  app.get('/api/boards/preview.svg',(req,reply)=>{
   const query=z.object({gridSize:z.coerce.number().int().min(1).max(6),groupSizeMm:z.coerce.number().finite().min(20).max(180),startId:z.coerce.number().int().min(0).max(586).default(0)}).merge(boardCrosshairQuery).parse(req.query);
@@ -125,8 +129,8 @@ export async function createApp(database?:string) {
   const body=parsed.data,status=robot.status();if(status.running||robot.poll().some(c=>c.type==='start'))throw new Error('请先停止导航并等待启动指令处理完成，再编辑路径');
   return store.db.transaction(()=>{
    const latest=store.get(body.mapId),item=store.get(body.mapId,body.baseVersion);if(!latest)throw Object.assign(new Error('地图不存在'),{statusCode:404});if(!item)throw Object.assign(new Error('地图版本不存在或已被其他页面保存，请重新加载最新版本后再修改'),{statusCode:409});if(latest.version!==body.baseVersion)throw Object.assign(new Error('地图已有新版本，请重新加载后再编辑路径'),{statusCode:409});
-   const compiled=compileDesignedRoute(item.map,body.points,body.bodyYawDeg);
-   if(body.routeId||body.routeName||body.saveAs){
+   const compiled=compileDesignedRoute(item.map,body.points,body.bodyYawDeg,body.segmentModes);
+   if(body.routeId||body.routeName||body.saveAs||item.map.routeMode==='map-only'){
     const routeId=body.saveAs||!body.routeId?'route-'+randomBytes(12).toString('hex'):body.routeId;const now=new Date().toISOString();
     const route=store.saveRoute({routeId,mapId:body.mapId,name:body.routeName??item.map.name+'路线',mapVersion:body.baseVersion,mapDigest:store.digest(item.map),points:body.points,motionSegments:compiled.map.motionSegments!,bodyYawDeg:body.bodyYawDeg,created:now,updated:now},body.routeUpdated);
     const snapshot=routeMapSnapshot(item.map,route);const tasks=(store.db.prepare('SELECT body FROM tasks ORDER BY updated DESC').all() as {body:string}[]).map(row=>taskSchema.parse(JSON.parse(row.body)));const matching=tasks.find(task=>task.routeId===route.routeId);
@@ -189,7 +193,10 @@ export async function createApp(database?:string) {
  app.post('/api/navigation/start',req=>{
   const {taskId}=z.object({taskId:z.string()}).parse(req.body);const row=store.db.prepare('SELECT body FROM tasks WHERE id=?').get(taskId) as {body:string}|undefined;if(!row)throw new Error('请先保存导航任务');const task=taskSchema.parse(JSON.parse(row.body));const latest=store.get(task.mapId),base=store.get(task.mapId,task.mapVersion),route=task.routeId?store.getRoute(task.routeId):null;if(!latest||!base||latest.version!==task.mapVersion||task.routeId&&(!route||route.mapId!==task.mapId||route.mapVersion!==task.mapVersion||route.mapDigest!==store.digest(base.map)))throw new Error('地图已有修改或执行路径绑定版本不一致，请重新验收并更新任务绑定版本');const item=route?{...base,map:routeMapSnapshot(base.map,route)}:base;
   if(task.routeSnapshot){const snapshot=task.routeSnapshot;if(!route||snapshot.routeId!==task.routeId||snapshot.mapId!==task.mapId||snapshot.mapVersion!==task.mapVersion||snapshot.mapDigest!==store.digest(base.map))throw new Error('任务路径快照与当前地图摘要或版本不一致');item.map=routeMapSnapshot(base.map,snapshot);}
+  if(item.map.routeMode==='map-only')throw Object.assign(new Error('请先手动编辑并保存导航路径'),{statusCode:423});
   const approval=mapApproval(base);
+  const strategyBlockers=segmentExecutionBlockers(item.map.motionSegments);if(strategyBlockers.length)throw Object.assign(new Error('路径策略尚不可执行：'+strategyBlockers.join('；')),{statusCode:423});
+  if(item.map.motionSegments?.some(segment=>segment.strategy==='left'||segment.strategy==='right')&&robot.status().mapping?.lateralSupported!==true)throw Object.assign(new Error('横移能力未由当前导航节点确认，禁止执行显式左/右平移策略'),{statusCode:423});
   if(item.map.captureQuality==='draft'&&!(approval.accepted&&(approval.kind==='user_confirmation'||approval.kind==='office_test')))throw Object.assign(new Error('此地图来自草稿采集，需显式用户确认后才能接纳导航地图'),{statusCode:423});
   const reasons=robot.status().conditions.filter(c=>!c.ready).map(c=>c.label);if(!approval.accepted)reasons.push('温室地图实测坐标验收或用户确认');
   if(!task.enabled)reasons.push('任务启用');if(!robot.status().connected)reasons.push('ROS2节点连接');if(reasons.length)throw Object.assign(new Error('尚未满足：'+[...new Set(reasons)].join('、')),{statusCode:423});
@@ -226,6 +233,23 @@ export async function createApp(database?:string) {
   if(result.stopped)log(result.reason);
   if(result.continuedFrom)log('自动保存扫描段 '+result.continuedFrom+'，继续扫描 '+result.sessionId);
   return result;
+ });
+ app.post('/api/survey/map',async req=>{
+  const body=mapOnlyRequestSchema.parse(req.body),session=getSurvey(store,body.sessionId);
+  if(session.state!=="stopped")throw new Error("请先停止扫描，再保存定位码地图");
+  const id="scan-"+session.id.replaceAll("-",""),existing=store.get(id);
+  if(existing&&existing.map.routeMode!=="map-only")throw Object.assign(new Error("此记录已有旧导航地图，请保留原地图并另建扫描"),{statusCode:409});
+  if((existing?.version??0)!==body.baseVersion)throw Object.assign(new Error("地图已被其他页面保存，请重新加载最新版本后再修改"),{statusCode:409});
+  if(existing&&!body.rebuild)throw Object.assign(new Error("此扫描已保存地图，请点击从原始扫描重建新版本；旧版本将保留"),{statusCode:409});
+  const evidence=JSON.stringify([session.name,session.samples,session.boards,session.anchors]);
+  const map=await createSurveyPointMap(root,session,body);
+  return store.db.transaction(()=>{
+   const latest=getSurvey(store,body.sessionId);
+   if(latest.state!=="stopped"||JSON.stringify([latest.name,latest.samples,latest.boards,latest.anchors])!==evidence)throw Object.assign(new Error("整理期间扫描记录发生变化，请重新停止并保存"),{statusCode:409});
+   const saved=saveMap(map,body.baseVersion);
+   log((existing?"从原始扫描重建定位码地图新版本 ":"保存整理后的定位码地图 ")+session.id+" v"+saved.version);
+   return {...saved,mapOnly:true,route:null,task:null};
+  })();
  });
  app.post('/api/survey/draft',req=>{
   const body=z.object({sessionId:z.string(),tagSizeMm:z.number().min(20).max(180).default(80)}).parse(req.body),session=getSurvey(store,body.sessionId);

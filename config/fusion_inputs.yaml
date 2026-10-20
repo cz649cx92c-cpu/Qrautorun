@@ -4,7 +4,7 @@ qr_fusion_inputs:
     odom_topic: /qr/chassis/odom
     # 依据用户对现成底盘运动反馈的明确确认，噪声仍保留现有保守先验。
     existing_chassis_confirmed: true
-    imu_topic: /odin1/imu
+    imu_topic: /qr/imu/raw
     feedback_topic: /chassis_info_fb
     imu_frame: imu_link
     input_timeout_s: 0.25

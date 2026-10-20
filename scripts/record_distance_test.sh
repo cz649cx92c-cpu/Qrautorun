@@ -16,6 +16,6 @@ set -u
 export ROS_LOG_DIR="$qr_project_root/logs/ros"
 exec /opt/ros/humble/bin/ros2 bag record -s sqlite3 --max-cache-size 1048576 \
   -o "$qr_record_path" \
-  /chassis_info_fb /odom /odin1/imu /qr/imu/status \
+  /chassis_info_fb /odom /qr/imu/raw /qr/imu/status \
   /qr/camera/status /qr/detector/status /qr/tags/provisional \
   /qr/fusion/status /qr/wheel/odom /ctrl_cmd /steering_ctrl_cmd

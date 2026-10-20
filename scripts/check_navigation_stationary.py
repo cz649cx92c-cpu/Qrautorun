@@ -20,7 +20,7 @@ JSON_TOPICS = ('/qr/tags/observations', '/qr/tags/provisional', '/qr/fusion/stat
 POSE_TOPICS = ('/qr/chassis/odom', '/qr/odometry/local', '/qr/odometry/provisional',
                '/qr/localization/pose', '/qr/localization/provisional', '/qr/localization/static_pose')
 TOPIC_MAX_AGE = {'/qr/camera/status': 1., '/qr/detector/status': .5,
-                 '/qr/fusion/status': .3, '/qr/localization/status': .3, '/odin1/imu': .5, '/chassis_info_fb': .3}
+                 '/qr/fusion/status': .3, '/qr/localization/status': .3, '/qr/imu/raw': .5, '/chassis_info_fb': .3}
 
 
 def finite(value):
@@ -263,7 +263,7 @@ def main():
     rclpy.init()
     node = rclpy.create_node('qr_navigation_stationary_check')
     specs = {
-        '/chassis_info_fb': ChassisInfoFb, '/odin1/imu': Imu, '/odom': Odometry,
+        '/chassis_info_fb': ChassisInfoFb, '/qr/imu/raw': Imu, '/odom': Odometry,
         '/qr/chassis/odom': Odometry,
         '/qr/odometry/local': Odometry, '/qr/odometry/provisional': Odometry,
         '/qr/localization/pose': Odometry, '/qr/localization/provisional': Odometry,

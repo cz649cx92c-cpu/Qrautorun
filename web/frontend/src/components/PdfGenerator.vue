@@ -5,7 +5,7 @@ import Button from './ui/Button.vue';
 
 type BoardMember={id:number;x:number;y:number;angle:number;size:number};
 type Board={id:string;referenceId:number;gridSize:number;sizeMm:number;gapMm:number;members:BoardMember[]};
-type Plan={groupCount:number;memberCount:number;pages:number;childSizeMm:number;minGroupSizeMm:number;maxGroupSizeMm:number;boards:Board[];filename:string;centerCrosshairAvailable?:boolean;centerCrosshairNote?:string};
+type Plan={groupCount:number;memberCount:number;pages:number;childSizeMm:number;minGroupSizeMm:number;maxGroupSizeMm:number;boards:Board[];filename:string;centerCrosshairAvailable?:boolean;centerCrosshairNote?:string;registration?:{available:boolean;message?:string;suggestedStartId?:number}};
 type GridOption={gridSize:number;minGroupSizeMm:number;maxGroupSizeMm:number;minChildSizeMm:number};
 const emit=defineEmits<{generated:[result:Plan]}>();
 const gridOptions=ref<GridOption[]>([]),gridSize=ref(2),groupSizeMm=ref(140),groupCount=ref(3),startId=ref(0),centerCrosshair=ref(true);
@@ -30,6 +30,8 @@ const previewUrl=computed(()=>'/api/boards/preview.svg?'+new URLSearchParams({gr
 const firstBoard=computed(()=>plan.value?.boards[0]);
 const centerCrosshairNote=computed(()=>!centerCrosshair.value?'已关闭中心十字，定位板尺寸和静区不变':plan.value?.centerCrosshairNote??(gridSize.value%2===0?'整组中心十字全长 8 mm、线宽 0.15 mm，沿中央白缝绘制':gridSize.value+'×'+gridSize.value+' 正中心是子码，没有安全白缝，无法画中心十字；请选择 2×2、4×4 或 6×6'));
 const boardLabel=computed(()=>firstBoard.value?.id??'B'+String(startId.value).padStart(3,'0'));
+const registrationConflict=computed(()=>plan.value?.registration?.available===false?plan.value.registration.message??'当前批次编号已被其他定位板占用':'');
+function useAvailableStart(){const suggested=plan.value?.registration?.suggestedStartId;if(suggested!==undefined)startId.value=suggested;}
 let timer:ReturnType<typeof setTimeout>|undefined,sequence=0,closed=false;
 async function responseError(response:Response){try{return (await response.json()).error??'请求失败';}catch{return '请求失败';}}
 async function requestPlan(){
@@ -65,6 +67,7 @@ async function download(){
   const planResponse=await fetch('/api/boards/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});
   if(!planResponse.ok)throw new Error(await responseError(planResponse));
   const confirmedPlan=await planResponse.json() as Plan;if(!closed)plan.value=confirmedPlan;
+  if(confirmedPlan.registration?.available===false)throw new Error(confirmedPlan.registration.message??'当前批次编号已被其他定位板占用');
   const response=await fetch('/api/boards/pdf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(request)});
   if(!response.ok)throw new Error(await responseError(response));
   if(!response.headers.get('Content-Type')?.includes('application/pdf'))throw new Error('PDF 格式错误');
@@ -92,10 +95,12 @@ onBeforeUnmount(()=>{closed=true;clearTimeout(timer);sequence++;});
    <label class="crosshair-option"><input v-model="centerCrosshair" type="checkbox"/>整组中心十字对位线</label><small class="crosshair-note" :class="{'crosshair-unavailable':centerCrosshair&&gridSize%2!==0}" data-testid="crosshair-note" role="status">{{centerCrosshairNote}}</small>
    </fieldset>
    <div class="pdf-summary"><div><span>子码总数</span><strong>{{plan?.memberCount??memberCount}} 个</strong></div><div><span>A4 页数</span><strong>{{plan?.pages??groupCount}} 页</strong></div><div v-if="plan"><span>子码黑边尺寸</span><strong>{{plan.childSizeMm.toFixed(2)}} mm</strong></div><div><span>子码编号</span><strong>{{label(startId)}} – {{label(endId)}}</strong></div></div>
-   <div v-if="localError||error" class="pdf-error" role="alert"><AlertTriangle :size="20"/>{{localError||error}}</div>
+   <div v-if="localError||error||registrationConflict" class="pdf-error" role="alert"><AlertTriangle :size="20"/>{{localError||error||registrationConflict}}</div>
+   <Button v-if="registrationConflict&&plan?.registration?.suggestedStartId!==undefined" variant="outline" class="download-button" :disabled="busy||planning" @click="useAvailableStart">使用可用编号 {{label(plan?.registration?.suggestedStartId??0)}}</Button>
+   <small v-if="registrationConflict" class="crosshair-note">已有定位板保持原编号和尺寸。新批次请确认使用空闲编号；重打请填写原起始编号、规格及尺寸。</small>
    <div v-if="message" class="pdf-success" role="status"><CheckCircle2 :size="20"/>{{message}}</div>
    <Button v-if="!gridOption&&!loadingOptions" class="download-button" variant="outline" @click="loadOptions">重新加载规格</Button>
-   <Button class="download-button" :disabled="busy||planning||!!localError||!plan" @click="download"><Download :size="20"/>{{busy?'正在生成…':'生成并下载 PDF'}}</Button>
+   <Button class="download-button" :disabled="busy||planning||!!localError||!!registrationConflict||!plan" @click="download"><Download :size="20"/>{{busy?'正在生成…':'生成并下载 PDF'}}</Button>
   </div>
   <div class="pdf-preview">
    <div class="preview-toolbar"><strong>定位组预览 · {{boardLabel}}</strong><span>{{gridSize}} × {{gridSize}} · {{groupSizeMm}} mm</span></div>

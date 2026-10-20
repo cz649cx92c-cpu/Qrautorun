@@ -95,7 +95,7 @@ def main():
             elif topic=='tags':observations.append({'data':data,'epoch':epoch})
         except (ValueError,KeyError,TypeError):counts[topic+'Rejected']+=1
     subscriptions=[node.create_subscription(CompressedImage,'/qr/camera/image/compressed',image,qos_profile_sensor_data),
-        node.create_subscription(Imu,'/odin1/imu',imu,qos_profile_sensor_data),
+        node.create_subscription(Imu,'/qr/imu/raw',imu,qos_profile_sensor_data),
         node.create_subscription(Odometry,'/qr/odometry/local',odom,qos_profile_sensor_data),
         node.create_subscription(ChassisInfoFb,'/chassis_info_fb',feedback,qos_profile_sensor_data)]
     for topic,path in [('fusion','/qr/fusion/status'),('camera','/qr/camera/status'),('detector','/qr/detector/status'),('tags','/qr/tags/provisional')]:

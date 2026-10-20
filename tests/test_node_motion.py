@@ -104,7 +104,7 @@ class NodeMotionTests(unittest.TestCase):
 
     def start_harness(self):
         node=SimpleNamespace(motion=Mock(), mission=Mock(running=False), engaged=False,
-            pending_start=None, pending_start_at=0., acks=queue.Queue(), pose=object())
+            pending_start=None, pending_start_at=0., acks=queue.Queue(), pose=object(), config={'maintenance_mode':False})
         node.cancel_pending_start=MethodType(GreenhouseNode.cancel_pending_start,node)
         return node
 

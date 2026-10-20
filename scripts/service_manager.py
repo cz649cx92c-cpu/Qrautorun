@@ -18,7 +18,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 SERVICES = {
     'web': ('start.sh', 'qr-navigation-web.service', 'web/backend/src/server.ts'),
-    'imu': ('start_imu.sh', 'qr-navigation-imu.service', 'install/odin_imu_adapter/lib/odin_imu_adapter/imu_only'),
+    'imu': ('start_imu.sh', 'qr-navigation-imu.service', 'scripts/run_serial_imu.py'),
     'vision': ('start_vision.sh', 'qr-navigation-vision.service', 'scripts/run_vision.py'),
     'fusion': ('start_fusion.sh', 'qr-navigation-fusion.service', 'scripts/run_fusion.py'),
     'localization': ('start_localization.sh', 'qr-navigation-localization.service', 'install/greenhouse_navigation/lib/greenhouse_navigation/localization'),

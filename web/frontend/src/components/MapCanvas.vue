@@ -4,10 +4,11 @@ import {onMounted,onBeforeUnmount,ref,watch} from 'vue';
 import type {FieldMap,Point} from '../../../shared/model';
 import {exitPoint,heading,distance} from '../../../shared/model';
 import {orthogonalRoute,snapRoutePoint,chainRouteGroups,routeGroupCenters} from '../../../shared/route-design';
+import {planStrategies,choicesFromSegments,degrees,type SegmentPlan} from '../../../shared/segment-strategy';
 import {Plus,Minus,Scan,MousePointer2} from 'lucide-vue-next';
 import Button from './ui/Button.vue';
-const props=defineProps<{map:FieldMap,selected:number[],rowId:string,tool:string,editable:boolean,drawing:Point[],panEnabled?:boolean,measurement?:number[],vehicle?:{x:number,y:number,yaw:number},trail?:Point[],routeAnchors?:Point[],routeSelected?:number,routeGroupIds?:number[],routeSkippedGroups?:{id:number,distanceM:number}[]}>();
-const emit=defineEmits<{select:[id:number,multi:boolean],row:[id:string],blank:[point:Point],move:[ids:number[],dx:number,dy:number],point:[rowId:string,index:number,point:Point],zone:[index:number,point:Point],designSelect:[index:number],designMove:[index:number,point:Point]}>();
+const props=defineProps<{map:FieldMap,selected:number[],rowId:string,tool:string,editable:boolean,drawing:Point[],panEnabled?:boolean,measurement?:number[],vehicle?:{x:number,y:number,yaw:number},trail?:Point[],routeAnchors?:Point[],routeSelected?:number,routeGroupIds?:number[],routeSkippedGroups?:{id:number,distanceM:number}[],segmentPlans?:SegmentPlan[],selectedSegment?:string}>();
+const emit=defineEmits<{select:[id:number,multi:boolean],inspect:[id:number],segmentSelect:[key:string],row:[id:string],blank:[point:Point],move:[ids:number[],dx:number,dy:number],point:[rowId:string,index:number,point:Point],zone:[index:number,point:Point],designSelect:[index:number],designMove:[index:number,point:Point]}>();
 const container=ref<HTMLDivElement>();let stage:Konva.Stage;let layer:Konva.Layer;let observer:ResizeObserver;let isMounted=false;const coordinate=ref('X 0.00 · Y 0.00 m'),zoom=ref(100);
 const px=(p:Point)=>[p.x*100,-p.y*100];
 let hoverMarker:Konva.Circle|undefined;
@@ -33,11 +34,21 @@ function redraw() {
   if(props.editable&&props.tool!=='measure'&&props.rowId===row.id)row.points.forEach((p,i)=>{const [x,y]=px(p),handle=new Konva.Circle({x,y,radius:5/scale,fill:'#f7f8f9',stroke:'#2563a6',strokeWidth:2/scale,draggable:true});handle.on('dragend',()=>emit('point',row.id,i,{x:handle.x()/100,y:-handle.y()/100}));layer.add(handle);});
  }
  for(const [i,segment] of (props.map.motionSegments??[]).entries()){
+  if(!segment.points?.length)continue;
   const color=segment.mode==='crab'?'#2563a6':'#2563a6',p=segment.points[Math.floor(segment.points.length/2)]!;
   layer.add(new Konva.Line({points:segment.points.flatMap(px),stroke:color,strokeWidth:3/scale,listening:false}));
   layer.add(new Konva.Text({fontFamily:'QR Sans, QR CJK, sans-serif',x:p.x*100+8/scale,y:-p.y*100+8/scale,text:(i+1)+' · '+(segment.mode==='crab'?'平移':segment.direction==='reverse'?'4T4D 倒车':'4T4D 前进'),fontSize:13/scale,fill:color,listening:false}));
  }
  if(props.trail?.length)layer.add(new Konva.Line({points:props.trail.flatMap(px),stroke:'#727d88',strokeWidth:2/scale,listening:false}));
+ const stored=props.map.motionSegments??[];
+ const plans=props.segmentPlans??(stored.length&&stored.every(s=>s.points?.length)?planStrategies([{id:stored[0]!.fromId,...stored[0]!.points[0]!},...stored.map(s=>({id:s.toId,...s.points.at(-1)!}))],stored[0]!.bodyYaw,choicesFromSegments(stored)):[]);
+ if(container.value)container.value.dataset.segmentPlans=JSON.stringify(plans.map(p=>({key:p.key,mode:p.mode,effective:p.effective,startYaw:p.startYaw,travelYaw:p.travelYaw,arrivalYaw:p.arrivalYaw,turn:p.turn,blocked:p.blocked,problem:p.problem})));
+ for(const [index,plan] of plans.entries()){
+  const x=(plan.start.x+plan.end.x)*50,y=-(plan.start.y+plan.end.y)*50,color=plan.blocked||plan.problem?'#b45309':'#2563eb',length=24/scale;
+  layer.add(new Konva.Arrow({name:'travel-'+plan.key,points:[x-Math.cos(plan.travelYaw)*length/2,y+Math.sin(plan.travelYaw)*length/2,x+Math.cos(plan.travelYaw)*length/2,y-Math.sin(plan.travelYaw)*length/2],stroke:color,fill:color,strokeWidth:(props.selectedSegment===plan.key?4:2)/scale,pointerLength:6/scale,pointerWidth:6/scale,listening:false}));
+  layer.add(new Konva.Arrow({name:'heading-'+plan.key,points:[x,y,x+Math.cos(plan.arrivalYaw)*18/scale,y-Math.sin(plan.arrivalYaw)*18/scale],stroke:'#d97706',fill:'#d97706',strokeWidth:2/scale,pointerLength:5/scale,pointerWidth:5/scale,listening:false}));
+  if(Math.abs(plan.turn)>.001)layer.add(new Konva.Text({x:x+8/scale,y:y-22/scale,text:(plan.turn>0?'↶':'↷')+Math.abs(degrees(plan.turn))+'° · 仅规划',fontSize:11/scale,fill:'#b45309',listening:false}));
+ }
  const measurementIds=props.tool==='measure'?(props.measurement??[]):[];
  const measurementTags=[...new Set(measurementIds)].slice(0,2).map(id=>props.map.tags.find(t=>t.id===id)).filter((t):t is FieldMap['tags'][number]=>!!t&&Number.isFinite(t.x)&&Number.isFinite(t.y));
  const measurementPair=measurementIds.length===2&&measurementIds[0]!==measurementIds[1]&&measurementTags.length===2?measurementTags:[];
@@ -51,7 +62,7 @@ function redraw() {
   const size=Math.max(t.size*100,9/scale);group.add(new Konva.Rect({x:-size/2,y:-size/2,width:size,height:size,cornerRadius:2/scale,fill:skipped?'#d97706':selected?'#2563a6':t.kind==='end'?'#2563a6':'#39444f',stroke:selected?'#c9d0d7':'white',strokeWidth:2/scale}));
   group.add(new Konva.Arrow({points:[0,0,Math.cos(t.angle*Math.PI/180)*16/scale,-Math.sin(t.angle*Math.PI/180)*16/scale],pointerLength:4/scale,pointerWidth:4/scale,stroke:'#2563a6',fill:'#2563a6',strokeWidth:1/scale,listening:false}));
   group.add(new Konva.Text({fontFamily:"QR Sans, QR CJK, sans-serif",x:-40/scale,y:14/scale,width:80/scale,align:'center',text:t.groupId??`Q${String(t.id).padStart(3,'0')}`,fontSize:16/scale,fill:skipped?'#d97706':selected?'#2563a6':'#56616d',listening:false}));
-  group.on('click tap',e=>{e.cancelBubble=true;if(props.tool==='route-design'){if(props.editable)emit('blank',{x:t.x,y:t.y});}else emit('select',t.id,!!e.evt.shiftKey);});
+  group.on('click tap',e=>{e.cancelBubble=true;if(props.tool==='route-design'){if(stageMoved||panGesture||props.panEnabled)return;emit('inspect',t.id);if(props.editable)emit('blank',{x:t.x,y:t.y});}else emit('select',t.id,!!e.evt.shiftKey);});
   group.on('dragend',()=>emit('move',selected?props.selected:[t.id],(group.x()-x!)/100,-(group.y()-y!)/100));layer.add(group);
  }
  if(props.tool==='route-design'){
@@ -123,7 +134,7 @@ onMounted(()=>{
  observer=new ResizeObserver(()=>{if(!isMounted||!container.value)return;stage.size({width:container.value.clientWidth,height:container.value.clientHeight});redraw();});
  observer.observe(container.value!);fit();void document.fonts.ready.then(redraw);
 });
-watch(()=>[props.map,props.selected,props.rowId,props.drawing,props.measurement,props.vehicle,props.trail,props.routeAnchors,props.routeSelected,props.routeGroupIds,props.routeSkippedGroups,props.editable],redraw,{deep:true});watch(()=>[props.tool,props.panEnabled],()=>{if(!isMounted)return;stage.draggable(props.tool==='pan'||props.tool==='measure'||!!props.panEnabled);if(props.tool==='route-design')redraw();else redraw();});watch(()=>props.map.id,fit);onBeforeUnmount(()=>{isMounted=false;window.removeEventListener('blur',resetPointerState);resetPointerState();observer?.disconnect();stage?.off();stage?.destroy();});defineExpose({fit});
+watch(()=>[props.map,props.selected,props.rowId,props.drawing,props.measurement,props.vehicle,props.trail,props.routeAnchors,props.routeSelected,props.routeGroupIds,props.routeSkippedGroups,props.editable,props.segmentPlans,props.selectedSegment],redraw,{deep:true});watch(()=>[props.tool,props.panEnabled],()=>{if(!isMounted)return;stage.draggable(props.tool==='pan'||props.tool==='measure'||!!props.panEnabled);if(props.tool==='route-design')redraw();else redraw();});watch(()=>props.map.id,fit);onBeforeUnmount(()=>{isMounted=false;window.removeEventListener('blur',resetPointerState);resetPointerState();observer?.disconnect();stage?.off();stage?.destroy();});defineExpose({fit});
 </script>
 <template><div :class="['canvas-wrap',{'pan-mode':panEnabled}]"><div ref="container" class="map-container" data-testid="map-canvas" :data-route-group-ids="tool==='route-design'?routeGroupIds?.join(','):undefined" :data-skipped-route-group-ids="tool==='route-design'?routeSkippedGroups?.map(tag=>tag.id).join(','):undefined"/><div class="canvas-caption"><span class="dot"></span> 单位 m</div><div class="canvas-controls"><Button variant="outline" size="icon" aria-label="放大地图" @click="scaleBy(1.2)"><Plus :size="16"/></Button><Button variant="outline" size="icon" aria-label="缩小地图" @click="scaleBy(0.8)"><Minus :size="16"/></Button><Button variant="outline" size="icon" aria-label="适应地图" @click="fit"><Scan :size="16"/></Button></div><div class="canvas-footer"><span>{{coordinate}}</span><span>{{zoom}}%</span></div><div v-if="tool==='route-design'" class="draw-hint"><MousePointer2 :size="14"/> 单击追加路点 · 方块可拖动 · 组中心自动吸附</div><div v-if="tool==='row'" class="draw-hint"><MousePointer2 :size="14"/> 点击画布添加路线控制点，再点击“完成绘制”</div></div></template>
 

@@ -1,16 +1,17 @@
 import {z} from 'zod';
 import {distance,mapSchema,pointSchema,validate,type FieldMap,type Point} from '../../shared/model';
 import {routeCorners,chainRouteGroups,routeGroupCenters} from '../../shared/route-design';
+import {segmentChoiceSchema,planStrategies,type SegmentChoice} from '../../shared/segment-strategy';
 import trial from '../../../src/greenhouse_navigation/greenhouse_navigation/recorded_trial_limits.json' with {type:'json'};
 
 export const routeDesignSchema=z.object({
  mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),baseVersion:z.number().int().positive(),
  points:z.array(pointSchema).min(2).max(501),bodyYawDeg:z.number().finite().min(-180).max(180),routeId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),routeName:z.string().trim().min(1).max(100).optional(),saveAs:z.boolean().default(false),routeUpdated:z.string().datetime().optional()
-}).strict();
+}).extend({segmentModes:z.array(segmentChoiceSchema).max(100).optional()}).strict();
 const wrap=(a:number)=>Math.atan2(Math.sin(a),Math.cos(a));
 const EPS=1e-8;
 
-export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:number){
+export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:number,segmentModes:SegmentChoice[]=[]){
  if(!Number.isFinite(bodyYawDeg)||Math.abs(bodyYawDeg)>180)throw new Error('车头朝向必须为 -180 到 180 度');
  if(input.length<2||input.length>501)throw new Error('路径需要 2–501 个控制点');
  const raw=input.map(p=>pointSchema.parse(p));
@@ -31,6 +32,11 @@ export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:nu
  if(boundaries.length>101)throw new Error('定位组区间不能超过100段，请拆分任务');
  if(chain.lengthM>50+EPS)throw new Error('吸附后路径总长度不能超过50米，请拆分任务');
  const bodyYaw=wrap(bodyYawDeg*Math.PI/180),segments:NonNullable<FieldMap['motionSegments']>=[],route:Point[]=[];
+ const plans=planStrategies(boundaries,bodyYaw,segmentModes),keys=new Set<string>();
+ for(const choice of segmentModes){const key=choice.fromId+'>'+choice.toId+'#'+choice.occurrence;if(keys.has(key)||!plans.some(plan=>plan.key===key))throw new Error('区间策略重复或与当前有向码间区间不匹配');keys.add(key);}
+ const issue=plans.find(plan=>plan.problem);if(issue)throw new Error(issue.problem);
+ // Unsupported turns are persisted as planning intent only. Existing continuous,
+ // validated execution geometry remains intact and the start API blocks the plan.
  for(let i=1;i<boundaries.length;i++){
   const a=boundaries[i-1]!,b=boundaries[i]!;
   if(distance(a,b)<.08)throw new Error('相邻定位组区间端点距离不足8厘米，请调整路径');
@@ -45,6 +51,7 @@ export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:nu
   if(route.length+n+(route.length?0:1)>1001)throw new Error('加密路线超过1001点，请缩短路径或拆分任务');
   const points=Array.from({length:n+1},(_,j)=>({x:a.x+(b.x-a.x)*j/n,y:a.y+(b.y-a.y)*j/n}));
   segments.push({id:'design-interval-'+i,fromId:a.id,toId:b.id,mode:direction==='lateral'?'crab':'4t4d',direction,
+   ...(plans[i-1]!.mode!=='auto'?{strategy:plans[i-1]!.mode}:{}),
    executionProfile:trial.profile as 'recorded_slow_trial',bodyYaw,endYaw:bodyYaw,wheelAngle,points});
   route.push(...(route.length?points.slice(1):points));
  }

@@ -1,8 +1,13 @@
 """Offline sensor telemetry: no node construction, ROS spin, or hardware writes."""
 import sys
 import unittest
+import copy
+import json
+import math
+import queue
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'src/greenhouse_navigation'))
 from greenhouse_navigation.node import GreenhouseNode
 
@@ -12,7 +17,8 @@ class SensorStatusTests(unittest.TestCase):
         return SimpleNamespace(
             detector=None, detector_received=0., imu_received=0.,
             fusion=None, fusion_received=0., mapping=None, mapping_received=0.,
-            pose=None, pose_received=0., config={'imu_topic': ''})
+            pose=None, pose_received=0., config={'imu_topic': ''},
+            get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=10_000_000_000)))
 
     def status(self, h):
         return GreenhouseNode.sensor_status(h, 10., {
@@ -110,7 +116,7 @@ class SensorStatusTests(unittest.TestCase):
         h.fusion.update(state='FUSED',ready=True,mappingReady=True,epoch='formal-origin')
         h.detector.update(captureTimestampVerified=True,localPoseReady=True)
         h.mapping.update(ready=False,reason='已切换正式融合，请使用正式观测',localEpoch='old-draft-origin')
-        h.observation_received=9.9
+        h.mapping_observation={'stamp':9.9,'localEpoch':'formal-origin'};h.observation_received=9.9
         result=self.status(h)['mapping']
         self.assertTrue(result['ready']);self.assertEqual(result['quality'],'verified')
         self.assertEqual(result['localEpoch'],'formal-origin');self.assertEqual(result['reason'],'')
@@ -124,8 +130,98 @@ class SensorStatusTests(unittest.TestCase):
             h.fusion.update(state='FUSED',ready=True,mappingReady=True,epoch='formal-origin')
             h.detector.update(captureTimestampVerified=True,localPoseReady=True)
             h.mapping.update(ready=False,reason='已切换正式融合，请使用正式观测')
-            h.observation_received=9.9;setattr(h,stale,9.)
+            h.mapping_observation={'stamp':9.9,'localEpoch':'formal-origin'};h.observation_received=9.9;setattr(h,stale,9.)
             self.assertFalse(self.status(h)['mapping']['ready'])
+
+    def formal_harness(self):
+        h=self.harness();self.ready(h)
+        h.fusion.update(state='FUSED',ready=True,mappingReady=True,epoch='formal-origin')
+        h.detector.update(calibrated=True,captureTimestampVerified=True,localPoseReady=False,
+            reason='局部轮式/IMU融合位姿未验证，扫描尚未就绪')
+        h.mapping.update(ready=False,reason='已切换正式融合，请使用正式观测')
+        h.observation_received=9.9
+        h.mapping_observation={'stamp':9.9,'localEpoch':'formal-origin'}
+        return h
+
+    def test_delayed_formal_dispatch_is_not_blocked_by_current_image_interpolation(self):
+        h=self.formal_harness()
+        result=self.status(h)
+        self.assertFalse(h.detector['localPoseReady'])
+        self.assertTrue(result['mapping']['ready'])
+        self.assertEqual(result['mapping']['quality'],'verified')
+        self.assertEqual(result['sensors']['camera'],'定位观测已同步')
+        self.assertEqual(result['detector']['reason'],'')
+
+    def test_formal_mapping_stale_future_epoch_and_missing_evidence_remain_blocked(self):
+        cases=[('receive-stale',lambda h:setattr(h,'observation_received',9.)),
+            ('receive-future',lambda h:setattr(h,'observation_received',11.)),
+            ('stamp-stale',lambda h:h.mapping_observation.update(stamp=9.)),
+            ('stamp-future',lambda h:h.mapping_observation.update(stamp=11.)),
+            ('stamp-nan',lambda h:h.mapping_observation.update(stamp=math.nan)),
+            ('old-epoch',lambda h:h.mapping_observation.update(localEpoch='old-origin')),
+            ('missing-epoch',lambda h:h.mapping_observation.update(localEpoch='')),
+            ('missing-evidence',lambda h:setattr(h,'mapping_observation',None)),
+            ('fusion-stale',lambda h:setattr(h,'fusion_received',9.)),
+            ('detector-stale',lambda h:setattr(h,'detector_received',9.)),
+            ('fusion-invalid',lambda h:h.fusion.update(state='INVALID',ready=False)),
+            ('fusion-not-ready',lambda h:h.fusion.update(ready=False)),
+            ('mapping-not-ready',lambda h:h.fusion.update(mappingReady=False)),
+            ('capture-unverified',lambda h:h.detector.update(captureTimestampVerified=False))]
+        for label,change in cases:
+            with self.subTest(case=label):
+                h=self.formal_harness();change(h)
+                self.assertFalse(self.status(h)['mapping']['ready'])
+
+    def test_only_accepted_synchronized_local_pose_records_mapping_evidence(self):
+        payload={'frame':'base_link','calibrated':True,'synchronized':True,'stamp':9.9,
+            'tags':[{'id':113,'x':0.,'y':0.,'angle':0.,'sigma':.01}],
+            'localPose':{'x':0.,'y':0.,'yaw':0.},'localPoseSynchronized':True,
+            'localEpoch':'formal-origin'}
+        cases=[None,{'synchronized':False},{'calibrated':False},
+            {'frame':'map'},{'stamp':9.},{'stamp':11.},
+            {'localPoseSynchronized':False},{'localEpoch':''},{'tags':[]},
+            {'localPose':{'x':math.nan,'y':0.,'yaw':0.}},
+            {'localPose':{'x':True,'y':0.,'yaw':0.}}]
+        for change in cases:
+            with self.subTest(change=change):
+                h=self.formal_harness();h.mapping_observation=None;h.active_boards=[]
+                h.mission=SimpleNamespace(running=False,log=lambda message:None)
+                h.survey=queue.Queue()
+                packet=copy.deepcopy(payload);packet.update(change or {})
+                with patch('greenhouse_navigation.node.time.monotonic',return_value=9.9):
+                    GreenhouseNode.observation_cb(h,SimpleNamespace(data=json.dumps(packet)))
+                if change is None:
+                    self.assertEqual(h.mapping_observation,{'stamp':9.9,'localEpoch':'formal-origin'})
+                    self.assertEqual(h.survey.qsize(),1)
+                    sample=h.survey.get_nowait()
+                    self.assertTrue(sample['synchronized']);self.assertTrue(sample['calibrated'])
+                    self.assertEqual(sample['localEpoch'],'formal-origin')
+                else:self.assertIsNone(h.mapping_observation)
+
+    def test_new_unsynchronized_local_pose_cannot_reuse_previous_mapping_evidence(self):
+        h=self.formal_harness();h.active_boards=[]
+        h.mission=SimpleNamespace(running=False,log=lambda message:None);h.survey=queue.Queue()
+        packet={'frame':'base_link','calibrated':True,'synchronized':True,'stamp':9.9,
+            'tags':[{'id':113,'x':0.,'y':0.,'angle':0.,'sigma':.01}],
+            'localPose':{'x':0.,'y':0.,'yaw':0.},'localPoseSynchronized':False,
+            'localEpoch':'formal-origin'}
+        GreenhouseNode.observation_cb(h,SimpleNamespace(data=json.dumps(packet)))
+        self.assertIsNone(h.mapping_observation);self.assertTrue(h.survey.empty())
+        self.assertFalse(self.status(h)['mapping']['ready'])
+
+    def test_actual_field_snapshot_replay_green(self):
+        path=Path(__file__).resolve().parents[1]/'logs/mapping-blocker-20261019/passive.json'
+        if not path.exists():self.skipTest('现场诊断 fixture 不随仓库分发')
+        topics=json.loads(path.read_text())['topics'];formal=topics['/qr/tags/observations']
+        self.assertGreater(formal['count'],0);self.assertLess(formal['ageMs']['max'],250.)
+        obs=formal['latest'];fusion=topics['/qr/fusion/status']['latest']
+        for flag in ('calibrated','synchronized','localPoseSynchronized'):self.assertIs(obs[flag],True)
+        self.assertEqual(obs['localEpoch'],fusion['epoch'])
+        h=self.formal_harness();h.detector=topics['/qr/detector/status']['latest']
+        h.fusion=fusion;h.mapping=topics['/qr/draft/status']['latest']
+        h.mapping_observation={'stamp':obs['stamp'],'localEpoch':obs['localEpoch']}
+        h.get_clock=lambda:SimpleNamespace(now=lambda:SimpleNamespace(nanoseconds=int((obs['stamp']+.1)*1e9)))
+        self.assertFalse(h.detector['localPoseReady']);self.assertTrue(self.status(h)['mapping']['ready'])
 
 
 if __name__=='__main__': unittest.main(verbosity=2)

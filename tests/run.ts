@@ -28,5 +28,8 @@ import './segment-route.test';
 import './route-design.test';
 
 import './board-crosshair.test';
+import './board-registration.test';
 
 import './routes-persistence.test';
+import './v4-motion-strategy.test';
+import './tag-reprint.test';

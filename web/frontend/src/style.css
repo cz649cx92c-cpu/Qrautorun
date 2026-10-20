@@ -73,3 +73,4 @@ button.rounded-lg{border-radius:6px;font-size:13px;font-weight:500;box-shadow:no
  .app-shell.is-route-editing .route-metric{display:none}
  .app-shell.is-route-editing .route-details-scroll{top:104px;width:min(280px,calc(100% - 16px))}
 }
+.map-rebuild-actions{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}.map-rebuild-actions small{display:block;margin-top:6px;color:var(--muted);font-size:11px;line-height:1.5}

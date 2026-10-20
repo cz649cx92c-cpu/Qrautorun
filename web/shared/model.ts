@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {boardSchema} from './boards';
+import {strategyModeSchema} from './segment-strategy';
 export const groupsSchema=z.array(boardSchema).max(587).superRefine((groups,ctx)=>{const names=new Set<string>(),children=new Set<number>();for(const group of groups){if(names.has(group.id))ctx.addIssue({code:z.ZodIssueCode.custom,message:'定位组编号重复'});names.add(group.id);for(const child of group.members){if(children.has(child.id))ctx.addIssue({code:z.ZodIssueCode.custom,message:'子码同时属于多个定位组'});children.add(child.id);}}});
 export const states = ['IDLE','INITIALIZING','SEGMENT_ALIGN','FORWARD','ROW_END','REVERSE','ROW_EXIT','SWITCH_TO_LATERAL','LATERAL_SHIFT','SWITCH_TO_ACKERMANN','NEXT_ROW','FINISHED','FAULT'] as const;
 export const actions = ['LOCALIZE','CONTINUE','SLOW_DOWN','STOP','WAIT','END_REVERSE','EXIT_SHIFT','RESTORE_ACKERMANN','CUSTOM','ROW_COMPLETE','TASK_COMPLETE'] as const;
@@ -10,8 +11,9 @@ export const pointSchema = z.object({x:number,y:number});
 export const ruleSchema = z.object({id:z.string().min(1).max(80),state:z.enum(states),direction:z.enum(['forward','reverse','lateral']),action:z.enum(actions),speed:z.number().min(0).max(0.3),waitSeconds:z.number().min(0).max(3600),radius:z.number().min(0.02).max(0.25),task:z.string().max(80).default('default'),customTask:z.string().max(80).default('')});
 export const tagSchema = z.object({id:z.number().int().min(0).max(586),groupId:z.string().optional(),rowId:z.string().max(80),x:number,y:number,angle:number,size:z.number().min(0.02).max(0.18),kind:z.enum(['entry','end','waypoint','reference','exit']),rules:z.array(ruleSchema).max(30)});
 export const rowSchema = z.object({id:z.string().min(1).max(80),name:z.string().min(1).max(80),width:z.number().min(0.41).max(5),start:pointSchema.optional(),points:z.array(pointSchema).min(2).max(1000),exitDistance:z.number().min(0.4).max(10)});
-export const motionSegmentSchema=z.object({id:z.string().min(1).max(80),fromId:z.number().int().min(0).max(586),toId:z.number().int().min(0).max(586),mode:z.enum(['4t4d','crab']),direction:z.enum(['forward','reverse','lateral']),executionProfile:z.literal('recorded_slow_trial').optional(),bodyYaw:number,endYaw:number,wheelAngle:z.number().finite().min(-90).max(90),points:z.array(pointSchema).min(2).max(1000)});
-export const mapSchema = z.object({schemaVersion:z.literal(1),id:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),name:z.string().min(1).max(100),frame:z.literal('map'),family:z.literal('tag36h11'),source:z.enum(['design','survey']),coordinateStatus:z.enum(['draft','reviewed']).default('draft'),captureQuality:z.enum(['verified','draft']).optional(),routeMode:z.enum(['rows','waypoints']).optional(),motionSegments:z.array(motionSegmentSchema).min(1).max(100).optional(),rows:z.array(rowSchema).max(100),tags:z.array(tagSchema).max(587),groups:groupsSchema.optional(),order:z.array(z.string()).max(100),zone:z.array(pointSchema).length(4),vehicle:z.object({width:z.number().min(0.1).max(1),length:z.number().min(0.2).max(3),margin:z.number().min(0.01).max(0.1)}),notes:z.string().max(2000).default('')}).superRefine((map,ctx)=>{
+export const motionSegmentSchema=z.object({id:z.string().min(1).max(80),fromId:z.number().int().min(0).max(586),toId:z.number().int().min(0).max(586),mode:z.enum(['4t4d','crab']),direction:z.enum(['forward','reverse','lateral']),executionProfile:z.literal('recorded_slow_trial').optional(),strategy:strategyModeSchema.optional(),bodyYaw:number,endYaw:number,wheelAngle:z.number().finite().min(-90).max(90),points:z.array(pointSchema).min(2).max(1000)});
+export const mapSchema = z.object({schemaVersion:z.literal(1),id:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),name:z.string().min(1).max(100),frame:z.literal('map'),family:z.literal('tag36h11'),source:z.enum(['design','survey']),coordinateStatus:z.enum(['draft','reviewed']).default('draft'),captureQuality:z.enum(['verified','draft']).optional(),routeMode:z.enum(['rows','waypoints','map-only']).optional(),motionSegments:z.array(motionSegmentSchema).min(1).max(100).optional(),rows:z.array(rowSchema).max(100),tags:z.array(tagSchema).max(587),groups:groupsSchema.optional(),order:z.array(z.string()).max(100),zone:z.array(pointSchema).length(4),vehicle:z.object({width:z.number().min(0.1).max(1),length:z.number().min(0.2).max(3),margin:z.number().min(0.01).max(0.1)}),notes:z.string().max(2000).default('')}).superRefine((map,ctx)=>{
+ if(map.routeMode==='map-only'&&(map.rows.length||map.order.length||map.motionSegments||map.tags.length===0||map.tags.some(t=>t.rowId||t.rules.length)))ctx.addIssue({code:z.ZodIssueCode.custom,message:'定位码地图需要有效点位且不能包含导航路径或动作'});
  if(map.motionSegments){
   if(map.routeMode!=='waypoints'||map.rows.length!==1)ctx.addIssue({code:z.ZodIssueCode.custom,message:'区间路线必须是一条办公室路径'});
   const ids=new Set<string>();
@@ -65,7 +67,11 @@ export function envelopeInside(p:Point,yaw:number,map:FieldMap):boolean {
 function segmentDistance(p:Point,a:Point,b:Point) {const d=distance(a,b)**2; const t=d?Math.max(0,Math.min(1,((p.x-a.x)*(b.x-a.x)+(p.y-a.y)*(b.y-a.y))/d)):0;return distance(p,{x:a.x+t*(b.x-a.x),y:a.y+t*(b.y-a.y)});}
 export function validate(map:FieldMap):{errors:string[],warnings:string[]} {
  const errors:string[]=[],warnings:string[]=[]; const ids=new Set<number>(), rows=new Set<string>();
- if(!map.rows.length) errors.push('地图至少需要一条作物行');
+ if(map.routeMode==='map-only'){
+  if(map.tags.length===0)errors.push('定位码地图没有有效点位');
+  const area=map.zone.reduce((a,p,i)=>{const q=map.zone[(i+1)%map.zone.length]!;return a+p.x*q.y-q.x*p.y;},0);
+  if(Math.abs(area)<1e-8)errors.push('地图显示范围不能退化为零面积');
+ }else if(!map.rows.length) errors.push('地图至少需要一条作物行');
  for(const row of map.rows) {if(rows.has(row.id)) errors.push(`作物行ID重复：${row.id}`);rows.add(row.id);
   if(map.routeMode!=='waypoints'&&row.width<=map.vehicle.width+2*map.vehicle.margin) errors.push(`${row.name} 无足够横向安全余量`);
   if(map.routeMode!=='waypoints'&&row.exitDistance<map.vehicle.length/2+map.vehicle.margin) errors.push(`${row.name} 后退退出距离不足以让整车离开作物区`);
@@ -83,7 +89,7 @@ export function validate(map:FieldMap):{errors:string[],warnings:string[]} {
   }
  }
  for(let i=0;i<map.tags.length;i++) for(let j=i+1;j<map.tags.length;j++) if(distance(map.tags[i]!,map.tags[j]!)<((map.tags[i]!.groupId?1:1.25)*map.tags[i]!.size+(map.tags[j]!.groupId?1:1.25)*map.tags[j]!.size)/2) errors.push(`Q${map.tags[i]!.id} 与 Q${map.tags[j]!.id} 物理标记重叠`);
- if(!map.order.length || new Set(map.order).size!==map.order.length || map.order.some(id=>!rows.has(id))) errors.push('作业顺序为空、重复或引用不存在的行');
+ if(map.routeMode!=='map-only'&&(!map.order.length || new Set(map.order).size!==map.order.length || map.order.some(id=>!rows.has(id)))) errors.push('作业顺序为空、重复或引用不存在的行');
  for(let i=1;i<map.order.length;i++) {const a=map.rows.find(r=>r.id===map.order[i-1])!,b=map.rows.find(r=>r.id===map.order[i])!;
   if(a&&b) {const yaw=heading(a),pa=exitPoint(a),pb=exitPoint(b);if(Math.abs(Math.atan2(Math.sin(heading(b)-yaw),Math.cos(heading(b)-yaw)))>0.02 || Math.abs((pb.x-pa.x)*Math.cos(yaw)+(pb.y-pa.y)*Math.sin(yaw))>0.05) errors.push(`${a.name} → ${b.name} 无法仅通过90°横移衔接`);
    for(let n=0;n<=20;n++) if(!envelopeInside({x:pa.x+(pb.x-pa.x)*n/20,y:pa.y+(pb.y-pa.y)*n/20},yaw,map)) {errors.push(`${a.name} → ${b.name} 横移包络超出换行区`);break;}

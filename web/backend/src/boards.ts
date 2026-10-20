@@ -52,6 +52,21 @@ export async function boardPdf(boards:Board[],centerCrosshair=true):Promise<Buff
   doc.end();
  });
 }
+/** Only reads registration state. Suggestions never change an existing board or reserve IDs. */
+export function boardRegistrationPlan(store:Store,raw:unknown){
+ const plan=boardPlan(raw);
+ try{checkBoardRegistration(store,plan.boards);return {...plan,registration:{available:true}};}
+ catch(error){
+  const conflict=error as {statusCode?:number,message:string};if(conflict.statusCode!==409)throw error;
+  const used=new Set(listBoards(store).flatMap(board=>board.members.map(member=>member.id)));
+  let suggestedStartId:number|undefined;
+  for(let start=0;start+plan.memberCount<=587;start++){
+   let free=true;for(let id=start;id<start+plan.memberCount;id++)if(used.has(id)){free=false;break;}
+   if(free){suggestedStartId=start;break;}
+  }
+  return {...plan,registration:{available:false,message:conflict.message,...(suggestedStartId===undefined?{}:{suggestedStartId})}};
+ }
+}
 export function boardTables(store:Store){store.db.exec('CREATE TABLE IF NOT EXISTS marker_boards(id TEXT PRIMARY KEY,reference_id INTEGER UNIQUE NOT NULL,body TEXT NOT NULL,created TEXT NOT NULL);');}
 export function listBoards(store:Store):Board[]{return (store.db.prepare('SELECT body FROM marker_boards ORDER BY reference_id').all() as {body:string}[]).map(row=>boardSchema.parse(JSON.parse(row.body)));}
 function boardConflict(message:string):never{throw Object.assign(new Error(message),{statusCode:409});}

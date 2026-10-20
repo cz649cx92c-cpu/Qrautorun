@@ -1,0 +1,6 @@
+import {defineConfig} from '@playwright/test';
+import {fileURLToPath} from 'node:url';
+const root=fileURLToPath(new URL('../../',import.meta.url));
+process.env.PLAYWRIGHT_BROWSERS_PATH=root+'.browser-cache';
+process.env.NO_PROXY=[process.env.NO_PROXY,'127.0.0.1','localhost'].filter(Boolean).join(',');
+export default defineConfig({testDir:'.',testMatch:['v4-editor.spec.ts','route-editor.spec.ts','distance.spec.ts','ui-restyle.spec.ts','guide.spec.ts','editor-ux-v3.spec.ts','scan-start-message.spec.ts'],timeout:45000,workers:1,reporter:'list',outputDir:root+'logs/map-only-20261019/regression-results',use:{baseURL:'http://127.0.0.1:4185',viewport:{width:1600,height:1000},browserName:'chromium',launchOptions:{args:['--no-sandbox','--disable-dev-shm-usage']}},webServer:[{cwd:root,command:'node --import tsx tests/fixtures/v4-server.ts',url:'http://127.0.0.1:4184/api/health',reuseExistingServer:false},{cwd:root,command:'node_modules/.bin/vite preview --config web/frontend/vite.config.ts --outDir '+root+'logs/map-only-20261019/dist --host 127.0.0.1 --port 4185 --strictPort',url:'http://127.0.0.1:4185',reuseExistingServer:false}]});

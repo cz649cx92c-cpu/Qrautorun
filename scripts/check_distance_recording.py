@@ -29,7 +29,7 @@ def receive(kind, msg):
     last[kind] = msg
 
 topics = [('feedback', ChassisInfoFb, '/chassis_info_fb'),
-          ('odom', Odometry, '/odom'), ('imu', Imu, '/odin1/imu')]
+          ('odom', Odometry, '/odom'), ('imu', Imu, '/qr/imu/raw')]
 subscriptions = [node.create_subscription(cls, topic,
     lambda msg, key=kind: receive(key, msg), qos_profile_sensor_data)
     for kind, cls, topic in topics]

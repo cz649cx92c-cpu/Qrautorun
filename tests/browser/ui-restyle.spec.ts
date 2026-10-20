@@ -10,7 +10,7 @@ async function mock(page:Page){
  await page.route('**/api/**',async route=>{
   const url=new URL(route.request().url()),path=url.pathname;
   if(path==='/api/routes')return route.fulfill({json:[]});
-  if(path==='/api/surveys'||path==='/api/tasks')return route.fulfill({json:[]});
+  if(path==='/api/surveys'||path==='/api/tasks'||path==='/api/maps')return route.fulfill({json:[]});
   if(path==='/api/boards')return route.fulfill({json:boards});
   if(path==='/api/robot/status')return route.fulfill({json:status});
   if(path==='/api/camera/status')return route.fulfill({json:{present:false,running:false}});
