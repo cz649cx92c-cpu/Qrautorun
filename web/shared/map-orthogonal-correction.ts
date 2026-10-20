@@ -4,13 +4,13 @@ import {applyMapAlignment, estimateMapAlignment, type FittedPoint} from './map-a
 export interface CorrectionAdjacency {fromId: number; toId: number}
 export interface OrthogonalCorrectionOptions {
   rotationDeg?: number;
-  /** Maximum residual from a common line, in metres; default .05. */
+  /** Maximum transverse residual allowed inside one row/column cluster, in metres; default .08. */
   toleranceM?: number;
-  /** Maximum nonrigid displacement, in metres; default .05. */
+  /** Maximum nonrigid displacement of a single centre, in metres; default .08. */
   maxFitDisplacementM?: number;
-  /** Maximum displacement including SE2, in metres; default .25. */
+  /** Maximum displacement including the rigid rotation, in metres; default 1.5. */
   maxDisplacementM?: number;
-  /** Verified edges only. When supplied, replaces inferred adjacency, including []. */
+  /** Verified edges only. When supplied, those pairs are forced onto one row/column. */
   adjacency?: readonly CorrectionAdjacency[];
 }
 export interface CorrectionLine {
@@ -19,7 +19,7 @@ export interface CorrectionLine {
   axis: 'row' | 'column';
   tagIds: number[];
   coordinateM: number;
-  /** Maximum transverse residual before nonrigid projection. */
+  /** Maximum transverse residual before the cluster is collapsed onto its median. */
   maxResidualM: number;
 }
 export interface CorrectionAmbiguity {code: string; tagIds: number[]; message: string}
@@ -38,38 +38,75 @@ export interface OrthogonalCorrectionPreview {
   rotationDeg: number | null;
   lines: CorrectionLine[];
   ambiguities: CorrectionAmbiguity[];
+  /** Blocking conditions only. */
   reasons: CorrectionReason[];
-  /** Geometric consensus and coverage, not measured positioning accuracy. */
+  /** Informational conditions that never block applying. */
+  notes: CorrectionReason[];
+  /** Axis-consensus confidence of the rigid rotation, not measured positioning accuracy. */
   confidence: number;
   /** Allows a separate manual workflow; does not override any readiness blocker. */
   manualFallbackAllowed: boolean;
 }
 
 type Axis = CorrectionLine['axis'];
-type Edge = {a: number; b: number; axis: Axis; explicit: boolean};
-type CandidateLine = CorrectionLine & {explicit: boolean};
-const minimumBaselineM = .08;
-const angularSlope = Math.tan(6 * Math.PI / 180);
+interface AxisCluster {ids: number[]; coordinateM: number; maxResidualM: number}
+
 const epsilon = 1e-10;
 const median = (values: number[]): number => {
   const sorted = [...values].sort((a, b) => a - b), middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  return sorted.length % 2 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
 };
 const point = (p: Point): Point => ({x: p.x, y: p.y});
 const transverse = (axis: Axis): 'x' | 'y' => axis === 'row' ? 'y' : 'x';
-const longitudinal = (axis: Axis): 'x' | 'y' => axis === 'row' ? 'x' : 'y';
 
 /**
- * Pure map-only preview. SE2 comes from map-alignment; only supported line centres
- * undergo nonrigid projection. Independent line offsets retain unequal spacing.
- * No scale factor, path fitting, persistence, version change, or measured-accuracy claim.
+ * Groups coordinates that already sit on one line after the rigid rotation.
+ * The span is bounded to 2 * tolerance so two neighbouring rows cannot chain
+ * into one cluster through a run of small gaps.
+ */
+function clusterAxis(entries: {id: number; value: number}[], tolerance: number): AxisCluster[] {
+  const sorted = [...entries].sort((a, b) => a.value - b.value || a.id - b.id);
+  const groups: {id: number; value: number}[][] = [];
+  for (const entry of sorted) {
+    const group = groups[groups.length - 1];
+    if (group && entry.value - group[0]!.value <= 2 * tolerance + epsilon
+      && Math.abs(entry.value - median(group.map(item => item.value))) <= tolerance + epsilon) {
+      group.push(entry);
+      continue;
+    }
+    groups.push([entry]);
+  }
+  return groups.map(group => {
+    const values = group.map(item => item.value), coordinateM = median(values);
+    return {
+      ids: group.map(item => item.id),
+      coordinateM,
+      maxResidualM: Math.max(...values.map(value => Math.abs(value - coordinateM))),
+    };
+  });
+}
+
+/**
+ * Pure map-only preview.
+ *
+ * 1. The whole map is rotated rigidly so the dominant row direction is parallel to
+ *    the x axis. A rotation preserves every centre-to-centre distance.
+ * 2. Centres that fall on one row (same y) or one column (same x) are collapsed onto
+ *    that cluster's median, which is the only nonrigid step and is bounded by the
+ *    tolerance. Unequal row/column spacing is retained: each cluster keeps its own
+ *    offset and centres keep their longitudinal coordinate.
+ *
+ * No scale factor, no path fitting, no persistence, no version change, and no claim
+ * about measured accuracy.
  */
 export function previewOrthogonalCorrection(
   source: FieldMap, options: OrthogonalCorrectionOptions = {},
 ): OrthogonalCorrectionPreview {
-  const tolerance = options.toleranceM ?? .05;
-  const fitLimit = options.maxFitDisplacementM ?? .05;
-  const totalLimit = options.maxDisplacementM ?? .25;
+  const tolerance = options.toleranceM ?? .08;
+  // A snap can never exceed the tolerance by construction; the limit only guards against
+  // a caller passing an inconsistent pair of options.
+  const fitLimit = options.maxFitDisplacementM ?? tolerance * 1.5;
+  const totalLimit = options.maxDisplacementM ?? 1.5;
   for (const [name, value] of [['toleranceM', tolerance], ['maxFitDisplacementM', fitLimit], ['maxDisplacementM', totalLimit]] as const) {
     if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be finite and positive`);
   }
@@ -79,194 +116,168 @@ export function previewOrthogonalCorrection(
   const result: OrthogonalCorrectionPreview = {
     ready: false, map: null, reason: '', points: [], outlierIds: [],
     maxDisplacementM: 0, maxFitDisplacementM: 0, maxDistanceChangeM: 0, distanceChanges: [],
-    rotationDeg: null, lines: [], ambiguities: [], reasons: [], confidence: 0, manualFallbackAllowed: false,
+    rotationDeg: null, lines: [], ambiguities: [], reasons: [], notes: [], confidence: 0, manualFallbackAllowed: false,
   };
   const addReason = (code: string, message: string, tagIds: number[] = []) => {
     result.reasons.push({code, message, tagIds: [...new Set(tagIds)].sort((a, b) => a - b)});
   };
+  const addNote = (code: string, message: string, tagIds: number[] = []) => {
+    result.notes.push({code, message, tagIds: [...new Set(tagIds)].sort((a, b) => a - b)});
+  };
   const disclaimer = '不代表实测精度提升；须人工检查并通过现有 API 显式保存新版本';
   if (map.routeMode !== 'map-only') {
     addReason('unsupported-route-mode', '非刚体几何校正仅适用于 map-only 定位码地图');
-    result.reason = `${result.reasons[0].message}；${disclaimer}`;
+    result.reason = `${result.reasons[0]!.message}；${disclaimer}`;
     return result;
   }
   result.manualFallbackAllowed = true;
   const sourceErrors = validate(map).errors;
   if (sourceErrors.length) addReason('invalid-source', sourceErrors.join('；'));
+
   const estimated = estimateMapAlignment({tags: [...map.tags].sort((a, b) => a.id - b.id)});
-  if (!estimated.ready) addReason('low-confidence', `${estimated.reason}；可另行手动回退，不自动确认`);
-  const rotation = options.rotationDeg ?? estimated.rotationDeg;
+  result.confidence = estimated.confidence;
+  const centroid = map.tags.length
+    ? {x: map.tags.reduce((sum, tag) => sum + tag.x, 0) / map.tags.length, y: map.tags.reduce((sum, tag) => sum + tag.y, 0) / map.tags.length}
+    : {x: 0, y: 0};
+  // A scan is not perfectly rigid: one long row can be a few degrees off the global
+  // axis estimate while short rows look flat. Sweeping the angle and keeping the one
+  // that puts the most centres onto shared lines aligns the longest evidence first,
+  // and the bounded snap below absorbs the remaining few centimetres.
+  const scoreRotation = (angleDeg: number) => {
+    const cos = Math.cos(angleDeg * Math.PI / 180), sin = Math.sin(angleDeg * Math.PI / 180);
+    const xs: {id: number; value: number}[] = [], ys: {id: number; value: number}[] = [];
+    for (const tag of map.tags) {
+      const dx = tag.x - centroid.x, dy = tag.y - centroid.y;
+      xs.push({id: tag.id, value: centroid.x + cos * dx - sin * dy});
+      ys.push({id: tag.id, value: centroid.y + sin * dx + cos * dy});
+    }
+    let supported = 0, residual = 0;
+    for (const cluster of [...clusterAxis(xs, tolerance), ...clusterAxis(ys, tolerance)]) {
+      if (cluster.ids.length < 2) continue;
+      supported += cluster.ids.length;
+      residual += cluster.maxResidualM;
+    }
+    return {supported, residual};
+  };
+  let rotation = options.rotationDeg ?? null, sweepSupported = 0;
+  if (rotation === null) {
+    let best = {angle: estimated.rotationDeg ?? 0, supported: -1, residual: Infinity};
+    for (let step = -180; step < 180; step++) {
+      const angle = step * .25, score = scoreRotation(angle);
+      if (score.supported > best.supported || (score.supported === best.supported && score.residual < best.residual - epsilon)) {
+        best = {angle, ...score};
+      }
+    }
+    rotation = best.angle;
+    sweepSupported = best.supported;
+  }
   let aligned: FieldMap = {...map, coordinateStatus: 'draft'};
-  if (rotation !== null) {
+  if (rotation === null) addReason('no-rotation', `无法估计地图主方向：${estimated.reason}`);
+  else {
     const rigid = applyMapAlignment(map, rotation);
     aligned = rigid.map;
     result.rotationDeg = rigid.transform.rotationDeg;
   }
-  const tags = [...aligned.tags].sort((a, b) => a.id - b.id);
-  const byId = new Map(tags.map(t => [t.id, t]));
-  const edges: Edge[] = [];
-  const blocked = new Set<number>();
-  const ambiguityKeys = new Set<string>();
-  const ambiguous = (code: string, ids: number[], message: string) => {
-    const tagIds = [...new Set(ids)].sort((a, b) => a - b), key = `${code}:${tagIds.join(',')}`;
-    if (!ambiguityKeys.has(key)) {
-      ambiguityKeys.add(key);
-      result.ambiguities.push({code, tagIds, message});
-    }
-    tagIds.forEach(id => blocked.add(id));
-  };
-  const axial = (a: Point, b: Point): Axis | null => {
-    const dx = Math.abs(a.x - b.x), dy = Math.abs(a.y - b.y);
-    if (dx >= minimumBaselineM && dy <= 2 * tolerance + epsilon && dy <= dx * angularSlope + epsilon) return 'row';
-    if (dy >= minimumBaselineM && dx <= 2 * tolerance + epsilon && dx <= dy * angularSlope + epsilon) return 'column';
-    return null;
-  };
-  if (rotation !== null && sourceErrors.length === 0) {
-    if (options.adjacency !== undefined) {
-      const seen = new Set<string>();
-      for (const edge of options.adjacency) {
-        const a = byId.get(edge.fromId), b = byId.get(edge.toId);
-        const axis = a && b && a.id !== b.id ? axial(a, b) : null;
-        if (!a || !b || !axis) {
-          addReason('invalid-adjacency', '显式邻接引用无效、基线不足或方向不支持正交线', [edge.fromId, edge.toId]);
-          continue;
-        }
-        const lo = Math.min(a.id, b.id), hi = Math.max(a.id, b.id), key = `${axis}:${lo}:${hi}`;
-        if (!seen.has(key)) {seen.add(key); edges.push({a: lo, b: hi, axis, explicit: true});}
-      }
-    } else {
-      // Use local geometric evidence, not all pairs sharing nearly the same x/y.
-      const nearest = tags.map(a => Math.min(...tags.filter(b => b.id !== a.id)
-        .map(b => distance(a, b)).filter(d => d >= minimumBaselineM))).filter(Number.isFinite);
-      const cutoff = nearest.length ? 3 * median(nearest) : 0;
-      const buckets = new Map<string, {id: number; length: number; along: number}[]>();
-      const candidates: Edge[] = [];
-      const directionKey = (id: number, otherId: number, axis: Axis): string => {
-        const coordinate = longitudinal(axis);
-        return `${id}:${axis}:${Math.sign(byId.get(otherId)![coordinate] - byId.get(id)![coordinate])}`;
-      };
-      for (let i = 0; i < tags.length; i++) for (let j = i + 1; j < tags.length; j++) {
-        const a = tags[i], b = tags[j], length = distance(a, b);
-        if (length > cutoff + epsilon) continue;
-        const axis = axial(a, b);
-        if (!axis) continue;
-        candidates.push({a: a.id, b: b.id, axis, explicit: false});
-        for (const [from, to] of [[a, b], [b, a]]) {
-          const key = directionKey(from.id, to.id, axis), group = buckets.get(key) ?? [];
-          group.push({id: to.id, length, along: Math.abs(to[longitudinal(axis)] - from[longitudinal(axis)])});
-          buckets.set(key, group);
-        }
-      }
-      const selected = new Map<string, number>();
-      for (const [key, neighbors] of buckets) {
-        neighbors.sort((a, b) => a.length - b.length || a.id - b.id);
-        const best = neighbors[0];
-        const ties = neighbors.slice(1).filter(n => n.length - best.length <= 2 * tolerance + epsilon
-          && Math.abs(n.along - best.along) <= 2 * tolerance + epsilon);
-        if (ties.length) {
-          ambiguous('neighbor-ambiguity', [Number(key.split(':')[0]), best.id, ...ties.map(n => n.id)],
-            '同一方向存在近等价邻接候选，不能自动选择同排同列');
-        } else selected.set(key, best.id);
-      }
-      for (const edge of candidates) {
-        if (!blocked.has(edge.a) && !blocked.has(edge.b)
-          && selected.get(directionKey(edge.a, edge.b, edge.axis)) === edge.b
-          && selected.get(directionKey(edge.b, edge.a, edge.axis)) === edge.a) edges.push(edge);
-      }
-    }
-  }
-  const candidates: CandidateLine[] = [];
-  for (const axis of ['row', 'column'] as const) {
-    const relevant = edges.filter(e => e.axis === axis), parent = new Map<number, number>();
+
+  const original = new Map(map.tags.map(tag => [tag.id, tag]));
+  const alignedTags = [...aligned.tags];
+  const clusterForced = (clusters: AxisCluster[], axis: Axis): AxisCluster[] => {
+    const pairs = options.adjacency ?? [];
+    if (!pairs.length) return clusters;
+    const parent = new Map<number, number>();
     const root = (id: number): number => {
       let r = id;
-      while (parent.get(r)! !== r) r = parent.get(r)!;
+      while (parent.get(r) !== r) r = parent.get(r)!;
       while (id !== r) {const next = parent.get(id)!; parent.set(id, r); id = next;}
       return r;
     };
-    for (const edge of relevant) {
-      if (!parent.has(edge.a)) parent.set(edge.a, edge.a);
-      if (!parent.has(edge.b)) parent.set(edge.b, edge.b);
-      const a = root(edge.a), b = root(edge.b);
-      parent.set(Math.max(a, b), Math.min(a, b));
+    for (const cluster of clusters) for (const id of cluster.ids) parent.set(id, id);
+    for (const pair of pairs) {
+      if (!parent.has(pair.fromId) || !parent.has(pair.toId)) continue;
+      const a = root(pair.fromId), b = root(pair.toId);
+      if (a !== b) parent.set(Math.max(a, b), Math.min(a, b));
     }
-    const groups = new Map<number, number[]>();
-    for (const id of parent.keys()) {const r = root(id), ids = groups.get(r) ?? []; ids.push(id); groups.set(r, ids);}
-    for (const ids of [...groups.values()].sort((a, b) => Math.min(...a) - Math.min(...b))) {
-      ids.sort((a, b) => a - b);
-      const values = ids.map(id => byId.get(id)![transverse(axis)]), coordinateM = median(values);
-      const maxResidualM = Math.max(...values.map(v => Math.abs(v - coordinateM)));
-      // A bounded whole cluster prevents transitive tolerance chaining.
-      if (maxResidualM > tolerance + epsilon || Math.max(...values) - Math.min(...values) > 2 * tolerance + epsilon) {
-        ambiguous('cluster-drift', ids, '邻接链整体超出同一直线容差，不能逐段吸附扩大线簇');
+    const merged = new Map<number, number[]>();
+    for (const cluster of clusters) for (const id of cluster.ids) {
+      const key = root(id), ids = merged.get(key) ?? [];
+      ids.push(id);
+      merged.set(key, ids);
+    }
+    return [...merged.values()].map(ids => {
+      const values = ids.map(id => alignedTags.find(tag => tag.id === id)![transverse(axis)]), coordinateM = median(values);
+      return {ids: ids.sort((a, b) => a - b), coordinateM, maxResidualM: Math.max(...values.map(value => Math.abs(value - coordinateM)))};
+    });
+  };
+  const rows = clusterForced(clusterAxis(alignedTags.map(tag => ({id: tag.id, value: tag.y})), tolerance), 'row');
+  const columns = clusterForced(clusterAxis(alignedTags.map(tag => ({id: tag.id, value: tag.x})), tolerance), 'column');
+
+  const targets = new Map<number, Partial<Point>>();
+  const assign = (axis: Axis, clusters: AxisCluster[]) => {
+    for (const cluster of clusters) {
+      if (cluster.ids.length < 2) continue;
+      if (cluster.maxResidualM > 2 * tolerance + epsilon) {
+        result.ambiguities.push({code: 'cluster-drift', tagIds: cluster.ids, message: `同${axis === 'row' ? '排' : '列'}点位跨度超过容差，不能吸附到同一条线`});
         continue;
       }
-      candidates.push({id: `${axis}:${ids.join('-')}`, axis, tagIds: ids, coordinateM, maxResidualM,
-        explicit: relevant.some(e => e.explicit && ids.includes(e.a) && ids.includes(e.b))});
+      result.lines.push({id: `${axis}:${cluster.ids.join('-')}`, axis, tagIds: cluster.ids, coordinateM: cluster.coordinateM, maxResidualM: cluster.maxResidualM});
+      for (const id of cluster.ids) targets.set(id, {...targets.get(id), [transverse(axis)]: cluster.coordinateM});
     }
-  }
-  let active = candidates.filter(line => line.tagIds.every(id => !blocked.has(id)));
-  // Prune unsupported two-point lines to a fixed point. Rectangles support each
-  // other; L/U fragments cannot bootstrap missing independent constraints.
-  for (;;) {
-    const membership = new Map<string, string>();
-    for (const line of active) for (const id of line.tagIds) membership.set(`${line.axis}:${id}`, line.id);
-    const next = active.filter(line => {
-      if (line.explicit || line.tagIds.length >= 3) return true;
-      const other: Axis = line.axis === 'row' ? 'column' : 'row';
-      const a = membership.get(`${other}:${line.tagIds[0]}`), b = membership.get(`${other}:${line.tagIds[1]}`);
-      return a !== undefined && b !== undefined && a !== b;
-    });
-    if (next.length === active.length) break;
-    active = next;
-  }
-  result.lines = active.map(({explicit: _explicit, ...line}) => line);
-  const targets = new Map<number, Partial<Point>>();
-  const memberships = new Map<string, string>();
-  for (const line of result.lines) for (const id of line.tagIds) {
-    const target = targets.get(id) ?? {};
-    target[transverse(line.axis)] = line.coordinateM;
-    targets.set(id, target);
-    memberships.set(`${line.axis}:${id}`, line.id);
-  }
+  };
+  assign('row', rows);
+  assign('column', columns);
+  result.lines.sort((a, b) => a.axis.localeCompare(b.axis) || Math.min(...a.tagIds) - Math.min(...b.tagIds));
+
+  // Two centres must never be collapsed onto the same grid intersection.
   const intersections = new Map<string, number>();
-  for (const tag of tags) {
-    const row = memberships.get(`row:${tag.id}`), column = memberships.get(`column:${tag.id}`);
-    if (!row || !column) continue;
-    const key = `${row}|${column}`, previous = intersections.get(key);
-    if (previous !== undefined) ambiguous('intersection-collision', [previous, tag.id], '多个定位码被分配到同一交点');
+  for (const tag of alignedTags) {
+    const target = targets.get(tag.id);
+    if (!target) continue;
+    const key = `${(target.x ?? tag.x).toFixed(6)}|${(target.y ?? tag.y).toFixed(6)}`;
+    const previous = intersections.get(key);
+    if (previous !== undefined) result.ambiguities.push({code: 'intersection-collision', tagIds: [previous, tag.id], message: '两个定位码会被吸附到同一交点'});
     else intersections.set(key, tag.id);
   }
-  const corrected = aligned.tags.map((tag, i) => {
+
+  const corrected = alignedTags.map((tag, index) => {
     const target = targets.get(tag.id), after = {...tag, x: target?.x ?? tag.x, y: target?.y ?? tag.y};
-    const displacementM = distance(map.tags[i], after), fitDisplacementM = distance(tag, after), outlier = !target;
-    result.points.push({id: tag.id, before: point(map.tags[i]), aligned: point(tag), after: point(after),
-      displacementM, fitDisplacementM, outlier});
-    if (outlier) result.outlierIds.push(tag.id);
+    const before = original.get(tag.id) ?? map.tags[index]!;
+    const displacementM = distance(before, after), fitDisplacementM = distance(tag, after);
+    result.points.push({id: tag.id, before: point(before), aligned: point(tag), after: point(after), displacementM, fitDisplacementM, outlier: !target});
+    if (!target) result.outlierIds.push(tag.id);
     result.maxDisplacementM = Math.max(result.maxDisplacementM, displacementM);
     result.maxFitDisplacementM = Math.max(result.maxFitDisplacementM, fitDisplacementM);
     return after;
   });
   for (let i = 0; i < corrected.length; i++) for (let j = i + 1; j < corrected.length; j++) {
-    const beforeM = distance(map.tags[i], map.tags[j]), afterM = distance(corrected[i], corrected[j]), changeM = afterM - beforeM;
-    result.distanceChanges.push({fromId: corrected[i].id, toId: corrected[j].id, beforeM, afterM, changeM});
+    const beforeM = distance(original.get(corrected[i]!.id) ?? map.tags[i]!, original.get(corrected[j]!.id) ?? map.tags[j]!);
+    const afterM = distance(corrected[i]!, corrected[j]!), changeM = afterM - beforeM;
+    result.distanceChanges.push({fromId: corrected[i]!.id, toId: corrected[j]!.id, beforeM, afterM, changeM});
     result.maxDistanceChangeM = Math.max(result.maxDistanceChangeM, Math.abs(changeM));
   }
-  result.confidence = estimated.confidence * (corrected.length - result.outlierIds.length) / corrected.length;
-  if (result.lines.length === 0) addReason('insufficient-support', '没有获得第三点、正交交叉或显式邻接支持的线簇');
-  if (result.outlierIds.length) addReason('outliers', '部分点位没有可靠线簇支持，保留其 SE2 基线位置，不自动确认', result.outlierIds);
-  if (result.ambiguities.length) addReason('ambiguity', '存在邻接、线簇或交点歧义，禁止自动确认', result.ambiguities.flatMap(a => a.tagIds));
-  if (result.maxFitDisplacementM > fitLimit + epsilon) addReason('fit-displacement-limit', '非刚体拟合位移超过上限',
+
+  if (!result.lines.length) addReason('no-support', '没有任何两个定位码落在同一排或同一列，无法确定吸附目标；请检查地图或改用实测坐标验收');
+  if (result.maxFitDisplacementM > fitLimit + epsilon) addReason('fit-displacement-limit', '逐点吸附位移超过上限',
     result.points.filter(p => p.fitDisplacementM > fitLimit + epsilon).map(p => p.id));
-  if (result.maxDisplacementM > totalLimit + epsilon) addReason('total-displacement-limit', '包含 SE2 的总位移超过上限',
+  if (result.maxDisplacementM > totalLimit + epsilon) addReason('total-displacement-limit', '包含整体旋转的总位移超过上限',
     result.points.filter(p => p.displacementM > totalLimit + epsilon).map(p => p.id));
+
+  if (result.rotationDeg !== null) {
+    addNote('rigid-rotation', `整体旋转 ${result.rotationDeg.toFixed(2)}°（刚性旋转，不改变任何码间距离）`);
+    if (sweepSupported) addNote('rotation-sweep', `方向按“最多点位能落在同一条水平/垂直线上”挑选：${sweepSupported} 个点位有同排/同列同伴`);
+    if (result.maxDisplacementM > .25 + epsilon) addNote('rigid-shift', `旋转使最远点移动 ${(result.maxDisplacementM * 100).toFixed(1)} cm，这是坐标方向变化，不是点位误差`);
+  }
+  if (result.outlierIds.length) addNote('unsupported-points', `${result.outlierIds.length} 个点位单独成排/成列，未参与吸附，保持旋转后的位置`, result.outlierIds);
+  if (!estimated.ready) addNote('axis-consensus', `全局主轴一致性 ${(estimated.confidence * 100).toFixed(0)}%，已改用逐点对齐最优方向；请目视确认预览`);
+
   const candidate = mapSchema.safeParse({...aligned, tags: corrected, coordinateStatus: 'draft'});
   if (candidate.success) {
     result.map = candidate.data;
     const errors = validate(candidate.data).errors;
     if (errors.length) addReason('invalid-preview', errors.join('；'));
-  } else addReason('invalid-preview', candidate.error.issues.map(i => i.message).join('；'));
+  } else addReason('invalid-preview', candidate.error.issues.map(issue => issue.message).join('；'));
   result.ready = result.reasons.length === 0;
-  result.reason = `${result.ready ? '可靠邻接支持的正交线簇中位数投影预览' : result.reasons.map(r => r.message).join('；')}；${disclaimer}`;
+  result.reason = result.ready
+    ? `整图旋转 ${(result.rotationDeg ?? 0).toFixed(2)}° 后，${result.lines.length} 条行列线上的码已对齐到同一条水平/垂直线；逐点最大移动 ${(result.maxFitDisplacementM * 100).toFixed(1)} cm`
+    : result.reasons.map(item => item.message).join('；');
   return result;
 }

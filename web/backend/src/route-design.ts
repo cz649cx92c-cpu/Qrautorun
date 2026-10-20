@@ -6,7 +6,7 @@ import trial from '../../../src/greenhouse_navigation/greenhouse_navigation/reco
 
 export const routeDesignSchema=z.object({
  mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),baseVersion:z.number().int().positive(),
- points:z.array(pointSchema).min(2).max(501),bodyYawDeg:z.number().finite().min(-180).max(180),routeId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),routeName:z.string().trim().min(1).max(100).optional(),saveAs:z.boolean().default(false),routeUpdated:z.string().datetime().optional()
+ points:z.array(pointSchema).min(2).max(501),bodyYawDeg:z.number().finite().min(-180).max(180),initialHeadingRad:z.number().finite().min(-Math.PI).max(Math.PI).nullable().optional(),routeId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),routeName:z.string().trim().min(1).max(100).optional(),saveAs:z.boolean().default(false),routeUpdated:z.string().datetime().optional()
 }).extend({segmentModes:z.array(segmentChoiceSchema).max(100).optional()}).strict();
 const wrap=(a:number)=>Math.atan2(Math.sin(a),Math.cos(a));
 const EPS=1e-8;
@@ -35,25 +35,31 @@ export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:nu
  const plans=planStrategies(boundaries,bodyYaw,segmentModes),keys=new Set<string>();
  for(const choice of segmentModes){const key=choice.fromId+'>'+choice.toId+'#'+choice.occurrence;if(keys.has(key)||!plans.some(plan=>plan.key===key))throw new Error('区间策略重复或与当前有向码间区间不匹配');keys.add(key);}
  const issue=plans.find(plan=>plan.problem);if(issue)throw new Error(issue.problem);
- // Unsupported turns are persisted as planning intent only. Existing continuous,
- // validated execution geometry remains intact and the start API blocks the plan.
+ // Body heading carried through the route: a turn_forward interval updates it at
+ // the shared QR centre, so following intervals are compiled against the new axis.
+ let yaw=bodyYaw;
  for(let i=1;i<boundaries.length;i++){
   const a=boundaries[i-1]!,b=boundaries[i]!;
   if(distance(a,b)<.08)throw new Error('相邻定位组区间端点距离不足8厘米，请调整路径');
   if(Math.abs(a.x-b.x)>EPS&&Math.abs(a.y-b.y)>EPS)throw new Error('串联节点无法直线连接，请沿正交网格布线');
-  const tangent=Math.atan2(b.y-a.y,b.x-a.x),angle=Math.abs(wrap(tangent-bodyYaw));
-  const direction=angle<=Math.PI/4+EPS?'forward':angle>=3*Math.PI/4-EPS?'reverse':'lateral';
-  if(direction!=='lateral'&&Math.abs(wrap(tangent-bodyYaw-(direction==='reverse'?Math.PI:0)))>.10)
+  // turn_forward rotates the body at the shared QR centre, so the interval itself
+  // is driven straight forward along the new heading instead of as a crab shift.
+  const turning=plans[i-1]!.mode==='turn_forward';
+  const tangent=Math.atan2(b.y-a.y,b.x-a.x),angle=Math.abs(wrap(tangent-yaw));
+  const direction=turning?'forward':angle<=Math.PI/4+EPS?'forward':angle>=3*Math.PI/4-EPS?'reverse':'lateral';
+  if(!turning&&direction!=='lateral'&&Math.abs(wrap(tangent-yaw-(direction==='reverse'?Math.PI:0)))>.10)
    throw new Error('前进/倒车区间与车头朝向偏差超过5.7度；请调整车头朝向，使其沿水平或垂直轴');
-  let wheelAngle=direction==='lateral'?wrap(tangent-bodyYaw)*180/Math.PI:0;
+  let wheelAngle=direction==='lateral'?wrap(tangent-yaw)*180/Math.PI:0;
   if(wheelAngle>90)wheelAngle-=180;if(wheelAngle< -90)wheelAngle+=180;
+  const segmentYaw=turning?tangent:yaw;
   const n=Math.min(999,Math.max(2,Math.ceil(distance(a,b)/.05)));
   if(route.length+n+(route.length?0:1)>1001)throw new Error('加密路线超过1001点，请缩短路径或拆分任务');
   const points=Array.from({length:n+1},(_,j)=>({x:a.x+(b.x-a.x)*j/n,y:a.y+(b.y-a.y)*j/n}));
   segments.push({id:'design-interval-'+i,fromId:a.id,toId:b.id,mode:direction==='lateral'?'crab':'4t4d',direction,
    ...(plans[i-1]!.mode!=='auto'?{strategy:plans[i-1]!.mode}:{}),
-   executionProfile:trial.profile as 'recorded_slow_trial',bodyYaw,endYaw:bodyYaw,wheelAngle,points});
+   executionProfile:trial.profile as 'recorded_slow_trial',bodyYaw:segmentYaw,endYaw:segmentYaw,wheelAngle,points});
   route.push(...(route.length?points.slice(1):points));
+  yaw=segmentYaw;
  }
  const rowId=source.rows[0]?.id??'scan-route-1';
  const row={id:rowId,name:'自定义正交路径',width:source.rows[0]?.width??.6,exitDistance:source.rows[0]?.exitDistance??.8,start:route[0]!,points:route.slice(1)};

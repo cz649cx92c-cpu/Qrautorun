@@ -30,6 +30,7 @@ export const root=fileURLToPath(new URL('../../../',import.meta.url));
 const mapConfirmationSchema=z.object({mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),version:z.number().int().positive(),confirm:z.literal(true),operator:z.string().trim().min(1).max(80),updateTasks:z.boolean().default(false)}).strict();
 const mapConfirmationEvidenceSchema=mapConfirmationSchema.extend({kind:z.literal('user_confirmation'),acceptedVersion:z.number().int().positive(),created:z.string().datetime()}).strict();
 const mapMeasurementSchema=z.object({mapId:z.string(),version:z.number().int().positive(),measurements:z.array(anchorSchema).min(3).max(587),operator:z.string().min(1).max(80)});
+const mapUnifyAnglesSchema=z.object({mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),version:z.number().int().positive(),confirm:z.literal(true),operator:z.string().trim().min(1).max(80),updateTasks:z.boolean().default(false)}).strict();
 const mapMeasurementEvidenceSchema=mapMeasurementSchema.extend({kind:z.literal('measurement').optional(),residuals:z.array(z.number().finite().min(0).max(.03)).min(3).max(587),created:z.string().datetime()}).strict();
 function routeMapSnapshot(source:z.infer<typeof mapSchema>,route:Route){
  const path=route.motionSegments.length?[route.motionSegments[0]!.points[0]!,...route.motionSegments.flatMap(segment=>segment.points.slice(1))]:route.points;
@@ -121,9 +122,28 @@ export async function createApp(database?:string) {
  app.post('/api/maps/generate',req=>({map:generate(generationSchema.parse(req.body))}));
  app.post('/api/maps/validate',req=>validate(mapSchema.parse(req.body)));
  app.post('/api/maps',req=>{const body=z.object({map:mapSchema,baseVersion:z.number().int().nonnegative()}).parse(req.body);return saveMap(body.map,body.baseVersion);});
+ // Read-only cascade preview for the delete dialog: what else disappears with this map.
+ app.get<{Params:{id:string}}>('/api/maps/:id/deletion',(req,reply)=>{
+  const info=store.mapDeletionInfo(req.params.id);if(!info)return reply.code(404).send({error:'地图不存在'});
+  const running=robot.status().running;
+  return {...info,blocked:running,blockedReason:running?'车辆正在执行导航任务，请先停止导航再删除地图':null};
+ });
+ app.delete<{Params:{id:string}}>('/api/maps/:id',req=>{
+  if(robot.status().running)throw Object.assign(new Error('车辆正在执行导航任务，请先停止导航再删除地图'),{statusCode:409});
+  if(robot.poll().some(command=>command.type==='start'))throw Object.assign(new Error('导航启动指令正在处理，请稍后再删除地图'),{statusCode:409});
+  const result=store.deleteMap(req.params.id);
+  log(`删除地图 ${result.name} ${result.mapId} · 版本${result.deletedVersions} · 路径${result.deletedRoutes} · 任务${result.deletedTasks}`);
+  return result;
+ });
  app.get('/api/routes',(req)=>{const query=req.query as {mapId?:string};return store.listRoutes(query.mapId);});
  app.get<{Params:{id:string}}>('/api/routes/:id',(req,reply)=>{const route=store.getRoute(req.params.id);if(!route)return reply.code(404).send({error:'路径不存在'});const item=store.get(route.mapId,route.mapVersion);if(!item||route.mapDigest!==store.digest(item.map))return reply.code(409).send({error:'路径引用的地图版本或摘要已变化，请重新选择路径'});return {...route,route,map:routeMapSnapshot(item.map,route),version:item.version,acceptance:mapApproval(item)};});
- app.delete<{Params:{id:string}}>('/api/routes/:id',req=>store.deleteRoute(req.params.id));
+ app.get<{Params:{id:string}}>('/api/routes/:id/usage',req=>store.routeUsage(req.params.id));
+ app.delete<{Params:{id:string},Querystring:{detachTasks?:string}}>('/api/routes/:id',req=>{
+  if(robot.status().running)throw Object.assign(new Error('车辆正在执行导航任务，请先停止导航再删除路径'),{statusCode:409});
+  const result=store.deleteRoute(req.params.id,req.query.detachTasks==='1');
+  log(`删除路径 ${result.name} ${result.routeId}`+(result.deletedTasks?` · 同时移除 ${result.deletedTasks} 个任务绑定`:''));
+  return result;
+ });
  app.post('/api/route/design',req=>{
   const parsed=routeDesignSchema.safeParse(req.body);if(!parsed.success)throw new Error('路径参数无效：mapId、正整数 baseVersion、2–501 个有限坐标 points、-180 到 180 度 bodyYawDeg 必须完整填写');
   const body=parsed.data,status=robot.status();if(status.running||robot.poll().some(c=>c.type==='start'))throw new Error('请先停止导航并等待启动指令处理完成，再编辑路径');
@@ -132,12 +152,12 @@ export async function createApp(database?:string) {
    const compiled=compileDesignedRoute(item.map,body.points,body.bodyYawDeg,body.segmentModes);
    if(body.routeId||body.routeName||body.saveAs||item.map.routeMode==='map-only'){
     const routeId=body.saveAs||!body.routeId?'route-'+randomBytes(12).toString('hex'):body.routeId;const now=new Date().toISOString();
-    const route=store.saveRoute({routeId,mapId:body.mapId,name:body.routeName??item.map.name+'路线',mapVersion:body.baseVersion,mapDigest:store.digest(item.map),points:body.points,motionSegments:compiled.map.motionSegments!,bodyYawDeg:body.bodyYawDeg,created:now,updated:now},body.routeUpdated);
+    const route=store.saveRoute({routeId,mapId:body.mapId,name:body.routeName??item.map.name+'路线',mapVersion:body.baseVersion,mapDigest:store.digest(item.map),points:body.points,motionSegments:compiled.map.motionSegments!,bodyYawDeg:body.bodyYawDeg,initialHeadingRad:body.initialHeadingRad??null,created:now,updated:now},body.routeUpdated);
     const snapshot=routeMapSnapshot(item.map,route);const tasks=(store.db.prepare('SELECT body FROM tasks ORDER BY updated DESC').all() as {body:string}[]).map(row=>taskSchema.parse(JSON.parse(row.body)));const matching=tasks.find(task=>task.routeId===route.routeId);
     const task=taskSchema.parse({...matching,id:matching?.id??'task-route-'+randomBytes(12).toString('hex'),name:route.name.slice(0,98)+'任务',mapId:route.mapId,mapVersion:route.mapVersion,routeId:route.routeId,routeSnapshot:route,rowOrder:snapshot.order,forwardSpeed:matching?.forwardSpeed??.08,reverseSpeed:matching?.reverseSpeed??.06,lateralSpeed:matching?.lateralSpeed??.05,endWaitSeconds:matching?.endWaitSeconds??2,returnToStart:matching?.returnToStart??false,enabled:matching?.enabled??true});
     store.db.prepare('INSERT INTO tasks VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,updated=excluded.updated').run(task.id,JSON.stringify(task),route.updated);return {...route,route,map:snapshot,version:item.version,task,updatedTasks:[task],trimmed:compiled.trimmed,lengthM:compiled.lengthM,routeGroups:compiled.routeGroups,acceptance:mapApproval(item)};
    }
-   const saved=saveMap(compiled.map,body.baseVersion);const existing=(store.db.prepare('SELECT body FROM tasks ORDER BY updated DESC').all() as {body:string}[]).map(row=>taskSchema.parse(JSON.parse(row.body))).filter(task=>task.mapId===item.map.id&&task.routeId===undefined);const updatedTasks=(existing.length?existing:[taskSchema.parse({id:'task-scan-design-'+randomBytes(12).toString('hex'),name:item.map.name.slice(0,95)+'任务',mapId:item.map.id,mapVersion:saved.version,rowOrder:saved.map.order,forwardSpeed:.08,reverseSpeed:.06,lateralSpeed:.05,endWaitSeconds:2})]).map(task=>taskSchema.parse({...task,mapVersion:saved.version,rowOrder:saved.map.order}));for(const task of updatedTasks)store.db.prepare('INSERT INTO tasks VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,updated=excluded.updated').run(task.id,JSON.stringify(task),new Date().toISOString());const legacyId=legacyRouteId(saved.map.id),existingRoute=store.getRoute(legacyId),now=new Date().toISOString();const legacyRoute=store.saveRoute({routeId:legacyId,mapId:saved.map.id,name:saved.map.rows[0]?.name??saved.map.name+'路线',mapVersion:saved.version,mapDigest:store.digest(saved.map),points:body.points,motionSegments:saved.map.motionSegments!,bodyYawDeg:body.bodyYawDeg,created:now,updated:now},existingRoute?.updated);log('保存自定义正交路径 '+saved.map.id+' v'+saved.version);return {...saved,route:legacyRoute,task:updatedTasks[0],updatedTasks,trimmed:compiled.trimmed,lengthM:compiled.lengthM,routeGroups:compiled.routeGroups};
+   const saved=saveMap(compiled.map,body.baseVersion);const existing=(store.db.prepare('SELECT body FROM tasks ORDER BY updated DESC').all() as {body:string}[]).map(row=>taskSchema.parse(JSON.parse(row.body))).filter(task=>task.mapId===item.map.id&&task.routeId===undefined);const updatedTasks=(existing.length?existing:[taskSchema.parse({id:'task-scan-design-'+randomBytes(12).toString('hex'),name:item.map.name.slice(0,95)+'任务',mapId:item.map.id,mapVersion:saved.version,rowOrder:saved.map.order,forwardSpeed:.08,reverseSpeed:.06,lateralSpeed:.05,endWaitSeconds:2})]).map(task=>taskSchema.parse({...task,mapVersion:saved.version,rowOrder:saved.map.order}));for(const task of updatedTasks)store.db.prepare('INSERT INTO tasks VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,updated=excluded.updated').run(task.id,JSON.stringify(task),new Date().toISOString());const legacyId=legacyRouteId(saved.map.id),existingRoute=store.getRoute(legacyId),now=new Date().toISOString();const legacyRoute=store.saveRoute({routeId:legacyId,mapId:saved.map.id,name:saved.map.rows[0]?.name??saved.map.name+'路线',mapVersion:saved.version,mapDigest:store.digest(saved.map),points:body.points,motionSegments:saved.map.motionSegments!,bodyYawDeg:body.bodyYawDeg,initialHeadingRad:body.initialHeadingRad??null,created:now,updated:now},existingRoute?.updated);log('保存自定义正交路径 '+saved.map.id+' v'+saved.version);return {...saved,route:legacyRoute,task:updatedTasks[0],updatedTasks,trimmed:compiled.trimmed,lengthM:compiled.lengthM,routeGroups:compiled.routeGroups};
   })();
  });
  app.get<{Params:{id:string},Querystring:{version?:string}}>('/api/maps/:id',(req,reply)=>{const version=req.query.version===undefined?undefined:z.coerce.number().int().positive().parse(req.query.version);const item=store.get(req.params.id,version);return item?{...item,acceptance:mapApproval(item)}:reply.code(404).send({error:'地图不存在'});});
@@ -160,21 +180,67 @@ export async function createApp(database?:string) {
    map.coordinateStatus='reviewed';const saved=store.save(map,item.version);
    const evidence=mapConfirmationEvidenceSchema.parse({...body,kind:'user_confirmation',acceptedVersion:saved.version,created:new Date().toISOString()});
    store.db.prepare('INSERT INTO acceptances VALUES(?,?,?,?)').run(map.id,saved.version,store.digest(saved.map),JSON.stringify(evidence));
-   const updatedTasks=[];
+   const digest=store.digest(saved.map),updatedTasks=[],updatedRoutes=[];
    if(body.updateTasks){
+    // 确认坐标必然生成新版本。同一场地的路径与任务原本绑定在旧版本上，
+    // 若不一起前移，用户确认完反而会因“路径摘要失配”被迫重画路径才能启动导航。
+    for(const route of store.listRoutes(map.id)){
+     if(route.mapVersion!==item.version)continue;
+     store.db.prepare('UPDATE routes SET map_version=?,map_digest=?,updated=? WHERE route_id=?').run(saved.version,digest,evidence.created,route.routeId);updatedRoutes.push(route.routeId);
+    }
     for(const row of store.db.prepare('SELECT body FROM tasks').all() as {body:string}[]){
      const task=taskSchema.parse(JSON.parse(row.body));if(task.mapId!==map.id||task.mapVersion!==item.version)continue;
-     const updated={...task,mapVersion:saved.version};store.db.prepare('UPDATE tasks SET body=?,updated=? WHERE id=?').run(JSON.stringify(updated),evidence.created,task.id);updatedTasks.push(updated);
+     const snapshot=task.routeId?store.getRoute(task.routeId):null;
+     const updated={...task,mapVersion:saved.version,...(snapshot?{routeSnapshot:snapshot}:{})};store.db.prepare('UPDATE tasks SET body=?,updated=? WHERE id=?').run(JSON.stringify(updated),evidence.created,task.id);updatedTasks.push(updated);
     }
    }
-   log('用户确认接纳地图 '+map.id+' v'+saved.version+'，确认人 '+body.operator);
-   return {...saved,evidence,acceptance:mapApproval(saved),previousVersion:item.version,updatedTasks};
+   log('用户确认接纳地图 '+map.id+' v'+saved.version+'，确认人 '+body.operator+(updatedRoutes.length?`，路径前移 ${updatedRoutes.length} 条`:''));
+   return {...saved,evidence,acceptance:mapApproval(saved),previousVersion:item.version,updatedTasks,updatedRoutes};
+  })();
+ });
+ app.post('/api/maps/unify-angles',req=>{
+  const body=mapUnifyAnglesSchema.parse(req.body);
+  return store.db.transaction(()=>{
+   const item=store.get(body.mapId);if(!item)throw Object.assign(new Error('地图不存在'),{statusCode:404});
+   if(item.version!==body.version)throw Object.assign(new Error('请使用最新地图版本进行朝向统一'),{statusCode:409});
+   const map=structuredClone(item.map),check=validate(map);if(check.errors.length)throw new Error(check.errors.join('；'));
+   if(map.tags.length<2)throw new Error('地图至少需要两个定位码才能统一朝向');
+   // 现场所有板子同方向铺设：扫描估计出的逐码朝向角只允许几度噪声，取中位数为统一目标。
+   const sorted=map.tags.map(t=>t.angle).sort((a,b)=>a-b),middle=Math.floor(sorted.length/2);
+   const unified=sorted.length%2?sorted[middle]!:(sorted[middle-1]!+sorted[middle]!)/2;
+   const before=map.tags.map(t=>({id:t.id,angleDeg:t.angle}));
+   for(const tag of map.tags)tag.angle=unified;
+   const saved=store.save(map,item.version);
+   const evidence=mapConfirmationEvidenceSchema.parse({...body,kind:'user_confirmation',acceptedVersion:saved.version,created:new Date().toISOString()});
+   store.db.prepare('INSERT INTO acceptances VALUES(?,?,?,?)').run(map.id,saved.version,store.digest(saved.map),JSON.stringify(evidence));
+   const digest=store.digest(saved.map),updatedTasks=[],updatedRoutes=[];
+   if(body.updateTasks){
+    // 朝向统一必然生成新版本；绑定旧版本的路径与任务一起前移，避免摘要失配被迫重画。
+    for(const route of store.listRoutes(map.id)){
+     if(route.mapVersion!==item.version)continue;
+     store.db.prepare('UPDATE routes SET map_version=?,map_digest=?,updated=? WHERE route_id=?').run(saved.version,digest,evidence.created,route.routeId);updatedRoutes.push(route.routeId);
+    }
+    for(const row of store.db.prepare('SELECT body FROM tasks').all() as {body:string}[]){
+     const task=taskSchema.parse(JSON.parse(row.body));if(task.mapId!==map.id||task.mapVersion!==item.version)continue;
+     const snapshot=task.routeId?store.getRoute(task.routeId):null;
+     const updated={...task,mapVersion:saved.version,...(snapshot?{routeSnapshot:snapshot}:{})};store.db.prepare('UPDATE tasks SET body=?,updated=? WHERE id=?').run(JSON.stringify(updated),evidence.created,task.id);updatedTasks.push(updated);
+    }
+   }
+   log('统一定位码朝向 '+map.id+' v'+saved.version+' → '+unified.toFixed(2)+'°（原散布 '+(sorted[sorted.length-1]!-sorted[0]!).toFixed(2)+'°），确认人 '+body.operator+(updatedRoutes.length?`，路径前移 ${updatedRoutes.length} 条`:''));
+   return {...saved,evidence,acceptance:mapApproval(saved),previousVersion:item.version,unifiedAngleDeg:unified,before,updatedTasks,updatedRoutes};
   })();
  });
  app.post('/api/localization/map',req=>{
   const body=z.object({mapId:z.string(),version:z.number().int().positive()}).strict().parse(req.body),item=store.get(body.mapId);
-  if(!item||item.version!==body.version||!mapApproval(item).accepted)throw new Error('请使用已确认的最新导航地图');
+  if(!item||item.version!==body.version)throw new Error('请使用最新的导航地图版本');
+  // 同一场地会被重复扫描成多张测试地图，它们共用同一批物理二维码板。
+  // 全局定位只关心“这张图的坐标是否已确认”以及“现场可见板组是否属于这张图”，
+  // 不再要求定位节点当前 mapId 与所选地图严格相等：切换定位地图本身就是重锚。
+  if(item.map.coordinateStatus!=='reviewed')throw new Error('请先确认该地图的扫描坐标，再切换定位地图');
   const status=robot.status();if(!status.connected||status.running||Math.abs(status.speed)>.001||!status.chassis.connected||typeof status.chassis.feedback?.vx!=='number'||Math.abs(status.chassis.feedback.vx)>.001||robot.poll().some(c=>c.type==='start'))throw new Error('请在小车停止且底盘反馈在线时切换定位地图');
+  const visible=new Set<string>((status.detector?.groups??[]).map((group:{id:string})=>String(group.id))),known=new Set<string>((item.map.groups??[]).map(group=>String(group.id)));
+  // 板组不一致只是提示，不拦截：融合节点在没有匹配板组时本来就不会锚定。
+  if(visible.size&&!Array.from(visible).some(id=>known.has(id)))log('定位地图切换提示：当前可见板组 '+Array.from(visible).join(',')+' 不在 '+item.map.id+' 内，等待该地图板组');
   const path=resolve(root,'maps/office-confirmed.json'),content=JSON.stringify({map:item.map,version:item.version});
   if(!existsSync(path)||readFileSync(path,'utf8')!==content){writeFileSync(path+'.tmp',content);renameSync(path+'.tmp',path);log('切换定位地图 '+item.map.id+' v'+item.version);}
   return {mapId:item.map.id,version:item.version};
@@ -195,7 +261,7 @@ export async function createApp(database?:string) {
   if(task.routeSnapshot){const snapshot=task.routeSnapshot;if(!route||snapshot.routeId!==task.routeId||snapshot.mapId!==task.mapId||snapshot.mapVersion!==task.mapVersion||snapshot.mapDigest!==store.digest(base.map))throw new Error('任务路径快照与当前地图摘要或版本不一致');item.map=routeMapSnapshot(base.map,snapshot);}
   if(item.map.routeMode==='map-only')throw Object.assign(new Error('请先手动编辑并保存导航路径'),{statusCode:423});
   const approval=mapApproval(base);
-  const strategyBlockers=segmentExecutionBlockers(item.map.motionSegments);if(strategyBlockers.length)throw Object.assign(new Error('路径策略尚不可执行：'+strategyBlockers.join('；')),{statusCode:423});
+  const strategyBlockers=segmentExecutionBlockers(item.map.motionSegments,{turnInPlace:robot.status().capabilities?.turnInPlace===true});if(strategyBlockers.length)throw Object.assign(new Error('路径策略尚不可执行：'+strategyBlockers.join('；')),{statusCode:423});
   if(item.map.motionSegments?.some(segment=>segment.strategy==='left'||segment.strategy==='right')&&robot.status().mapping?.lateralSupported!==true)throw Object.assign(new Error('横移能力未由当前导航节点确认，禁止执行显式左/右平移策略'),{statusCode:423});
   if(item.map.captureQuality==='draft'&&!(approval.accepted&&(approval.kind==='user_confirmation'||approval.kind==='office_test')))throw Object.assign(new Error('此地图来自草稿采集，需显式用户确认后才能接纳导航地图'),{statusCode:423});
   const reasons=robot.status().conditions.filter(c=>!c.ready).map(c=>c.label);if(!approval.accepted)reasons.push('温室地图实测坐标验收或用户确认');

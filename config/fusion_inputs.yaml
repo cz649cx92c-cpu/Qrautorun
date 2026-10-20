@@ -18,4 +18,5 @@ qr_fusion_inputs:
     lateral_constraint_sigma_mps: 0.05
     wheel_calibration_verified: false
     noise_calibration_verified: false
-    imu_projection_verified: false
+    # 同上旋转实测：dot(gyro-bias,up) 投影与视觉净转角差 0.20/1.18 deg，投影已实测验证。
+    imu_projection_verified: true

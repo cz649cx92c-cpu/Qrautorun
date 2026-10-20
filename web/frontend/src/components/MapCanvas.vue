@@ -7,8 +7,8 @@ import {orthogonalRoute,snapRoutePoint,chainRouteGroups,routeGroupCenters} from 
 import {planStrategies,choicesFromSegments,degrees,type SegmentPlan} from '../../../shared/segment-strategy';
 import {Plus,Minus,Scan,MousePointer2} from 'lucide-vue-next';
 import Button from './ui/Button.vue';
-const props=defineProps<{map:FieldMap,selected:number[],rowId:string,tool:string,editable:boolean,drawing:Point[],panEnabled?:boolean,measurement?:number[],vehicle?:{x:number,y:number,yaw:number},trail?:Point[],routeAnchors?:Point[],routeSelected?:number,routeGroupIds?:number[],routeSkippedGroups?:{id:number,distanceM:number}[],segmentPlans?:SegmentPlan[],selectedSegment?:string}>();
-const emit=defineEmits<{select:[id:number,multi:boolean],inspect:[id:number],segmentSelect:[key:string],row:[id:string],blank:[point:Point],move:[ids:number[],dx:number,dy:number],point:[rowId:string,index:number,point:Point],zone:[index:number,point:Point],designSelect:[index:number],designMove:[index:number,point:Point]}>();
+const props=defineProps<{map:FieldMap,selected:number[],rowId:string,tool:string,editable:boolean,drawing:Point[],panEnabled?:boolean,measurement?:number[],vehicle?:{x:number,y:number,yaw:number},trail?:Point[],routeAnchors?:Point[],routeSelected?:number,routeGroupIds?:number[],routeSkippedGroups?:{id:number,distanceM:number}[],segmentPlans?:SegmentPlan[],selectedSegment?:string,initialHeading?:number}>();
+const emit=defineEmits<{select:[id:number,multi:boolean],inspect:[id:number],segmentSelect:[key:string],row:[id:string],blank:[point:Point],move:[ids:number[],dx:number,dy:number],point:[rowId:string,index:number,point:Point],zone:[index:number,point:Point],designSelect:[index:number],designMove:[index:number,point:Point],heading:[value:number]}>();
 const container=ref<HTMLDivElement>();let stage:Konva.Stage;let layer:Konva.Layer;let observer:ResizeObserver;let isMounted=false;const coordinate=ref('X 0.00 · Y 0.00 m'),zoom=ref(100);
 const px=(p:Point)=>[p.x*100,-p.y*100];
 let hoverMarker:Konva.Circle|undefined;
@@ -43,11 +43,30 @@ function redraw() {
  const stored=props.map.motionSegments??[];
  const plans=props.segmentPlans??(stored.length&&stored.every(s=>s.points?.length)?planStrategies([{id:stored[0]!.fromId,...stored[0]!.points[0]!},...stored.map(s=>({id:s.toId,...s.points.at(-1)!}))],stored[0]!.bodyYaw,choicesFromSegments(stored)):[]);
  if(container.value)container.value.dataset.segmentPlans=JSON.stringify(plans.map(p=>({key:p.key,mode:p.mode,effective:p.effective,startYaw:p.startYaw,travelYaw:p.travelYaw,arrivalYaw:p.arrivalYaw,turn:p.turn,blocked:p.blocked,problem:p.problem})));
- for(const [index,plan] of plans.entries()){
-  const x=(plan.start.x+plan.end.x)*50,y=-(plan.start.y+plan.end.y)*50,color=plan.blocked||plan.problem?'#b45309':'#2563eb',length=24/scale;
-  layer.add(new Konva.Arrow({name:'travel-'+plan.key,points:[x-Math.cos(plan.travelYaw)*length/2,y+Math.sin(plan.travelYaw)*length/2,x+Math.cos(plan.travelYaw)*length/2,y-Math.sin(plan.travelYaw)*length/2],stroke:color,fill:color,strokeWidth:(props.selectedSegment===plan.key?4:2)/scale,pointerLength:6/scale,pointerWidth:6/scale,listening:false}));
+ // The route stays blue; only the selected segment is painted red along its whole length.
+ const orderedPlans=[...plans].filter(plan=>plan.key!==props.selectedSegment).concat(plans.filter(plan=>plan.key===props.selectedSegment));
+ for(const plan of orderedPlans){
+  const x=(plan.start.x+plan.end.x)*50,y=-(plan.start.y+plan.end.y)*50,length=24/scale,active=props.selectedSegment===plan.key;
+  const color=active?'#ffffff':plan.blocked||plan.problem?'#b45309':'#2563eb';
+  const arrowPoints=[x-Math.cos(plan.travelYaw)*length/2,y+Math.sin(plan.travelYaw)*length/2,x+Math.cos(plan.travelYaw)*length/2,y-Math.sin(plan.travelYaw)*length/2];
+  if(active){
+   // Only the selected leg is red, and it is red along its whole length: a white halo
+   // under a thick red line, then a white direction chevron, a dashed ring and a label.
+   // The leg follows the real polyline between the two group centres, so a bent leg
+   // is never drawn as a straight chord.
+   const near=(p:Point,q:Point)=>Math.hypot(p.x-q.x,p.y-q.y)<1e-4;
+   let from=-1,to=-1;
+   for(let i=0;i<props.drawing.length;i++){const p=props.drawing[i]!;if(near(p,plan.start))from=i;if(near(p,plan.end))to=i;}
+   const legPoints=from>=0&&to>from?props.drawing.slice(from,to+1):[plan.start,plan.end];
+   const leg=legPoints.flatMap(px);
+   layer.add(new Konva.Line({name:'selected-leg-halo',points:leg,stroke:'#ffffff',strokeWidth:13/scale,lineCap:'round',lineJoin:'round',listening:false}));
+   layer.add(new Konva.Line({name:'selected-leg',points:leg,stroke:'#dc2626',strokeWidth:7/scale,lineCap:'round',lineJoin:'round',listening:false}));
+   layer.add(new Konva.Circle({x,y,radius:17/scale,stroke:'#dc2626',strokeWidth:1.5/scale,dash:[5/scale,3/scale],listening:false}));
+  }
+  layer.add(new Konva.Arrow({name:'travel-'+plan.key,points:arrowPoints,stroke:color,fill:color,strokeWidth:(active?3:2)/scale,pointerLength:(active?9:6)/scale,pointerWidth:(active?9:6)/scale,listening:false}));
   layer.add(new Konva.Arrow({name:'heading-'+plan.key,points:[x,y,x+Math.cos(plan.arrivalYaw)*18/scale,y-Math.sin(plan.arrivalYaw)*18/scale],stroke:'#d97706',fill:'#d97706',strokeWidth:2/scale,pointerLength:5/scale,pointerWidth:5/scale,listening:false}));
   if(Math.abs(plan.turn)>.001)layer.add(new Konva.Text({x:x+8/scale,y:y-22/scale,text:(plan.turn>0?'↶':'↷')+Math.abs(degrees(plan.turn))+'° · 仅规划',fontSize:11/scale,fill:'#b45309',listening:false}));
+  if(active)layer.add(new Konva.Text({x:x+14/scale,y:y+16/scale,text:'当前段',fontFamily:'QR Sans, QR CJK, sans-serif',fontSize:12/scale,fontStyle:'bold',fill:'#dc2626',listening:false}));
  }
  const measurementIds=props.tool==='measure'?(props.measurement??[]):[];
  const measurementTags=[...new Set(measurementIds)].slice(0,2).map(id=>props.map.tags.find(t=>t.id===id)).filter((t):t is FieldMap['tags'][number]=>!!t&&Number.isFinite(t.x)&&Number.isFinite(t.y));
@@ -92,6 +111,21 @@ function redraw() {
    handle.on('dragend',()=>{suppressDesignClick=true;setTimeout(()=>{suppressDesignClick=false;},0);emit('designMove',i,{x:handle.x()/100,y:-handle.y()/100});redraw();});layer.add(handle);
    layer.add(new Konva.Text({x:x!+9/scale,y:y!-18/scale,text:String(i+1),fontSize:12/scale,fontFamily:'monospace',fill:'#39444f',listening:false}));
   });
+  // Amber arrow on the first waypoint: the route's starting body heading. Drag the
+  // tip to set it; the value is emitted on dragend only so redraw cannot kill the drag.
+  const headingRad=props.initialHeading;
+  if((props.routeAnchors??[]).length&&typeof headingRad==='number'&&Number.isFinite(headingRad)){
+   const [hx,hy]=px(props.routeAnchors![0]!);const arm=Math.max(52/scale,.42*100);
+   const arrow=new Konva.Arrow({name:'initial-heading',points:[hx,hy,hx+Math.cos(headingRad)*arm,hy-Math.sin(headingRad)*arm],stroke:'#d97706',fill:'#d97706',strokeWidth:3/scale,pointerLength:11/scale,pointerWidth:10/scale,listening:false});
+   layer.add(arrow);
+   const knob=new Konva.Circle({name:'initial-heading-handle',x:hx+Math.cos(headingRad)*arm,y:hy-Math.sin(headingRad)*arm,radius:9/scale,fill:'#fffbeb',stroke:'#d97706',strokeWidth:2/scale,draggable:props.editable});
+   let pending=headingRad;
+   knob.on('dragstart',()=>{suppressDesignClick=true;});
+   knob.on('dragmove',()=>{const dx=knob.x()-hx,dy=knob.y()-hy;if(Math.hypot(dx,dy)<arm*.45)return;pending=Math.atan2(-dy,dx);arrow.points([hx,hy,hx+Math.cos(pending)*arm,hy-Math.sin(pending)*arm]);layer.batchDraw();});
+   knob.on('dragend',()=>{setTimeout(()=>{suppressDesignClick=false;},0);emit('heading',pending);emit('designSelect',0);});
+   layer.add(knob);
+   layer.add(new Konva.Text({name:'initial-heading-label',x:hx+Math.cos(headingRad)*arm+8/scale,y:hy-Math.sin(headingRad)*arm+8/scale,text:'初始 '+Math.round(((headingRad*180/Math.PI)%360+360)%360)+'°',fontFamily:'QR Sans, QR CJK, sans-serif',fontSize:11/scale,fontStyle:'bold',fill:'#b45309',listening:false}));
+  }
  }else if(props.drawing.length) {layer.add(new Konva.Line({points:props.drawing.flatMap(px),stroke:'#2563a6',strokeWidth:2/scale,listening:false}));for(const p of props.drawing){const [x,y]=px(p);layer.add(new Konva.Circle({x,y,radius:4/scale,fill:'#2563a6',listening:false}));}}
  if(props.vehicle){const [x,y]=px(props.vehicle);const vehicle=new Konva.Group({x,y,rotation:-props.vehicle.yaw*180/Math.PI});vehicle.add(new Konva.Rect({x:-props.map.vehicle.length*50,y:-props.map.vehicle.width*50,width:props.map.vehicle.length*100,height:props.map.vehicle.width*100,cornerRadius:5,fill:'#2563a6',stroke:'white',strokeWidth:2/scale}));vehicle.add(new Konva.Arrow({points:[0,0,props.map.vehicle.length*50,0],stroke:'white',fill:'white',strokeWidth:2/scale,pointerWidth:6/scale,pointerLength:6/scale}));layer.add(vehicle);}
  measurementTags.forEach((t,i)=>{const [x,y]=px(t),radius=Math.max(t.size*100,9/scale)/2+5/scale;
@@ -134,7 +168,7 @@ onMounted(()=>{
  observer=new ResizeObserver(()=>{if(!isMounted||!container.value)return;stage.size({width:container.value.clientWidth,height:container.value.clientHeight});redraw();});
  observer.observe(container.value!);fit();void document.fonts.ready.then(redraw);
 });
-watch(()=>[props.map,props.selected,props.rowId,props.drawing,props.measurement,props.vehicle,props.trail,props.routeAnchors,props.routeSelected,props.routeGroupIds,props.routeSkippedGroups,props.editable,props.segmentPlans,props.selectedSegment],redraw,{deep:true});watch(()=>[props.tool,props.panEnabled],()=>{if(!isMounted)return;stage.draggable(props.tool==='pan'||props.tool==='measure'||!!props.panEnabled);if(props.tool==='route-design')redraw();else redraw();});watch(()=>props.map.id,fit);onBeforeUnmount(()=>{isMounted=false;window.removeEventListener('blur',resetPointerState);resetPointerState();observer?.disconnect();stage?.off();stage?.destroy();});defineExpose({fit});
+watch(()=>[props.map,props.selected,props.rowId,props.drawing,props.measurement,props.vehicle,props.trail,props.routeAnchors,props.routeSelected,props.routeGroupIds,props.routeSkippedGroups,props.initialHeading,props.editable,props.segmentPlans,props.selectedSegment],redraw,{deep:true});watch(()=>[props.tool,props.panEnabled],()=>{if(!isMounted)return;stage.draggable(props.tool==='pan'||props.tool==='measure'||!!props.panEnabled);if(props.tool==='route-design')redraw();else redraw();});watch(()=>props.map.id,fit);onBeforeUnmount(()=>{isMounted=false;window.removeEventListener('blur',resetPointerState);resetPointerState();observer?.disconnect();stage?.off();stage?.destroy();});defineExpose({fit});
 </script>
 <template><div :class="['canvas-wrap',{'pan-mode':panEnabled}]"><div ref="container" class="map-container" data-testid="map-canvas" :data-route-group-ids="tool==='route-design'?routeGroupIds?.join(','):undefined" :data-skipped-route-group-ids="tool==='route-design'?routeSkippedGroups?.map(tag=>tag.id).join(','):undefined"/><div class="canvas-caption"><span class="dot"></span> 单位 m</div><div class="canvas-controls"><Button variant="outline" size="icon" aria-label="放大地图" @click="scaleBy(1.2)"><Plus :size="16"/></Button><Button variant="outline" size="icon" aria-label="缩小地图" @click="scaleBy(0.8)"><Minus :size="16"/></Button><Button variant="outline" size="icon" aria-label="适应地图" @click="fit"><Scan :size="16"/></Button></div><div class="canvas-footer"><span>{{coordinate}}</span><span>{{zoom}}%</span></div><div v-if="tool==='route-design'" class="draw-hint"><MousePointer2 :size="14"/> 单击追加路点 · 方块可拖动 · 组中心自动吸附</div><div v-if="tool==='row'" class="draw-hint"><MousePointer2 :size="14"/> 点击画布添加路线控制点，再点击“完成绘制”</div></div></template>
 

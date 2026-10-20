@@ -6,6 +6,12 @@ from .control import Command, geometry, wrap
 from .recorded_trial import limits_for
 
 
+# Declared to the web bridge so the start API can drop its 423 for this strategy
+# instead of assuming the capability exists.
+TURN_EXECUTION_AVAILABLE = True
+TURN_STRATEGY = 'turn_forward'
+
+
 def inverse(segment):
     result=copy.deepcopy(segment)
     result['points'].reverse()
@@ -27,6 +33,7 @@ def validate_segments(segments):
         points=segment.get('points',[])
         if segment.get('mode') not in ('4t4d','crab') or len(points)<2:raise ValueError('区间模式或路径无效')
         if not all(math.isfinite(float(p[k])) for p in points for k in ('x','y')):raise ValueError('区间坐标无效')
+        if segment.get('strategy') not in (None,'auto','forward','reverse','left','right',TURN_STRATEGY):raise ValueError('未知区间策略')
         if not all(math.isfinite(float(segment[k])) for k in ('bodyYaw','endYaw','wheelAngle')):raise ValueError('区间车头方向无效')
         if not -90<=segment['wheelAngle']<=90:raise ValueError('平移轮角超出范围')
         if any(math.hypot(b['x']-a['x'],b['y']-a['y'])<.001 for a,b in zip(points,points[1:])):raise ValueError('区间控制点重合')
@@ -51,7 +58,10 @@ def validate_segments(segments):
                 if abs(wrap(tangents[i]-tangents[i-1]))/span>curvature_limit:raise ValueError('4T4D区间曲率超限')
         if previous:
             p=previous['points'][-1]
-            if previous['toId']!=segment['fromId'] or math.hypot(p['x']-a['x'],p['y']-a['y'])>.001 or abs(wrap(previous['endYaw']-segment['bodyYaw']))>.15:raise ValueError('相邻区间不连续')
+            if previous['toId']!=segment['fromId'] or math.hypot(p['x']-a['x'],p['y']-a['y'])>.001:raise ValueError('相邻区间不连续')
+            # A turn_forward interval is allowed to change the body heading at the
+            # shared QR centre; the rotation itself is executed at that standstill.
+            if segment.get('strategy')!=TURN_STRATEGY and abs(wrap(previous['endYaw']-segment['bodyYaw']))>.15:raise ValueError('相邻区间车头方向不连续')
         previous=segment
 
 
@@ -65,14 +75,41 @@ class SegmentExecutor:
         self.outbound_count=len(segments)
         if mission.task.get('returnToStart',False):self.segments += [inverse(s) for s in reversed(segments)]
         self.phase='START_STOP';self.last_seq=None;self.arrival_seen=False;self.align_after_seq=None
+        self.turn_rate=0.;self.turn_started=0.
 
     @property
     def segment(self):return self.segments[self.index]
 
+    @property
+    def turning(self):return self.phase in ('TURN','TURN_STOP')
+
+    def turn_required(self):
+        """Only an explicitly chosen turn_forward 4T4D interval rotates in place."""
+        s=self.segment
+        return s.get('strategy')==TURN_STRATEGY and s['mode']=='4t4d'
+
+    def turn_tolerance(self):
+        return math.radians(float(self.m.config.get('turn_tolerance_deg',5.)))
+
+    def boundary_heading_tolerance(self):
+        return math.radians(float(self.m.config.get('boundary_heading_tolerance_deg',15.)))
+
+    def next_turn_required(self):
+        """下一段是否为到码转向段（会在该码中心原地旋转到其 bodyYaw）。"""
+        nxt=self.index+1
+        if nxt>=len(self.segments):return False
+        s=self.segments[nxt]
+        return s.get('strategy')==TURN_STRATEGY and s['mode']=='4t4d'
+
     def start(self,pose):
         s=self.segment;p=s['points'][0]
         if math.hypot(pose.x-p['x'],pose.y-p['y'])>self.m.config.get('start_position_tolerance_m',.05):raise ValueError('请将小车放到首个二维码起点')
-        if abs(wrap(pose.yaw-s['bodyYaw']))>.10:raise ValueError('车头方向与首段录制方向不一致')
+        # 车头一致性对照的是第一段的车头朝向，而非“录制时刻”。到码转向段允许任意
+        # 初始车头（第一段到达码后会原地转到该段 bodyYaw）。容差取自
+        # max_heading_rad（默认 8.6°），可通过 start_heading_tolerance_deg 覆盖。
+        if not self.turn_required():
+            tolerance=math.radians(float(self.m.config.get('start_heading_tolerance_deg',15.)))
+            if abs(wrap(pose.yaw-s['bodyYaw']))>tolerance:raise ValueError(f"车头方向与首段朝向不一致（差 {math.degrees(wrap(pose.yaw-s['bodyYaw'])):.1f}°，容差 {math.degrees(tolerance):.1f}°）；把车头摆正或调低路径起点车头后再开始")
         self.m.running=True;self.m.paused=False;self.m.fired.clear();self.m.completed=[];self.m.wait_until=0.
         self.m.transition('INITIALIZING');self.m.log('按二维码区间执行，共 '+str(self.outbound_count)+' 段；到码停稳后确认下一段模式')
 
@@ -80,7 +117,8 @@ class SegmentExecutor:
 
     def pause(self):
         self.m.stable=0;self.m.last_sample=None
-        if self.phase in ('MOVE','ALIGN'):self.phase='RECOVER_STOP'
+        if self.phase in ('MOVE','ALIGN','TURN','TURN_STOP'):self.phase='RECOVER_STOP'
+        self.turn_rate=0.
 
     def resume(self):
         self.m.stable=0;self.m.last_sample=None;self.m.entered=time.monotonic();self.m.tracker.reset()
@@ -96,7 +134,7 @@ class SegmentExecutor:
 
     def align(self):
         s=self.segment;self.m.mode=s['mode'];self.m.target_angle=s['wheelAngle'] if s['mode']=='crab' and not self.m.body_velocity_crab() else 0.
-        self.m.transition('SEGMENT_ALIGN');self.phase='ALIGN';self.align_after_seq=self.last_seq
+        self.m.transition('SEGMENT_ALIGN');self.phase='ALIGN';self.align_after_seq=self.last_seq;self.turn_rate=0.
         self.m.log(f"区间 {self.index+1}：Q{s['fromId']:03} → Q{s['toId']:03}，"+('平移' if s['mode']=='crab' else '4T4D '+s['direction']))
         return self.zero()
 
@@ -126,7 +164,12 @@ class SegmentExecutor:
             if stopped and self.phase=='RECOVER_STOP':return self.align()
             if stopped and self.arrival_seen:
                 expected_yaw=s['endYaw'] if self.phase=='END_STOP' else s['bodyYaw']
-                if abs(wrap(pose.yaw-expected_yaw))>.10:m.fault('二维码边界车头方向与录制不一致');return zero
+                # A turn interval has not rotated yet at its own start boundary;
+                # when the NEXT interval is a turn interval it rotates at this QR
+                # centre, so the heading at this boundary is irrelevant too.
+                skip=(self.phase=='START_STOP' and self.turn_required()) or (self.phase=='END_STOP' and self.next_turn_required())
+                tolerance=self.boundary_heading_tolerance()
+                if not skip and abs(wrap(pose.yaw-expected_yaw))>tolerance:m.fault(f"二维码边界车头方向与录制不一致（差 {math.degrees(wrap(pose.yaw-expected_yaw)):.1f}°，容差 {math.degrees(tolerance):.1f}°）");return zero
                 if self.phase=='START_STOP':return self.align()
                 wait=m.task['endWaitSeconds'] if self.index+1 in (self.outbound_count,len(self.segments)) else .2
                 if elapsed<wait:return zero
@@ -141,10 +184,17 @@ class SegmentExecutor:
             if not ready:m.stable=0;m.last_sample=None
             confirmation_angle=None if s['mode']=='crab' and m.body_velocity_crab() else m.target_angle
             if ready and m.stable_feedback(fb,confirmation_angle,gears):
-                self.phase='MOVE';m.transition('LATERAL_SHIFT' if s['mode']=='crab' else 'REVERSE' if s['direction']=='reverse' else 'FORWARD')
+                if self.turn_required():
+                    # Rotate at this QR centre before the straight interval starts.
+                    self.phase='TURN';self.turn_rate=0.;self.turn_started=time.monotonic()
+                    m.transition('SEGMENT_TURN')
+                    m.log(f"到码转向：Q{s['fromId']:03} 处原地旋转到 {math.degrees(s['bodyYaw']):.1f}°，当前 {math.degrees(pose.yaw):.1f}°")
+                else:
+                    self.phase='MOVE';m.transition('LATERAL_SHIFT' if s['mode']=='crab' else 'REVERSE' if s['direction']=='reverse' else 'FORWARD')
             elif elapsed>timeout:
                 m.fault(f"区间换挡或轮角确认超时：模式={s['mode']}，车体档位={fb.get('body_gear')}，转向档位={fb.get('steering_gear')}，目标握手角={m.target_angle:.1f}°，缓存转角={fb.get('steering_angle')}，速度={fb.get('speed')}，反馈序号={fb.get('seq')}")
             return self.zero()
+        if self.phase in ('TURN','TURN_STOP'):return self.rotate(pose,fb,dt)
         if not self.mode_ready(fb):m.fault('区间运行中底盘模式或轮角反馈不匹配');return zero
         points=s['points'];cross,tangent,remaining,end=geometry(pose,points)
         a,b=points[-2:];length=math.hypot(b['x']-a['x'],b['y']-a['y']);past=((pose.x-b['x'])*(b['x']-a['x'])+(pose.y-b['y'])*(b['y']-a['y']))/length
@@ -170,3 +220,45 @@ class SegmentExecutor:
         scale=max(1.,abs(cross)/.025,abs(angle)/m.config['max_heading_rad']);target*=max(.25,1./scale)
         command= m.tracker.reverse(pose,points,target,dt,profile=s.get('executionProfile'))[0] if s['direction']=='reverse' else m.tracker.forward(pose,points,target,dt,profile=s.get('executionProfile'))[0]
         return command
+
+    def rotate(self,pose,fb,dt):
+        """In-place turn at the QR centre, under the same live gates as driving.
+
+        Feedback freshness, finite pose and every runtime condition were already
+        validated at the top of tick(); losing any of them faults the mission and
+        the zero command is sent instead of further rotation.
+        """
+        m=self.m;s=self.segment;zero=self.zero()
+        error=wrap(s['bodyYaw']-pose.yaw)
+        tolerance=self.turn_tolerance()
+        timeout=float(m.config.get('turn_timeout_s',15.))
+        max_rate=float(m.config.get('turn_yaw_rate_max_radps',.3))
+        if self.phase=='TURN':
+            if abs(error)<=tolerance:
+                self.turn_rate=0.;self.phase='TURN_STOP';m.transition('SEGMENT_TURN')
+                m.log(f"到码转向到位：残差 {math.degrees(error):.2f}°，等待停稳确认")
+                return zero
+            if time.monotonic()-self.turn_started>timeout:
+                self.turn_rate=0.
+                m.fault(f"到码转向超时（超过 {timeout:.0f} 秒）：目标 {math.degrees(s['bodyYaw']):.1f}°，当前 {math.degrees(pose.yaw):.1f}°，残差 {math.degrees(error):.1f}°")
+                return zero
+            gain=float(m.config.get('turn_yaw_gain',1.5))
+            acceleration=float(m.config.get('turn_yaw_accel_radps2',.6))
+            # Bounded proportional law with a minimum rate so the chassis actually
+            # starts moving, then a slew limit so it eases in and out.
+            desired=math.copysign(min(max_rate,max(.06,abs(error)*gain)),error)
+            previous=self.turn_rate
+            self.turn_rate=max(previous-acceleration*dt,min(previous+acceleration*dt,desired))
+            self.turn_rate=max(-max_rate,min(max_rate,self.turn_rate))
+            return Command(mode=m.mode,yaw_rate=self.turn_rate)
+        # TURN_STOP: confirm measured standstill, then re-check the heading.
+        if m.stable_feedback(fb):
+            if abs(error)>tolerance:
+                m.log(f"转向停稳后残差 {math.degrees(error):.2f}°，继续微调")
+                self.phase='TURN';self.turn_rate=0.
+                return zero
+            self.phase='MOVE';m.transition('FORWARD')
+            m.log('到码转向完成并已停稳，开始前进')
+        elif time.monotonic()-self.turn_started>timeout:
+            m.fault('到码转向后停稳确认超时')
+        return zero

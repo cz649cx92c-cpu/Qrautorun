@@ -4,10 +4,12 @@ export type StrategyMode=z.infer<typeof strategyModeSchema>;
 export const segmentChoiceSchema=z.object({fromId:z.number().int().min(0).max(586),toId:z.number().int().min(0).max(586),occurrence:z.number().int().min(0).max(100),mode:strategyModeSchema}).strict();
 export type SegmentChoice=z.infer<typeof segmentChoiceSchema>;
 export type StrategyNode={id:number,x:number,y:number};
-export const strategyOptions=[{value:'auto',label:'自动 / 旧路线'},{value:'forward',label:'保持朝向前进'},{value:'reverse',label:'保持朝向倒车'},{value:'left',label:'保持朝向左平移'},{value:'right',label:'保持朝向右平移'},{value:'turn_forward',label:'转向后前进（仅规划）'}] as const;
+// Reported by the ROS node at runtime; never assumed by the bridge or the UI.
+export type SegmentCapabilities={turnInPlace?:boolean};
+export const strategyOptions=[{value:'auto',label:'自动 / 旧路线'},{value:'forward',label:'保持朝向前进'},{value:'reverse',label:'保持朝向倒车'},{value:'left',label:'保持朝向左平移'},{value:'right',label:'保持朝向右平移'},{value:'turn_forward',label:'转向后前进（到码原地转向）'}] as const;
 export const wrapYaw=(angle:number)=>Math.atan2(Math.sin(angle),Math.cos(angle));
 export const degrees=(angle:number)=>Math.round(angle*180/Math.PI*100)/100;
-export function planStrategies(nodes:StrategyNode[],initialYaw:number,choices:SegmentChoice[]=[]){
+export function planStrategies(nodes:StrategyNode[],initialYaw:number,choices:SegmentChoice[]=[],capabilities:SegmentCapabilities={}){
  const seen=new Map<string,number>();let yaw=wrapYaw(initialYaw);
  return nodes.slice(1).map((b,i)=>{
   const a=nodes[i]!,pair=a.id+'>'+b.id,occurrence=seen.get(pair)??0;seen.set(pair,occurrence+1);
@@ -20,7 +22,7 @@ export function planStrategies(nodes:StrategyNode[],initialYaw:number,choices:Se
   if(mode==='reverse'&&Math.abs(wrapYaw(relative-Math.PI))>.10)problem='倒车方向必须位于车头后方';
   if(mode==='left'&&Math.abs(wrapYaw(relative-Math.PI/2))>.10)problem='左平移方向必须位于车头左侧';
   if(mode==='right'&&Math.abs(wrapYaw(relative+Math.PI/2))>.10)problem='右平移方向必须位于车头右侧';
-  const blocked=effective==='turn_forward'&&Math.abs(turn)>.001?'到码转向执行状态尚未接入；此段仅规划，禁止执行':'';
+  const blocked=effective==='turn_forward'&&Math.abs(turn)>.001&&capabilities.turnInPlace!==true?'到码转向执行能力未由当前导航节点确认；此段仅规划，禁止执行':'';
   yaw=bodyYaw;
   return {key,fromId:a.id,toId:b.id,occurrence,mode,effective,start:a,end:b,startYaw,bodyYaw,travelYaw,arrivalYaw:bodyYaw,turn,problem,blocked};
  });
@@ -30,9 +32,9 @@ type StoredSegment={fromId:number,toId:number,bodyYaw:number,strategy?:StrategyM
 export function choicesFromSegments(segments:StoredSegment[]):SegmentChoice[]{
  const seen=new Map<string,number>();return segments.map(segment=>{const pair=segment.fromId+'>'+segment.toId,occurrence=seen.get(pair)??0;seen.set(pair,occurrence+1);return {fromId:segment.fromId,toId:segment.toId,occurrence,mode:segment.strategy??'auto'};});
 }
-export function segmentExecutionBlockers(segments:StoredSegment[]=[]){
+export function segmentExecutionBlockers(segments:StoredSegment[]=[],capabilities:SegmentCapabilities={}){
  if(!segments.length||!segments.some(segment=>segment.strategy&&segment.strategy!=='auto'))return [];
  const nodes=[{id:segments[0]!.fromId,...segments[0]!.points[0]!},...segments.map(s=>({id:s.toId,...s.points.at(-1)!}))];
- const plans=planStrategies(nodes,segments[0]!.bodyYaw,choicesFromSegments(segments));
+ const plans=planStrategies(nodes,segments[0]!.bodyYaw,choicesFromSegments(segments),capabilities);
  return plans.flatMap(plan=>[plan.problem,plan.blocked].filter(Boolean).map(reason=>'Q'+String(plan.fromId).padStart(3,'0')+' → Q'+String(plan.toId).padStart(3,'0')+'：'+reason));
 }

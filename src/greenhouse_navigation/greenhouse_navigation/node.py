@@ -20,6 +20,7 @@ from yhs_can_interfaces.msg import ChassisInfoFb
 from .motion_recording import feedback_record
 from .control import Pose,Command
 from .mission import Mission
+from .segment_execution import TURN_EXECUTION_AVAILABLE
 from .execution_diagnostics import ExecutionDiagnostics
 from .motion_interface import ExistingMotionInterface,COMMAND_TOPICS
 from .can_health import CanHealth
@@ -42,6 +43,13 @@ class GreenhouseNode(Node):
         defaults['existing_runtime_conditions_accepted']=False
         defaults['start_position_tolerance_m']=.05
         defaults['qr_interval_navigation']=False
+        defaults['turn_yaw_rate_max_radps']=.3
+        defaults['turn_yaw_accel_radps2']=.6
+        defaults['turn_yaw_gain']=1.5
+        defaults['turn_tolerance_deg']=5.
+        defaults['turn_timeout_s']=15.
+        defaults['start_heading_tolerance_deg']=15.
+        defaults['boundary_heading_tolerance_deg']=15.
         for key,value in defaults.items():self.declare_parameter(key,value);self.config[key]=self.get_parameter(key).value
         if self.config['maintenance_mode'] and self.config['execution_enabled']:
             raise ValueError('IMU维护模式必须禁用实体执行')
@@ -496,7 +504,12 @@ class GreenhouseNode(Node):
         if cmd.mode=='4t4d':
             executor=getattr(self.mission,'segment_executor',None)
             trial=limits_for(executor.segment.get('executionProfile')) if executor else None
-            bound=min(trial['maxYawRate'],abs(cmd.vx)*trial['maxCurvature']) if trial else abs(cmd.vx)*.6
+            if executor is not None and executor.turning:
+                # A pure in-place turn has no forward speed, so the curvature bound
+                # below would clamp the yaw rate to zero. Use the turn rate limit.
+                bound=float(self.config.get('turn_yaw_rate_max_radps',.3))
+            else:
+                bound=min(trial['maxYawRate'],abs(cmd.vx)*trial['maxCurvature']) if trial else abs(cmd.vx)*.6
             cmd.yaw_rate=max(-bound,min(bound,cmd.yaw_rate))
         # 人工接管/其它原命令发布者出现时退出控制，不向其继续覆盖零指令。
         ownership=next(v['ready'] for v in conditions if v['id']=='ownership')
@@ -510,6 +523,8 @@ class GreenhouseNode(Node):
         except Exception:
             telemetry['executionDiagnostics']={'status':'unavailable','reason':'执行诊断数据暂不可用','sampledAt':diagnostic_time}
         telemetry['maintenance']={'active':self.config.get('maintenance_mode',False),'executionEnabled':self.config['execution_enabled'],'pendingStart':self.pending_start is not None,'queuedLocalCommands':self.commands.qsize(),'taskCommandPolling':not self.config.get('maintenance_mode',False),'imuDirectionVerified':self.config.get('imu_direction_verified',False)}
+        # Capability is reported by this node, never assumed by the web bridge.
+        telemetry['capabilities']={'turnInPlace':bool(TURN_EXECUTION_AVAILABLE and float(self.config.get('turn_yaw_rate_max_radps',0.))>0 and float(self.config.get('turn_timeout_s',0.))>0),'turnToleranceDeg':float(self.config.get('turn_tolerance_deg',5.)),'turnMaxRateRadps':float(self.config.get('turn_yaw_rate_max_radps',.3)),'turnTimeoutS':float(self.config.get('turn_timeout_s',15.))}
         telemetry['markerTracking']=GreenhouseNode.marker_tracking(self,start)
         telemetry.update(self.sensor_status(start,telemetry['sensors']))
         telemetry['pose'],telemetry['localization']=self.localization_telemetry(start)

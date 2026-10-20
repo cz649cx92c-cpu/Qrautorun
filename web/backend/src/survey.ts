@@ -21,28 +21,39 @@ export function surveyTables(store:Store){
  if(!columns.some(c=>c.name==='boards'))store.db.exec("ALTER TABLE survey_sessions ADD COLUMN boards TEXT NOT NULL DEFAULT '[]'");
 }
 export function createSurvey(store:Store,name:string,layouts:Board[]=[]){const boards=groupsSchema.parse(layouts),id=randomUUID();store.db.prepare('INSERT INTO survey_sessions(id,name,created,state,anchors,result,boards) VALUES(?,?,?,?,?,?,?)').run(id,name,new Date().toISOString(),'collecting','[]',null,JSON.stringify(boards));return getSurvey(store,id);}
-// 与 compileScan 的地图 ID 一致，保护已经生成地图的原始观测。
+// 与 compileScan 的地图 ID 一致；删除扫描记录时同时清理它生成的地图。
 function surveyMapId(id:string){return 'scan-'+id.replaceAll('-','');}
 function linkedSurveyMap(store:Store,id:string){const mapId=surveyMapId(id),draftId='draft-'+mapId;const found=store.db.prepare('SELECT map_id FROM versions WHERE map_id IN (?,?) ORDER BY CASE WHEN map_id=? THEN 0 ELSE 1 END LIMIT 1').get(mapId,draftId,mapId) as {map_id:string}|undefined;return found?.map_id??(store.db.prepare("SELECT 1 FROM tasks WHERE json_extract(body,'$.mapId')=? LIMIT 1").get(mapId)?mapId:null);}
-function removableDraft(store:Store,mapId:string|null){if(!mapId?.startsWith('draft-'))return false;const item=store.get(mapId);return !!item&&item.map.coordinateStatus==='draft'&&item.map.rows.length===0&&!store.db.prepare("SELECT 1 FROM tasks WHERE json_extract(body,'$.mapId')=? LIMIT 1").get(mapId);}
+// A recording owns the map it produced, so the same recording can also own both the
+// rebuilt map and the point draft that an earlier save left behind.
+function linkedSurveyMapIds(store:Store,id:string){const base=surveyMapId(id),ids=new Set<string>();for(const candidate of [base,'draft-'+base])if(store.get(candidate))ids.add(candidate);const linked=linkedSurveyMap(store,id);if(linked)ids.add(linked);return [...ids];}
 export function listSurveys(store:Store):SurveySummary[]{
  const rows=store.db.prepare(`SELECT s.id,s.name,s.created,s.state,
   (SELECT COUNT(*) FROM survey_samples p WHERE p.session_id=s.id) AS sampleCount,
   (SELECT COUNT(DISTINCT json_extract(t.value,'$.id')) FROM survey_samples p,json_each(p.body,'$.tags') t WHERE p.session_id=s.id) AS groupCount
-  FROM survey_sessions s ORDER BY s.created DESC,s.id DESC`).all() as Omit<SurveySummary,'mapId'|'deletable'|'protectedReason'>[];
- return rows.map(row=>{const linked=linkedSurveyMap(store,row.id),protectedReason=row.state==='collecting'?'采集中':linked&&!removableDraft(store,linked)?'已生成导航地图':null;return {...row,mapId:linked,deletable:!protectedReason,protectedReason};});
+  FROM survey_sessions s ORDER BY s.created DESC,s.id DESC`).all() as Omit<SurveySummary,'mapId'|'deletable'|'protectedReason'|'mapVersions'|'routeCount'|'taskCount'>[];
+ return rows.map(row=>{
+  // Only a recording that is still collecting is locked. A saved recording may be deleted,
+  // and the confirmation dialog shows how many maps, routes and task bindings go with it.
+  const linked=linkedSurveyMap(store,row.id),protectedReason=row.state==='collecting'?'采集中':null;
+  let mapVersions=0,routeCount=0,taskCount=0;
+  for(const mapId of linkedSurveyMapIds(store,row.id)){const info=store.mapDeletionInfo(mapId);if(!info)continue;mapVersions+=info.versions;routeCount+=info.routes.length;taskCount+=info.tasks.length;}
+  return {...row,mapId:linked,deletable:!protectedReason,protectedReason,mapVersions,routeCount,taskCount};
+ });
 }
 export function deleteSurvey(store:Store,id:string){
  return store.db.transaction(()=>{
   const row=store.db.prepare('SELECT id,name,state FROM survey_sessions WHERE id=?').get(id) as {id:string,name:string,state:string}|undefined;
   if(!row)throw Object.assign(new Error('扫描记录不存在'),{statusCode:404});
   if(row.state==='collecting')throw Object.assign(new Error('正在采集的扫描记录不能删除'),{statusCode:409});
-  const linked=linkedSurveyMap(store,id);if(linked&&!removableDraft(store,linked))throw Object.assign(new Error('此扫描已生成导航地图，原始记录不能删除'),{statusCode:409});
-  if(linked)store.db.prepare('DELETE FROM versions WHERE map_id=?').run(linked);
+  // The map produced by this recording is deleted with it instead of blocking the delete;
+  // versions, routes and task bindings go in the same transaction.
+  let deletedMaps=0,deletedVersions=0,deletedRoutes=0,deletedTasks=0;
+  for(const mapId of linkedSurveyMapIds(store,id)){const result=store.deleteMap(mapId);deletedMaps++;deletedVersions+=result.deletedVersions;deletedRoutes+=result.deletedRoutes;deletedTasks+=result.deletedTasks;}
   store.db.prepare('DELETE FROM survey_motion WHERE session_id=?').run(id);
   const samples=store.db.prepare('DELETE FROM survey_samples WHERE session_id=?').run(id).changes;
   store.db.prepare('DELETE FROM survey_sessions WHERE id=?').run(id);
-  return {deleted:true,id:row.id,name:row.name,sampleCount:samples};
+  return {deleted:true,id:row.id,name:row.name,sampleCount:samples,deletedMaps,deletedVersions,deletedRoutes,deletedTasks};
  })();
 }
 export function getSurvey(store:Store,id:string){

@@ -35,9 +35,9 @@ watch(open,value=>{query.value='';pendingDelete.value='';if(value)emit('refresh'
        <div class="record-time"><Clock3 :size="16"/><time :datetime="r.created">{{date(r.created)}}</time><span>#{{r.id.slice(-8)}}</span></div>
        <div class="record-bottom"><div class="record-counts"><span>{{r.groupCount}} 定位组</span><span>{{r.sampleCount}} 帧</span></div><div class="record-actions">
         <Button variant="outline" size="sm" :disabled="busy||selectionDisabled" :aria-label="'打开扫描 '+r.name" @click="choose(r.id)"><Check v-if="r.id===selectedId" :size="17"/>{{r.id===selectedId?'当前记录':'打开'}}</Button>
-        <Button variant="ghost" size="icon" class="record-delete" :disabled="busy||!r.deletable" :aria-label="'删除扫描 '+r.name" :title="r.protectedReason??'删除记录'" @click="pendingDelete=r.id"><LockKeyhole v-if="!r.deletable" :size="20"/><Trash2 v-else :size="20"/></Button>
+        <Button variant="ghost" size="icon" class="record-delete" :disabled="busy||!r.deletable" :aria-label="'删除扫描 '+r.name" :title="r.protectedReason??'删除记录及其地图'" @click="pendingDelete=r.id"><LockKeyhole v-if="r.state==='collecting'" :size="20"/><Trash2 v-else :size="20"/></Button>
        </div></div>
-       <div v-if="pendingDelete===r.id" class="record-confirm"><span>删除这条扫描及观测数据？</span><div><Button variant="outline" size="sm" :disabled="busy" @click="pendingDelete=''">取消</Button><Button variant="destructive" size="sm" :disabled="busy" @click="remove(r.id)">确认删除</Button></div></div>
+       <div v-if="pendingDelete===r.id" class="record-confirm"><span>删除扫描「{{r.name}}」及 {{r.sampleCount}} 帧观测？<template v-if="r.mapId">其地图（{{r.mapVersions}} 个版本）、{{r.routeCount}} 条路径与 {{r.taskCount}} 个任务绑定将一并删除。</template><template v-else>此操作不可撤销。</template></span><div><Button variant="outline" size="sm" :disabled="busy" @click="pendingDelete=''">取消</Button><Button variant="destructive" size="sm" :disabled="busy" @click="remove(r.id)">确认删除</Button></div></div>
       </article>
       <div v-if="!filtered.length" class="records-empty"><FolderOpen :size="36"/><span>{{query?'没有匹配的记录':'暂无扫描记录'}}</span></div>
      </div>

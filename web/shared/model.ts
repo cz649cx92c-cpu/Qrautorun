@@ -21,7 +21,8 @@ export const mapSchema = z.object({schemaVersion:z.literal(1),id:z.string().rege
    if(ids.has(segment.id))ctx.addIssue({code:z.ZodIssueCode.custom,message:'区间编号重复'});ids.add(segment.id);
    if((segment.mode==='crab')!==(segment.direction==='lateral'))ctx.addIssue({code:z.ZodIssueCode.custom,message:'区间模式与方向不一致'});
    for(const [id,p] of [[segment.fromId,segment.points[0]!],[segment.toId,segment.points.at(-1)!]] as const){const tag=map.tags.find(t=>t.id===id);if(!tag||Math.hypot(tag.x-p.x,tag.y-p.y)>.03)ctx.addIssue({code:z.ZodIssueCode.custom,message:'区间端点必须对应二维码中心'});}
-   const prev=map.motionSegments?.[i-1];if(prev&&(prev.toId!==segment.fromId||Math.hypot(prev.points.at(-1)!.x-segment.points[0]!.x,prev.points.at(-1)!.y-segment.points[0]!.y)>.001||Math.abs(Math.atan2(Math.sin(prev.endYaw-segment.bodyYaw),Math.cos(prev.endYaw-segment.bodyYaw)))>.15))ctx.addIssue({code:z.ZodIssueCode.custom,message:'相邻区间位置或车头方向不连续'});
+   const prev=map.motionSegments?.[i-1];const turning=segment.strategy==='turn_forward';
+   if(prev&&(prev.toId!==segment.fromId||Math.hypot(prev.points.at(-1)!.x-segment.points[0]!.x,prev.points.at(-1)!.y-segment.points[0]!.y)>.001||(!turning&&Math.abs(Math.atan2(Math.sin(prev.endYaw-segment.bodyYaw),Math.cos(prev.endYaw-segment.bodyYaw)))>.15)))ctx.addIssue({code:z.ZodIssueCode.custom,message:'相邻区间位置或车头方向不连续'});
   });
  }
  const groups=new Map((map.groups??[]).map(g=>[g.referenceId,g]));const childIds=new Set((map.groups??[]).flatMap(g=>g.members.map(m=>m.id)));

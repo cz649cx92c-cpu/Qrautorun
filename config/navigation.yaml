@@ -12,6 +12,10 @@ greenhouse_navigation:
     existing_chassis_confirmed: true
     # 用户明确不要求重复验收现成底盘运行条件，保留实时反馈/急停/接管检查。
     existing_runtime_conditions_accepted: true
+    # 2026-10-19 15:32 旋转实测：B129 视觉净转角 vs IMU 投影角
+    # 右转 -92.05 deg / IMU -91.84 deg（差 0.20），左转 +95.68 / +94.49（差 1.18），符号与量级一致。
+    # 证据 logs/imu-marker-20261019T153211+0800/rotation-analysis.json
+    imu_direction_verified: true
     field_freshness_verified: false
     hardware_watchdog_verified: false
     manual_takeover_verified: false

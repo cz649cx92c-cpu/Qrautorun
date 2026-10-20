@@ -10,6 +10,9 @@ export const routeSchema=z.object({
  points:z.array(pointSchema).min(2).max(501),
  motionSegments:z.array(motionSegmentSchema).min(1).max(100),
  bodyYawDeg:z.number().finite().min(-180).max(180),
+ // Explicitly chosen starting body heading. null/absent means "not set by the
+ // user": the editor then defaults to the first leg's travel direction.
+ initialHeadingRad:z.number().finite().nullable().optional(),
  created:z.string().datetime(),
  updated:z.string().datetime()
 });
