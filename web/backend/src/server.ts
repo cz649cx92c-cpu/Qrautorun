@@ -26,11 +26,13 @@ import {boardOptions,boardPlan,boardRegistrationPlan,boardSvg,boardPdf,boardTabl
 import {boardPrintSchema} from '../../shared/boards';
 import {CameraPreview} from './camera';
 import {CameraCalibration} from './calibration';
+import {CalibrationStore,calibrationDatabasePath,imuCalibrationFromSnapshot} from './calibration-store';
+import {registerCalibrationRoutes} from './calibration-routes';
 export const root=fileURLToPath(new URL('../../../',import.meta.url));
-const mapConfirmationSchema=z.object({mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),version:z.number().int().positive(),confirm:z.literal(true),operator:z.string().trim().min(1).max(80),updateTasks:z.boolean().default(false)}).strict();
+const mapConfirmationSchema=z.object({mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),version:z.number().int().positive(),confirm:z.literal(true),operator:z.string().trim().max(80).optional().default(''),updateTasks:z.boolean().default(false)}).strict();
 const mapConfirmationEvidenceSchema=mapConfirmationSchema.extend({kind:z.literal('user_confirmation'),acceptedVersion:z.number().int().positive(),created:z.string().datetime()}).strict();
-const mapMeasurementSchema=z.object({mapId:z.string(),version:z.number().int().positive(),measurements:z.array(anchorSchema).min(3).max(587),operator:z.string().min(1).max(80)});
-const mapUnifyAnglesSchema=z.object({mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),version:z.number().int().positive(),confirm:z.literal(true),operator:z.string().trim().min(1).max(80),updateTasks:z.boolean().default(false)}).strict();
+const mapMeasurementSchema=z.object({mapId:z.string(),version:z.number().int().positive(),measurements:z.array(anchorSchema).min(3).max(587),operator:z.string().trim().max(80).optional().default('')});
+const mapUnifyAnglesSchema=z.object({mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),version:z.number().int().positive(),confirm:z.literal(true),operator:z.string().trim().max(80).optional().default(''),updateTasks:z.boolean().default(false)}).strict();
 const mapMeasurementEvidenceSchema=mapMeasurementSchema.extend({kind:z.literal('measurement').optional(),residuals:z.array(z.number().finite().min(0).max(.03)).min(3).max(587),created:z.string().datetime()}).strict();
 function routeMapSnapshot(source:z.infer<typeof mapSchema>,route:Route){
  const path=route.motionSegments.length?[route.motionSegments[0]!.points[0]!,...route.motionSegments.flatMap(segment=>segment.points.slice(1))]:route.points;
@@ -49,6 +51,13 @@ export async function createApp(database?:string) {
  const broadcast=()=>{const msg=JSON.stringify({type:'robot',status:robot.status()});for(const c of clients)if(c.readyState===1)c.send(msg);};
  function authorized(req:{headers:Record<string,unknown>}){const key=String(req.headers['x-bridge-key']??'');if(key.length!==bridgeKey.length||!timingSafeEqual(Buffer.from(key),Buffer.from(bridgeKey)))throw Object.assign(new Error('ROS2桥身份认证失败'),{statusCode:401});}
  function log(event:string){store.db.prepare('INSERT INTO runtime_log VALUES(?,?)').run(new Date().toISOString(),event);}
+ // 融合标定使用独立 SQLite 文件：绝不写地图数据库，也不受地图事务回滚影响。
+ const calibrationStore=new CalibrationStore(calibrationDatabasePath(database,root,config.database),(mapId,version)=>{
+  const item=store.get(mapId,version);
+  return item?{map:{id:item.map.id,name:item.map.name},version:item.version,digest:store.digest(item.map),tags:item.map.tags.map(tag=>({id:tag.id,x:tag.x,y:tag.y,angle:tag.angle}))}:null;
+ },()=>imuCalibrationFromSnapshot(root));
+ registerCalibrationRoutes(app,{calibration:calibrationStore,store,robot,root,authorized,log});
+ app.addHook('onClose',async()=>{calibrationStore.close();});
  function mapApproval(item:NonNullable<ReturnType<Store['get']>>){
   const acceptance=store.db.prepare('SELECT digest,body FROM acceptances WHERE map_id=? AND version=?').get(item.map.id,item.version) as {digest:string,body:string}|undefined;
   const digestValid=!!acceptance&&acceptance.digest===store.digest(item.map);
@@ -287,9 +296,19 @@ export async function createApp(database?:string) {
  });
  app.post('/api/survey/import',req=>{const body=z.object({sessionId:z.string(),samples:z.array(z.unknown()).min(1).max(500)}).parse(req.body);return appendSamples(store,body.sessionId,body.samples);});
  app.post('/api/robot/motion-records',req=>{
-  authorized(req);if(!surveyId)return {stored:0};
+  authorized(req);
   const body=z.object({records:z.array(z.unknown()).max(200)}).parse(req.body);
-  return appendMotionRecords(store,surveyId,body.records);
+  if(surveyId)return appendMotionRecords(store,surveyId,body.records);
+  // 融合标定：复用同一被动反馈通道；只有存在录制中试验时才入库。
+  const activeCalibration=calibrationStore.activeTrial();
+  if(activeCalibration){
+   const samples=body.records.map(record=>{
+    const fields=record as Record<string,unknown>;
+    return {kind:'feedback',...fields,stamp:Number(fields.stamp)};
+   }).filter(sample=>Number.isFinite(sample.stamp));
+   return calibrationStore.addSamples(activeCalibration.sessionId,activeCalibration.trialId,samples);
+  }
+  return {stored:0};
  });
  app.post('/api/robot/observations',req=>{
   authorized(req);if(!surveyId)return {stored:0};

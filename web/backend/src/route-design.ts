@@ -55,6 +55,12 @@ export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:nu
   const n=Math.min(999,Math.max(2,Math.ceil(distance(a,b)/.05)));
   if(route.length+n+(route.length?0:1)>1001)throw new Error('加密路线超过1001点，请缩短路径或拆分任务');
   const points=Array.from({length:n+1},(_,j)=>({x:a.x+(b.x-a.x)*j/n,y:a.y+(b.y-a.y)*j/n}));
+  // The factory only drives straight legs: every generated point must stay on the same
+  // horizontal or vertical line. This is the last gate before the segment can be stored.
+  for(let j=1;j<points.length;j++){
+   const p0=points[j-1]!,p1=points[j]!;
+   if(Math.abs(p0.x-p1.x)>EPS&&Math.abs(p0.y-p1.y)>EPS)throw new Error('编译出的路径段必须是水平或垂直直线，禁止斜线或弧线');
+  }
   segments.push({id:'design-interval-'+i,fromId:a.id,toId:b.id,mode:direction==='lateral'?'crab':'4t4d',direction,
    ...(plans[i-1]!.mode!=='auto'?{strategy:plans[i-1]!.mode}:{}),
    executionProfile:trial.profile as 'recorded_slow_trial',bodyYaw:segmentYaw,endYaw:segmentYaw,wheelAngle,points});

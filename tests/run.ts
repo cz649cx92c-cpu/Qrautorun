@@ -33,3 +33,7 @@ import './board-registration.test';
 import './routes-persistence.test';
 import './v4-motion-strategy.test';
 import './tag-reprint.test';
+import './route-fixes.test';
+import './calibration-analysis.test';
+import './calibration-api.test';
+import './calibration-ui.test';

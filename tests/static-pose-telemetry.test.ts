@@ -64,6 +64,15 @@ const displayNode=ast.statements.find(s=>ts.isFunctionDeclaration(s)&&s.name?.te
 assert.ok(displayNode);
 const displayJs=ts.transpileModule(displayNode.getText(ast),{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
 const display=vm.runInNewContext(displayJs+'\nmatchingMapPose;') as (status:unknown,mapId:string,now:number,received?:number)=>{x:number,y:number,yaw:number,headingDeg:number,isStatic:boolean,sourceLabel:string}|null;
+const mapVehicleNode=ast.statements.find(s=>ts.isVariableStatement(s)&&s.declarationList.declarations.some(d=>d.name.getText(ast)==='mapVehicle'));
+assert.ok(mapVehicleNode);
+const mapVehicleJs=ts.transpileModule(mapVehicleNode.getText(ast),{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+const emptyPointsNode=ast.statements.find(s=>ts.isVariableStatement(s)&&s.declarationList.declarations.some(d=>d.name.getText(ast)==='EMPTY_POINTS'));
+assert.ok(emptyPointsNode);
+const emptyPointsJs=ts.transpileModule(emptyPointsNode.getText(ast),{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+const mapTrailNode=ast.statements.find(s=>ts.isVariableStatement(s)&&s.declarationList.declarations.some(d=>d.name.getText(ast)==='mapTrail'));
+assert.ok(mapTrailNode);
+const mapTrailJs=ts.transpileModule(mapTrailNode.getText(ast),{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
 const staticStatus=()=>({...telemetry(),connected:true});
 
 test('网页显示当前地图的静止坐标与包裹朝向，其他地图或局部坐标不绘制',()=>{
@@ -87,12 +96,39 @@ test('网页隐藏过期、运动、未知来源及非有限位姿',()=>{
  assert.equal(display({...status,localization:localization({navigationReady:true})},'office',1_000_000),null);
 });
 
+test('路径编辑时切断真实车位绘制，导航监控页仍保留车位',()=>{
+ const status=staticStatus();
+ const context=vm.createContext({computed:(fn:()=>unknown)=>({get value(){return fn();}}),page:{value:'navigate'},editingRoute:{value:false},bridgeOnline:{value:true},robot:{value:status},field:{value:{id:'office'}},poseClock:{value:1_000_000},robotReceivedClock:{value:1_000_000},matchingMapPose:display});
+ vm.runInContext(mapVehicleJs,context);
+ assert.ok(vm.runInContext('mapVehicle.value',context));
+ context.editingRoute.value=true;
+ assert.equal(vm.runInContext('mapVehicle.value',context),null);
+ context.editingRoute.value=false;context.page.value='scan';
+ assert.equal(vm.runInContext('mapVehicle.value',context),null);
+ context.page.value='navigate';context.bridgeOnline.value=false;
+ assert.equal(vm.runInContext('mapVehicle.value',context),null);
+});
+
+test('扫描页采集轨迹是独立单一来源：默认隐藏、仅显式诊断开关显示、编辑/导航不绘制',()=>{
+ const trailPoints=[{x:1,y:2},{x:3,y:4}];
+ const context=vm.createContext({computed:(fn:()=>unknown)=>({get value(){return fn();}}),page:{value:'scan'},editingRoute:{value:false},showCaptureTrail:{value:false},trail:{value:trailPoints}});
+ vm.runInContext(emptyPointsJs+'\n'+mapTrailJs,context);
+ const empty=vm.runInContext('EMPTY_POINTS',context);
+ assert.deepEqual(vm.runInContext('mapTrail.value',context),empty);
+ context.showCaptureTrail.value=true;
+ assert.deepEqual(vm.runInContext('mapTrail.value',context),trailPoints);
+ context.page.value='navigate';
+ assert.deepEqual(vm.runInContext('mapTrail.value',context),empty);
+ context.page.value='scan';context.editingRoute.value=true;
+ assert.deepEqual(vm.runInContext('mapTrail.value',context),empty);
+});
+
 test('网页正式位姿使用同步来源，静止预览不解除canNavigate条件',()=>{
  const status=staticStatus();assert.equal(display({...status,localization:localization({state:'FORMAL',source:'synchronized_qr',navigationReady:true,captureTimestampVerified:true})},'office',1_000_000)?.sourceLabel,'正式二维码融合定位');
  const statement=ast.statements.find(s=>ts.isVariableStatement(s)&&s.declarationList.declarations.some(d=>d.name.getText(ast)==='canNavigate'));
  assert.ok(statement);const gate=ts.transpileModule(statement.getText(ast),{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
  const context=vm.createContext({computed:(fn:()=>boolean)=>({get value(){return fn()}}),
-  editingRoute:{value:false},speedDirty:{value:false},savedStrategyBlockers:{value:[]},lateralStrategyBlocked:{value:false},
+  editingRoute:{value:false},orthogonalPreviewActive:{value:false},speedDirty:{value:false},savedStrategyBlockers:{value:[]},lateralStrategyBlocked:{value:false},
   tasks:{value:[{id:'task-scan-office',mapId:'office',mapVersion:2}]},selectedTask:{value:'task-scan-office'},
   field:{value:{id:'office',coordinateStatus:'reviewed',captureQuality:'draft'}},version:{value:2},
   mapApproval:{value:{accepted:true,digestValid:true}},userConfirmedMap:{value:true},robot:{value:status}});

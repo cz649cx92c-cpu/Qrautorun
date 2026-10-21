@@ -44,16 +44,23 @@ test('用户确认记录独立证据，保留草稿采集质量、几何、历�
  assert.match((await app.inject('/api/logs')).body,/用户确认接纳地图/);
 }));
 
-test('确认接口严格要求 true、非空确认人、整数版本，拒绝伪造测量及额外字段',async()=>fixture(async(app,store)=>{
- const {confirm:_confirm,...noConfirm}=confirmation,{operator:_operator,...noOperator}=confirmation,{version:_version,...noVersion}=confirmation;
- const invalid=[noConfirm,noOperator,noVersion,{...confirmation,confirm:false},{...confirmation,confirm:'true'},{...confirmation,confirm:1},
-  {...confirmation,operator:''},{...confirmation,operator:'   '},{...confirmation,operator:'x'.repeat(81)},
+test('确认接口严格要求 true、整数版本，拒绝伪造测量及额外字段；实验员姓名已删除',async()=>fixture(async(app,store)=>{
+ const {confirm:_confirm,...noConfirm}=confirmation,{version:_version,...noVersion}=confirmation;
+ // 地图区域“实验员姓名”字段已删除：缺少 operator 或传空串都必须成功，长度上限仍然生效。
+ const invalid=[noConfirm,noVersion,{...confirmation,confirm:false},{...confirmation,confirm:'true'},{...confirmation,confirm:1},
+  {...confirmation,operator:'x'.repeat(81)},
   {...confirmation,version:0},{...confirmation,version:1.1},{...confirmation,version:'1'},
   {...confirmation,updateTasks:'true'},{...confirmation,measurements:[]},{...confirmation,residuals:[0]},
   {...confirmation,kind:'measurement'},{...confirmation,digest:'fake'},{...confirmation,execution_enabled:true}];
  for(const payload of invalid){const response=await app.inject({method:'POST',url:'/api/maps/confirm',payload});assert.equal(response.statusCode,400,JSON.stringify(payload));}
  assert.equal(store.get('office')!.version,1);assert.equal(count(store,'acceptances'),0);
- const response=await app.inject({method:'POST',url:'/api/maps/confirm',payload:{...confirmation,operator:'  张三  '}});assert.equal(response.json().evidence.operator,'张三');
+ const legacyFree=await app.inject({method:'POST',url:'/api/maps/confirm',payload:{mapId:'office',version:1,confirm:true}});
+ assert.equal(legacyFree.statusCode,200,legacyFree.body);assert.equal(legacyFree.json().evidence.operator,'');
+ const response=await app.inject({method:'POST',url:'/api/maps/confirm',payload:{...confirmation,operator:'  张三  '}});
+ assert.equal(response.statusCode,409,'确认后版本前进，重复确认必须 409');
+ // 版本已前进，用新版本再验证 operator 仍可选且被裁剪
+ const advanced=await app.inject({method:'POST',url:'/api/maps/confirm',payload:{mapId:'office',version:2,confirm:true,operator:'  张三  '}});
+ assert.equal(advanced.statusCode,200,advanced.body);assert.equal(advanced.json().evidence.operator,'张三');
 }));
 
 test('只确认指定最新版本，不自动接纳其他地图，过期或重复请求无写入',async()=>fixture(async(app,store,map)=>{
@@ -129,8 +136,9 @@ test('草稿导航拒绝缺失、损坏、非确认、错地图/版本及摘要�
   await app.inject({method:'POST',url:'/api/tasks',payload:task(map)});
   await app.inject({method:'POST',url:'/api/maps/confirm',payload:{...confirmation,updateTasks:true}});
   const saved=acceptance(store),evidence=JSON.parse(saved.body);
+  // 实验员姓名字段已删除：operator 为空/缺省不再是非法证据，因此不再列入 bad。
   const bad=[{...saved,digest:'bad'}, {...saved,body:'not json'}, {...saved,body:'null'},
-   ...[{...evidence,kind:'measurement'},{...evidence,confirm:false},{...evidence,operator:' '},{...evidence,mapId:'other-office'},
+   ...[{...evidence,kind:'measurement'},{...evidence,confirm:false},{...evidence,mapId:'other-office'},
     {...evidence,version:2},{...evidence,acceptedVersion:1},{...evidence,measurements:[]},{...evidence,residuals:[0]}].map(body=>({...saved,body:JSON.stringify(body)}))];
   for(const row of bad){store.db.prepare('UPDATE acceptances SET digest=?,body=? WHERE map_id=? AND version=2').run(row.digest,row.body,'office');
    assert.equal((await app.inject('/api/maps/office')).json().acceptance.accepted,false);

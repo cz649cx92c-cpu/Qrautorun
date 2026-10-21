@@ -8,7 +8,7 @@ from unittest.mock import patch
 import yaml
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src/greenhouse_navigation'))
-from greenhouse_navigation.control import Pose
+from greenhouse_navigation.control import Pose, wrap
 from greenhouse_navigation.mission import Mission
 from greenhouse_navigation.segment_execution import validate_segments
 
@@ -22,9 +22,16 @@ def segment(a,b,mode='4t4d',direction='forward',index=0):
             'points':[{'x':a[0],'y':a[1]},{'x':(a[0]+b[0])/2,'y':(a[1]+b[1])/2},{'x':b[0],'y':b[1]}]}
 
 
-def setup(segments=None,returning=False):
+# Turn-in-place parameters are declared by node.py through ROS parameter defaults,
+# so the YAML fixture carries none of them. Mirror those defaults here.
+TURN_DEFAULTS={'turn_yaw_rate_max_radps':.3,'turn_yaw_accel_radps2':.6,'turn_yaw_gain':1.5,
+               'turn_tolerance_deg':5.,'turn_timeout_s':15.}
+
+
+def setup(segments=None,returning=False,start_yaw=None):
     config=yaml.safe_load((ROOT/'config/navigation.yaml').read_text())['greenhouse_navigation']['ros__parameters']
     config.update(existing_chassis_confirmed=True,existing_runtime_conditions_accepted=True)
+    for key,value in TURN_DEFAULTS.items():config.setdefault(key,value)
     ss=segments or [segment((0,0),(.3,0)),segment((.3,0),(.3,.3),'crab','lateral',1),
                     segment((.3,.3),(.6,.6),'crab','lateral',2),segment((.6,.6),(.3,.6),'4t4d','reverse',3)]
     points=[ss[0]['points'][0]]+[s['points'][-1] for s in ss]
@@ -33,7 +40,7 @@ def setup(segments=None,returning=False):
            'tags':[{'id':i,**p} for i,p in enumerate(points)]}
     task={'id':'task','rowOrder':['route'],'forwardSpeed':.08,'reverseSpeed':.06,'lateralSpeed':.05,
           'endWaitSeconds':.2,'returnToStart':returning}
-    m=Mission(config);pose=Pose(points[0]['x'],points[0]['y'],ss[0]['bodyYaw'])
+    m=Mission(config);pose=Pose(points[0]['x'],points[0]['y'],ss[0]['bodyYaw'] if start_yaw is None else start_yaw)
     m.start(field,task,pose)
     return m,pose
 
@@ -59,6 +66,243 @@ class SegmentExecutionTests(unittest.TestCase):
             command=self.tick(m,pose)
             if m.segment_executor.phase=='MOVE':return
         self.fail(str(m.events))
+
+    def enter_turn(self,m,pose):
+        for _ in range(20):
+            self.tick(m,pose)
+            if m.segment_executor.phase=='TURN':return
+        self.fail(str(m.events))
+
+    def spin(self,m,pose,limit=600):
+        """Offline kinematics: integrate the commanded yaw rate until MOVE starts.
+
+        Returns (first_move_command, in_place_commands, reached_turn_stop).  The
+        first MOVE command is the one produced by the tick in which TURN_STOP
+        completes, so a dead cycle after the turn shows up as vx==0 here.
+        """
+        in_place=[];reached_stop=False;first_move=None
+        for _ in range(limit):
+            command=self.tick(m,pose)
+            phase=m.segment_executor.phase
+            if phase in ('TURN','TURN_STOP'):in_place.append(command)
+            if phase=='TURN_STOP':reached_stop=True
+            pose.yaw+=command.yaw_rate*.05
+            if m.state=='FAULT':break
+            if phase=='MOVE':
+                first_move=command;break
+        return first_move,in_place,reached_stop
+
+    @staticmethod
+    def turn_forward_segment():
+        return {'id':'turn','fromId':0,'toId':1,'mode':'4t4d','direction':'forward',
+                'strategy':'turn_forward','bodyYaw':math.pi/2,'endYaw':math.pi/2,
+                'wheelAngle':0.,'points':[{'x':0.,'y':0.},{'x':0.,'y':.3}]}
+
+    def test_turn_forward_90_turn_completion_emits_forward_command(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        first,in_place,stopped=self.spin(m,pose)
+        self.assertTrue(stopped,'转向必须先经过 TURN_STOP 停稳确认：'+str(m.events))
+        self.assertIsNotNone(first,'TURN_STOP 完成后必须立即产生前进指令：'+str(m.events))
+        self.assertEqual(m.segment_executor.phase,'MOVE')
+        self.assertEqual(m.state,'FORWARD')
+        # A pure in-place turn never emits translation.
+        for command in in_place:
+            self.assertEqual((command.vx,command.vy),(0.,0.))
+        self.assertLessEqual(abs(wrap(pose.yaw-math.pi/2)),math.radians(m.config['turn_tolerance_deg'])+.06)
+        # The completing cycle itself is 4T4D forward: no dead (vx==0) cycle.
+        self.assertEqual(first.mode,'4t4d')
+        self.assertGreater(first.vx,0.)
+        self.assertEqual(first.vy,0.)
+        # ... and every following cycle keeps producing 4T4D forward motion.
+        for _ in range(20):
+            command=self.tick(m,pose)
+            self.assertEqual(m.segment_executor.phase,'MOVE',str(m.events))
+            self.assertEqual(command.mode,'4t4d')
+            self.assertGreater(command.vx,0.,'转向后必须持续产生前进速度：'+str(m.events))
+            self.assertEqual(command.vy,0.)
+
+    def test_saved_route_turn_forward_payload_drives_forward_after_turn(self):
+        # Shape mirrors web/backend/src/route-design.ts compileDesignedRoute output and
+        # therefore the routes.motion_segments JSON the ROS node actually consumes.
+        turn={'id':'design-interval-1','fromId':0,'toId':1,'mode':'4t4d','direction':'forward',
+              'strategy':'turn_forward','executionProfile':'recorded_slow_trial',
+              'bodyYaw':math.pi/2,'endYaw':math.pi/2,'wheelAngle':0.,
+              'points':[{'x':0.,'y':i*.05} for i in range(9)]}
+        straight={'id':'design-interval-2','fromId':1,'toId':2,'mode':'4t4d','direction':'forward',
+                  'strategy':'forward','executionProfile':'recorded_slow_trial',
+                  'bodyYaw':math.pi/2,'endYaw':math.pi/2,'wheelAngle':0.,
+                  'points':[{'x':0.,'y':.4+i*.05} for i in range(9)]}
+        validate_segments([turn,straight])
+        m,pose=setup([copy.deepcopy(turn),copy.deepcopy(straight)],start_yaw=0.)
+        self.enter_turn(m,pose)
+        first,_,stopped=self.spin(m,pose)
+        self.assertTrue(stopped,str(m.events))
+        self.assertGreater(first.vx,0.,str(m.events))
+        self.assertEqual(first.vy,0.)
+        self.assertEqual(first.mode,'4t4d')
+
+    def test_crab_interval_never_reports_forward(self):
+        # A crab interval must stay lateral: vx==0 and vy!=0, never "forward".
+        crab={'id':'crab','fromId':0,'toId':1,'mode':'crab','direction':'lateral',
+              'bodyYaw':0.,'endYaw':0.,'wheelAngle':90.,
+              'points':[{'x':0.,'y':0.},{'x':0.,'y':.3}]}
+        m,pose=setup([crab],start_yaw=0.);executor=m.segment_executor;executor.align()
+        command=executor.move_command(pose,self.feedback('crab',m.target_angle),[],.05)
+        self.assertEqual(command.mode,'crab')
+        self.assertLess(abs(command.vx),1e-9)
+        self.assertGreater(command.vy,0.)
+        self.assertEqual(command.yaw_rate,0.)
+
+    def test_turn_forward_rejects_lateral_and_reverse_masquerade(self):
+        lateral={'id':'t','fromId':0,'toId':1,'mode':'crab','direction':'lateral','strategy':'turn_forward',
+                 'bodyYaw':0.,'endYaw':0.,'wheelAngle':90.,'points':[{'x':0.,'y':0.},{'x':0.,'y':.3}]}
+        reverse={'id':'t2','fromId':0,'toId':1,'mode':'4t4d','direction':'reverse','strategy':'turn_forward',
+                 'bodyYaw':0.,'endYaw':0.,'wheelAngle':0.,'points':[{'x':0.,'y':0.},{'x':.3,'y':0.}]}
+        for bad in (lateral,reverse):
+            with self.assertRaisesRegex(ValueError,'转向后前进'):validate_segments([bad])
+
+    def test_turn_forward_keeps_safety_gates_after_turn(self):
+        # 1) Stale chassis feedback after the turn still faults and outputs zero.
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        first,_,_=self.spin(m,pose)
+        self.assertGreater(first.vx,0.)
+        self.now+=.05
+        stale=self.feedback();stale['aggregate_received']-=1.
+        command=m.tick(pose,stale,[{'id':0}],[],.05)
+        self.assertEqual(m.state,'FAULT')
+        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
+
+        # 2) A heading residual beyond max_heading_rad after the turn keeps the gate.
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        first,_,_=self.spin(m,pose)
+        self.assertGreater(first.vx,0.)
+        pose.yaw=math.pi/2+m.config['max_heading_rad']+.05
+        command=self.tick(m,pose)
+        self.assertEqual(m.state,'FAULT')
+        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
+
+        # 3) Cross-track beyond max_cross_track_m after the turn keeps the gate.
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        first,_,_=self.spin(m,pose)
+        self.assertGreater(first.vx,0.)
+        pose.x=m.config['max_cross_track_m']+.02
+        command=self.tick(m,pose)
+        self.assertEqual(m.state,'FAULT')
+        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
+
+    def test_non_turn_forward_keeps_regular_forward_command(self):
+        m,pose=setup([segment((0,0),(.3,0))])
+        self.enter_move(m,pose)
+        command=self.tick(m,pose)
+        self.assertEqual(m.segment_executor.phase,'MOVE')
+        self.assertGreater(command.vx,0.)
+        self.assertEqual(command.vy,0.)
+        self.assertEqual(command.yaw_rate,0.)
+
+    def test_turn_error_and_timeout_keep_zero_output(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        self.now+=m.config['turn_timeout_s']+.1
+        command=self.tick(m,pose)
+        self.assertEqual(m.state,'FAULT')
+        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
+
+        # Residual grows again after standstill was confirmed: keep micro-adjusting,
+        # but never emit translation while it is still turning.
+        m,pose=setup([self.turn_forward_segment()],start_yaw=math.pi/2-math.radians(2.))
+        self.enter_turn(m,pose)
+        self.tick(m,pose)
+        self.assertEqual(m.segment_executor.phase,'TURN_STOP')
+        pose.yaw=math.pi/2-math.radians(20.)
+        command=None
+        for _ in range(10):
+            command=self.tick(m,pose)
+            if m.segment_executor.phase=='TURN':break
+        self.assertEqual(m.segment_executor.phase,'TURN')
+        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
+
+    def test_turn_exit_pose_jump_uses_boundary_reference_and_moves_forward(self):
+        # 现场数据：到达 Q193 后原地转 90°，转向期间融合位姿从 (-1.2296,-0.3402)
+        # 跳到 (-1.1904,-0.3145)（约 4.4cm），随后横向门限 5cm 立即 fault，一次都没前进。
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        pose.x=.025  # 边界处已有 2.5cm 横向偏差（在到码容差 6cm 内）
+        self.enter_turn(m,pose)
+        for _ in range(300):
+            command=self.tick(m,pose);pose.yaw+=command.yaw_rate*.05
+            if m.segment_executor.phase=='TURN_STOP':break
+        self.assertEqual(m.segment_executor.phase,'TURN_STOP',str(m.events))
+        pose.x=.069  # 原地转向期间的位姿估计跳变，而不是指令平移
+        first=None
+        for _ in range(60):
+            command=self.tick(m,pose)
+            if m.segment_executor.phase=='MOVE':first=command;break
+        self.assertIsNotNone(first,'转向后必须产生前进命令：'+str(m.events))
+        self.assertEqual(first.mode,'4t4d');self.assertGreater(first.vx,0.);self.assertEqual(first.vy,0.)
+        events=' | '.join(m.events)
+        self.assertIn('转向期间位姿估计变化',events)
+        self.assertIn('转向出口容差生效',events)
+        for _ in range(10):
+            command=self.tick(m,pose)
+            self.assertEqual(m.segment_executor.phase,'MOVE',str(m.events))
+            self.assertGreater(command.vx,0.,'转向后必须持续前进：'+str(m.events));self.assertEqual(command.vy,0.)
+
+    def test_turn_exit_pose_jump_without_boundary_reference_faults_with_angles(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        for _ in range(300):
+            command=self.tick(m,pose);pose.yaw+=command.yaw_rate*.05
+            if m.segment_executor.phase=='TURN_STOP':break
+        pose.x=.07  # 转向开始时边界偏差是 0，跳变 7cm 不能被“参考”掉
+        command=None
+        for _ in range(30):
+            command=self.tick(m,pose)
+            if m.state=='FAULT' or m.segment_executor.phase=='MOVE':break
+        self.assertEqual(m.state,'FAULT')
+        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
+        events=' | '.join(m.events)
+        self.assertIn('横向偏差',events);self.assertIn('目标角',events)
+
+    def test_turn_exit_reference_window_expiry_still_faults(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        pose.x=.025;self.enter_turn(m,pose)
+        for _ in range(300):
+            command=self.tick(m,pose);pose.yaw+=command.yaw_rate*.05
+            if m.segment_executor.phase=='TURN_STOP':break
+        pose.x=.069
+        # 位姿冻结（横向误差始终不收敛）：出口容差窗口用尽后必须停车，不能无限走。
+        for _ in range(400):
+            command=self.tick(m,pose)
+            if m.state=='FAULT':break
+        self.assertEqual(m.state,'FAULT')
+        self.assertIn('转向出口容差前进已用尽', ' | '.join(m.events))
+        self.assertEqual((command.vx,command.vy), (0.,0.))
+
+    def test_turn_residual_warning_reports_target_and_measured(self):
+        # 现场实测残差 -4.89°（在 5° 容差内但实际少转约 4.9°）：应先微调，再前进。
+        m,pose=setup([self.turn_forward_segment()],start_yaw=math.pi/2-math.radians(4.5))
+        self.enter_turn(m,pose)
+        first,_,_=self.spin(m,pose)
+        self.assertGreater(first.vx,0.,str(m.events))
+        self.assertLessEqual(abs(wrap(pose.yaw-math.pi/2)),m.segment_executor.turn_acceptance_warn()+.06)
+        events=' | '.join(m.events)
+        self.assertIn('转角修正',events)
+        self.assertIn('到码转向完成：目标',events)
+        self.assertIn('实测',events)
+
+    def test_turn_timeout_reports_angles_and_blocks_forward(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        self.now+=m.config['turn_timeout_s']+.1
+        command=self.tick(m,pose)
+        self.assertEqual(m.state,'FAULT')
+        events=' | '.join(m.events)
+        self.assertIn('到码转向超时',events);self.assertIn('目标',events)
+        self.assertIn('容差',events);self.assertIn('未达到目标角',events)
+        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
 
     def test_received_feedback_aliases_do_not_add_command_modes(self):
         for mode,body,steering in [('4t4d',5,5),('4t4d',5,6),('4t4d',6,6),('crab',7,7),('crab',8,7)]:

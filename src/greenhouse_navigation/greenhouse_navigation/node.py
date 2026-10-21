@@ -54,7 +54,10 @@ class GreenhouseNode(Node):
         if self.config['maintenance_mode'] and self.config['execution_enabled']:
             raise ValueError('IMU维护模式必须禁用实体执行')
         self.execution_diagnostics=ExecutionDiagnostics();self.mission=Mission(self.config);self.feedback=None;self.received=0.;self.pose=None;self.pose_received=0.;self.imu_received=0.;self.observations=[];self.tag_received=0.;self.camera_received=0.;self.observation_received=0.;self.camera_frame_stamp=None;self.seq=0
-        self.boot_id=str(uuid.uuid4());self.commands=queue.Queue();self.acks=queue.Queue();self.survey=queue.Queue(maxsize=500);self.motion_records=queue.Queue(maxsize=3000);self.lock=threading.Lock();self.snapshot={};self.registry_boards=[];self.active_boards=[];self.boards_sent=None;self.fusion=None;self.fusion_received=0.;self.detector=None;self.detector_received=0.;self.pid_file=Path(self.config['bridge_key_file']).parent.parent/'logs/robot.pid';self.pid_file.parent.mkdir(parents=True,exist_ok=True);self.pid_file.write_text(str(os.getpid()));self.closed=threading.Event();self.last_tick=time.monotonic();self.engaged=False
+        self.boot_id=str(uuid.uuid4());self.commands=queue.Queue();self.acks=queue.Queue();self.survey=queue.Queue(maxsize=500);self.motion_records=queue.Queue(maxsize=3000)
+        # 融合标定：只被动收集带原始 ROS 时间戳的观测/IMU 样本；不参与任何运动决策。
+        self.calibration_context=None;self.calibration_last_context=None;self.calibration_samples=queue.Queue(maxsize=4000)
+        self.lock=threading.Lock();self.snapshot={};self.registry_boards=[];self.active_boards=[];self.boards_sent=None;self.fusion=None;self.fusion_received=0.;self.detector=None;self.detector_received=0.;self.pid_file=Path(self.config['bridge_key_file']).parent.parent/'logs/robot.pid';self.pid_file.parent.mkdir(parents=True,exist_ok=True);self.pid_file.write_text(str(os.getpid()));self.closed=threading.Event();self.last_tick=time.monotonic();self.engaged=False
         self.mapping=None;self.mapping_received=0.
         self.static_pose=None;self.static_pose_received=0.;self.static_pose_context=None
         self.localization_status=None;self.localization_received=0.;self.preview_pose=None;self.preview_pose_received=0.
@@ -173,6 +176,12 @@ class GreenhouseNode(Node):
         stamp=msg.header.stamp.sec+msg.header.stamp.nanosec/1e9
         age=self.get_clock().now().nanoseconds/1e9-stamp
         if 0<=age<.25 and math.isfinite(msg.angular_velocity.z):self.imu_received=time.monotonic()
+        if self.calibration_context is not None:
+            sample={'kind':'imu','stamp':stamp,'gx':float(msg.angular_velocity.x),'gy':float(msg.angular_velocity.y),'gz':float(msg.angular_velocity.z),
+                    'ax':float(msg.linear_acceleration.x),'ay':float(msg.linear_acceleration.y),'az':float(msg.linear_acceleration.z)}
+            if all(math.isfinite(sample[key]) for key in ('stamp','gx','gy','gz')):
+                try:self.calibration_samples.put_nowait(sample)
+                except queue.Full:pass
 
     def pose_cb(self,msg):
         stamp=msg.header.stamp.sec+msg.header.stamp.nanosec/1e9
@@ -319,6 +328,12 @@ class GreenhouseNode(Node):
             else:tags=collapse_group_observations(tags,self.active_boards)
             if self.active_boards:tags=[t for t in tags if t.get('groupId')]
             self.observations=tags;self.observation_received=time.monotonic();self.camera_received=self.observation_received
+            if self.calibration_context is not None:
+                sample={'kind':'observation','stamp':stamp,'frame':'base_link','calibrated':True,'synchronized':True,
+                        'representation':batch.get('representation'),'tags':tags,
+                        'groupLayouts':batch.get('groupLayouts',[]),'localEpoch':batch.get('localEpoch')}
+                try:self.calibration_samples.put_nowait(sample)
+                except queue.Full:pass
             self.mapping_observation=None
             known={t['id'] for t in self.mission.field['tags']} if self.mission.running and self.mission.field else None
             relevant=[t for t in tags if known is None or t['id'] in known]
@@ -462,6 +477,21 @@ class GreenhouseNode(Node):
             self.mission.log(str(error))
         self.pending_start=None
 
+    def apply_calibration_command(self,payload):
+        """只切换被动标定采样上下文；绝不触发运动、解锁或导航。"""
+        if not isinstance(payload,dict):raise ValueError('标定命令格式无效')
+        if payload.get('active'):
+            session_id=payload.get('sessionId');trial_id=payload.get('trialId')
+            if (not isinstance(session_id,str) or not session_id or len(session_id)>80
+                    or not isinstance(trial_id,str) or not trial_id or len(trial_id)>80):
+                raise ValueError('标定会话/试验编号无效')
+            self.calibration_context={'sessionId':session_id,'trialId':trial_id}
+            self.calibration_last_context=dict(self.calibration_context)
+            self.mission.log('开始被动记录标定样本；不发送任何运动命令')
+        else:
+            self.calibration_context=None
+            self.mission.log('结束标定样本记录')
+
     def tick(self):
         with self.lock:registry=copy.deepcopy(self.registry_boards)
         boards=self.mission.field.get('groups',[]) if self.mission.running and self.mission.field else registry
@@ -482,6 +512,7 @@ class GreenhouseNode(Node):
                 elif c['type']=='resume':
                     if any(not v['ready'] for v in conditions):raise ValueError('恢复任务前需重新满足全部运行条件')
                     self.mission.resume()
+                elif c['type']=='calibration':self.apply_calibration_command(c.get('payload') or {})
                 else:raise ValueError('未知任务命令')
                 ok=True;message='任务请求已由ROS2状态机处理'
             except Exception as e:message=str(e);self.mission.log(message)
@@ -668,6 +699,12 @@ class GreenhouseNode(Node):
                 motion=[]
                 while len(motion)<200 and not self.motion_records.empty():motion.append(self.motion_records.get_nowait())
                 if motion:request('/api/robot/motion-records',{'records':motion})
+                calibration_context=self.calibration_context or self.calibration_last_context
+                if calibration_context is not None:
+                    samples=[]
+                    while len(samples)<150 and not self.calibration_samples.empty():samples.append(self.calibration_samples.get_nowait())
+                    if samples:request('/api/robot/calibration/samples',{'sessionId':calibration_context['sessionId'],'trialId':calibration_context['trialId'],'samples':samples})
+                    if self.calibration_context is None and self.calibration_samples.empty():self.calibration_last_context=None
                 observations=[]
                 while len(observations)<5 and not self.survey.empty():observations.append(self.survey.get_nowait())
                 if observations:request('/api/robot/observations',{'samples':observations})

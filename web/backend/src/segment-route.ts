@@ -59,24 +59,13 @@ export function compileMotionSegments(result:Result,samples:Sample[],optimizedSa
    const {forwardM,reverseM}=longitudinalTravel(rs);
    if(Math.abs(forwardM-reverseM)<.02||Math.min(forwardM,reverseM)>.015)throw new Error('4T4D区间前后换向，请将换向位置设为二维码边界');
    direction=forwardM>reverseM?'forward':'reverse';
-   const trace:{x:number;y:number;travel:number}[]=[{x:start.x,y:start.y,travel:0}];
-   let x=start.x,y=start.y,yaw=bodyYaw,travel=0;
-   for(let i=1;i<rs.length;i++){
-    const p=rs[i-1]!,q=rs[i]!,dt=q.stamp-p.stamp,vx=(p.vx+q.vx)/2,vy=(p.vy+q.vy)/2,w=(p.wz+q.wz)/2,mid=yaw+w*dt/2;
-    x+=(vx*Math.cos(mid)-vy*Math.sin(mid))*dt;y+=(vx*Math.sin(mid)+vy*Math.cos(mid))*dt;yaw=wrap(yaw+w*dt);travel+=Math.hypot(vx,vy)*dt;
-    trace.push({x,y,travel});
-   }
-   if(travel<.02)throw new Error('区间反馈运动距离不足');
-   const correction={x:end.x-x,y:end.y-y};
-   const adjusted=trace.map(p=>({x:p.x+correction.x*p.travel/travel,y:p.y+correction.y*p.travel/travel}));
-   points=[{x:start.x,y:start.y}];
-   adjusted.slice(1,-1).forEach(p=>{if(distance(points.at(-1)!,p)>=.03)points.push(p);});
-   if(distance(points.at(-1)!,end)<.015&&points.length>1)points.pop();points.push({x:end.x,y:end.y});
-   for(let i=1;i<points.length-1;i++){
-    const p=points[i-1]!,q=points[i]!,r=points[i+1]!,turn=wrap(Math.atan2(r.y-q.y,r.x-q.x)-Math.atan2(q.y-p.y,q.x-p.x));
-    if(Math.abs(turn)/(Math.max(.001,(distance(p,q)+distance(q,r))/2))>trial.maxCurvature)throw new Error('录制区间曲率超过低速试用范围');
-   }
-   const startTangent=Math.atan2(points[1]!.y-start.y,points[1]!.x-start.x),finishTangent=Math.atan2(end.y-points.at(-2)!.y,end.x-points.at(-2)!.x),offset=direction==='reverse'?Math.PI:0;
+   // The factory executes straight legs only. A recorded trace must not become an arc or a
+   // diagonal path: keep the QR-to-QR segment exactly on its horizontal/vertical axis.
+   const dx=end.x-start.x,dy=end.y-start.y;
+   if(Math.abs(dx)>.02&&Math.abs(dy)>.02)throw new Error('该区间不是水平/垂直直线（同时存在 X/Y 位移）：仅支持正交路线，请用路径编辑器重画成正交直线');
+   const n=Math.max(2,Math.ceil(distance(start,end)/.03));
+   points=Array.from({length:n+1},(_,i)=>({x:start.x+dx*i/n,y:start.y+dy*i/n}));
+   const startTangent=Math.atan2(dy,dx),finishTangent=startTangent,offset=direction==='reverse'?Math.PI:0;
    if(Math.abs(wrap(bodyYaw-startTangent-offset))>.10||Math.abs(wrap(endYaw-finishTangent-offset))>.15)throw new Error('区间路径方向与记录车头方向不一致，请检查定位或重新录制');
   }
   if(points.length===2)points.splice(1,0,{x:(points[0]!.x+points[1]!.x)/2,y:(points[0]!.y+points[1]!.y)/2});

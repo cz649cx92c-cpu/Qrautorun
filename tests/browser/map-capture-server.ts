@@ -3,7 +3,7 @@ import {generateBoards} from '../../web/shared/boards';
 import {generate,defaults} from '../../web/shared/model';
 import {compileDesignedRoute} from '../../web/backend/src/route-design';
 const app=await createApp(':memory:');
-async function post(url:string,payload:unknown){const result=await app.inject({method:'POST',url,payload});if(result.statusCode!==200)throw new Error(result.body);return result.headers['content-type']?.includes('application/pdf')?result.rawPayload:result.json();}
+async function post(url:string,payload:unknown){const result:any=await app.inject({method:'POST',url,payload:payload as any});if(result.statusCode!==200)throw new Error(result.body);return result.headers['content-type']?.includes('application/pdf')?result.rawPayload:result.json();}
 const boards=generateBoards({gridSize:2,groupSizeMm:100,groupCount:10,startId:0});
 await post('/api/boards/pdf',{gridSize:2,groupSizeMm:100,groupCount:10,startId:0});
 const cases:Record<string,string>={};

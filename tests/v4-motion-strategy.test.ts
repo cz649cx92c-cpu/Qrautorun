@@ -46,3 +46,38 @@ test('v4路线策略保存/刷新/任务快照/另存和409；转向规划禁止
   assert.equal((await app.inject('/api/robot/status')).json().running,false);
  }finally{await app.close();RobotLink.prototype.status=status;RobotLink.prototype.enqueue=enqueue;}
 });
+// v6 adds in-place turn execution to the ROS node (TURN_EXECUTION_AVAILABLE) and
+// reports it as capabilities.turnInPlace. This covers the real save path of
+// motion_segments that the executor consumes:
+//   POST /api/route/design segmentModes -> routes.motion_segments JSON ->
+//   task.routeSnapshot -> POST /api/navigation/start payload.map.motionSegments
+test('v6转向后前进链路：策略写入routes.motion_segments、任务快照和启动payload',async()=>{
+ const status=RobotLink.prototype.status,enqueue=RobotLink.prototype.enqueue,commands:any[]=[];
+ RobotLink.prototype.status=function(){return {...status.call(this),connected:true,running:false,capabilities:{turnInPlace:true,turnToleranceDeg:5,turnMaxRateRadps:.3,turnTimeoutS:15},mapping:{ready:true,quality:'verified' as const,reason:'mock',localEpoch:'mock',lateralSupported:true},conditions:[{id:'mock',label:'纯软件',ready:true}]};};
+ RobotLink.prototype.enqueue=function(type,payload){commands.push({type,payload});return {accepted:true,commandId:'00000000-0000-4000-8000-000000000000',state:'mock'};};
+ const app=await createApp(':memory:');try{
+  const initial=compileDesignedRoute(fixture(),points,0).map;assert.equal((await app.inject({method:'POST',url:'/api/maps',payload:{map:initial,baseVersion:0}})).statusCode,200);
+  const saved=await app.inject({method:'POST',url:'/api/route/design',payload:{mapId:initial.id,baseVersion:1,points,bodyYawDeg:0,routeId:'v6-turn',routeName:'转向后前进',segmentModes:[{fromId:1,toId:2,occurrence:0,mode:'turn_forward'}]}});
+  assert.equal(saved.statusCode,200,saved.body);const body=saved.json();
+  const turnSegment=body.route.motionSegments[1];
+  assert.equal(turnSegment.strategy,'turn_forward');
+  assert.equal(turnSegment.mode,'4t4d');
+  assert.equal(turnSegment.direction,'forward');
+  // The routes table column the node receives is byte-identical through the API.
+  const reloaded=(await app.inject('/api/routes/v6-turn')).json().route;
+  assert.equal(reloaded.motionSegments[1].strategy,'turn_forward');
+  assert.deepEqual(reloaded.motionSegments,body.route.motionSegments);
+  // The immutable task snapshot carries the same strategy.
+  assert.equal(body.task.routeSnapshot.motionSegments[1].strategy,'turn_forward');
+  const started=await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:body.task.id}});
+  assert.equal(started.statusCode,200,started.body);
+  assert.equal(commands.length,1);
+  const executedSegment=commands[0]!.payload.map.motionSegments[1];
+  assert.equal(executedSegment.strategy,'turn_forward','启动payload必须把策略送进执行器');
+  assert.equal(executedSegment.mode,'4t4d');
+  assert.equal(executedSegment.direction,'forward');
+  assert.equal(executedSegment.vy,undefined);
+  assert.ok(!('strategy' in commands[0]!.payload.map.motionSegments[2]),'自动段不带显式策略，保持旧路线兼容');
+  assert.equal((await app.inject('/api/robot/status')).json().running,false);
+ }finally{await app.close();RobotLink.prototype.status=status;RobotLink.prototype.enqueue=enqueue;}
+});
