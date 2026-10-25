@@ -1,54 +1,206 @@
 # QR 导航控制台
 
-基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端采用 Vue 3、TypeScript 和 Konva，Web 服务采用 Fastify，导航执行集成 ROS 2/Python。
+> **当前分支：`v8`**（代码提交 `1aea34f`，2026-10-25）
+> 上一版本：`v7`（`700459c`）· 本分支相对 `v7` 的实际差异见下方「v8 改动」
+> `main` 分支停留在 v2 代码基线，**不包含**本分支的任何功能。要使用本版本请切到 `v8`。
+> 本页内容由一次**仅改 README** 的文档提交更新；分支最新 SHA 见 `git log -1`。
 
-## 功能
+基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端 Vue 3 + TypeScript + Konva，Web 服务 Fastify，导航执行 ROS 2 / Python。
 
-- 手柄示教扫描、地图整理、坐标确认与版本保存。
-- 建图后可在地图上设计横平竖直路线，支持吸附、拖动、撤销、测距和任务同步。
-- 商业化蓝白控制台、使用指南、统计卡片和高级诊断；扫描和导航页不再显示顶部五步条及地图版本卡。
-- 多码定位板 SVG/PDF、默认开启的 0.15 mm 中心十字对位线，以及 50 mm 校对尺。
-- 相机实时预览、标定和导航运行状态。
+## v8 改动（相对 `v7` / `700459c`）
 
-## 启动
+48 个文件，`+3120 / −1871`。下面每一条都能在本分支的提交差异里逐项核对。
 
-安装本项目依赖后运行：
+### 1. 自用版界面（去掉商业化流程）
+
+QRautorun 是内部自用工具，v8 把商业化流程带来的必填项和大块说明区删掉：
+
+- 删除「实验员 / 用户姓名」字段及其必填校验。
+- 扫描记录名、路径名改为自动生成（`扫描-YYYYMMDD-HHmm`、`地图名+新路径`），不再手填。
+- 删除顶部五步工作流条、右侧「作业概览」、整个「使用指南」页面。
+- 保留：地图 / 路径选择与新建、二维码点位、编辑路径、开始 / 暂停 / 停止、错误提示。
+
+**没有放宽任何底层安全门**，只是把「两步人工确认 + 大段说明」压成一行状态。涉及 `web/frontend/src/App.vue`、`tests/personal-ui-simple.test.ts`。
+
+### 2. 切换地图即生效，删除「启用此地图」按钮
+
+v7 的问题：定位作用域被「这张图的坐标是否已验收」卡死。`POST /api/localization/map` 对 `coordinateStatus=draft` 的地图直接 400，前端 watcher 又要求「已选任务 + accepted」才发请求，于是切到新扫的图后定位仍锚在旧图，界面只能显示「当前定位属于其他地图」并永久卡住。
+
+v8 改为定位作用域跟随「当前选中的 `mapId + mapVersion`」：
+
+- `web/backend/src/server.ts`
+  - 新增纯函数 `localizationScopeBlock()` / `localizationScopePhase()`，
+    phase 为 `unknown | switching | waiting-anchor | anchored`，导航放行与前端状态共用同一套口径。
+  - `POST /api/localization/map` 允许切到 `draft` 地图（保留「小车静止」门），
+    返回 `coordinateStatus / reviewed / switched`，审计日志标注「坐标来自扫描：未做人工验收」；
+    内容未变时不写文件，避免抖动。
+  - 新增 `GET /api/localization/scope`。
+  - `/api/navigation/start` 去掉人工 `mapApproval` 门禁，改为对**所有** `routeMode` 校验
+    `mapId + mapVersion + poseAvailable`，不匹配返回 423。
+- `localization.py`：`reload_map` 接受 `draft` 并清空 history / estimate / covariance / anchor；
+  `navigation_ready` 不再依赖 `coordinate_reviewed`（字段保留用于状态展示）。
+- `scripts/start_localization.sh`：预检区分是否已验收，未验收仍可启动（否则重启即失去定位）。
+- `App.vue`：删除「启用此地图」按钮与手动确认 UI，切图后立即设置作用域并触发既有切图重锚；
+  新增「当前地图 · 名称 v版本」状态条；路径只能加载当前 `mapId + mapVersion` 的快照。
+
+旧接口 `/api/maps/confirm`、`/api/maps/accept` 保留兼容，只是前端不再要求点击。
+
+### 3. 相机预览 180° 与时序标定指纹解耦
+
+v7 的问题：`camera_preview.json` 加上 `rotate: 180` 后，时序标定按**整文件 SHA256** 校验，
+指纹失配导致 `captureTimestampVerified=false`，「实时标定相机观测」条件永久不 ready。
+旋转只影响预览方向，不改变采集时间戳、分辨率或帧率。
+
+v8：
+
+- `timing_calibration.py` 新增采集配置指纹：只纳入影响采集与时序的字段
+  （device、vendor/product、分辨率、fps、曝光/采集模式等），
+  明确排除 `rotate / hflip / vflip / preview` 等纯显示字段；
+  `camera_calibration.json`、`camera_extrinsics.json` 仍按严格整文件校验。
+- 旧证据继续走 `legacy-capture-spec` 分支，**不重跑**运动时序标定。
+- `scripts/calibrate_motion_timing.py` 写入 `configurationCaptureSha256`。
+- `web/backend/src/camera.ts` 新增 `cameraVideoOptions(rotate)`：
+  `0 → -c:v copy`，`180 → -vf hflip,vflip`（只允许 0/180，其它角度会改变帧尺寸）。
+
+### 4. 二维码区间执行链路
+
+v7 的区间执行只有「到码停稳 → 确认档位 → 走下一段」。v8 补了起点判定、转向残差、
+边界横向对中，以及二维码之间的连续估计。
+
+**4.1 起点门禁**（新增 `start_gate.py`，纯函数、不依赖 ROS）
+
+- 等待**当前地图、当前 epoch** 的新鲜稳定样本（默认 5 个样本、抖动 ≤10 mm / ≤0.5°）；
+- 起点偏差按第一段的**沿程 / 横向**分解，而不是欧氏距离——车沿路线方向稍前/稍后但横向居中应当放行；
+- 保留原有横向（`max_cross_track_m`）与航向门限；超时（默认 12 s）内无有效定位则明确拒绝。
+
+**4.2 转向残差标定**（新增 `turn_calibration.py`）
+
+只读打开 `calibration.db`（`mode=ro`，运行期绝不写标定库），从有效且方向一致的转向试验里
+推导 `acceptance_deg`（默认 ≤2.5°）与 `correction_tolerance_deg`（默认 ≤1.0°）。
+反向 / 不匹配 / 无效试验一律排除；无可用分析时回退固定默认值。
+
+**4.3 边界横向对中**（`CENTER_ALIGN / CENTER_MOVE / CENTER_STOP`）
+
+每个二维码停稳后，相对**下一段目标直线**计算有符号 cross-track：
+
+| 条件 | 行为 |
+| --- | --- |
+| `abs(cross) ≤ 2 cm` | 直接进入下一段 |
+| `2 cm < abs(cross) ≤ 5 cm` | 低速、有限 crab 对中，收敛到 ≤2 cm 后停稳再进下一段 |
+| `abs(cross) > 5 cm`、方向发散、航向/速度异常、定位质量低、超时或距离窗口耗尽 | 明确 FAULT 停车 |
+
+路线仍是横平竖直，不生成弧线，不把横移伪装成前进；第一段起点偏差不会混进后续区间。
+结构记录 `centering.startCrossM / endCrossM / deltaCrossM / direction / command / travelM / durationS / decision`。
+
+**4.4 二维码间 dead-reckoning**
+
+每个直线 `MOVE` 区间建立 DR 状态，用底盘轮速 `vx/vy` 与 IMU `yaw/yaw_rate` 按时间积分，
+实时得到预测位姿、预测有符号 cross-track 与航向误差，而不是只在 `END_STOP` 才算偏差。
+
+- 预测横向偏差达到 `dr_correction_trigger_m`（默认 0.008 m）时进入 **DR 来源**的 `CENTER_*`，
+  用已有 crab 能力低速有限纠偏；纠偏期间继续积分，否则预测偏差不会随实际横移收敛；
+- 纠偏不改变目标里程，不生成弧线，不把横移伪装成前进；
+- 二维码重新出现时按 pose stamp 变化调用 `dr_try_rebase()`：
+  记录 QR 前最后一个 DR 位姿、QR 绝对位姿、横向/沿程/航向残差、校正前后值；
+  只接受**当前地图 + 当前 epoch + 质量合格 + 时间戳有效**的 QR；
+  跨地图 / epoch 变化 / sigma 超限 / 低质量 → `skipped_map_or_epoch` / `skipped_low_quality`，
+  单帧低质量跳变不会被当成车辆偏移；
+- 校正只重置 DR 锚点与误差状态（`pred / anchor_pose / anchor_stamp / anchor_cross`），
+  **不瞬移控制位姿**；
+- QR 与预测残差连续超硬限（默认 5 cm、连续 3 帧）→ 判定预测发散并 FAULT 停车。
+
+相关参数（`node.py` 默认值，可在 `config/navigation.yaml` 覆盖）：
+`dr_correction_enabled`、`dr_cross_target_m=.008`、`dr_correction_trigger_m=.008`、
+`dr_correction_limit=2`、`dr_correction_travel_m=.05`、`dr_correction_min_remaining_m=.15`、
+`dr_correction_min_stale_s=.25`、`dr_rebase_residual_limit_m=.05`、
+`dr_rebase_max_sigma_m=.03`、`dr_divergence_frames=3`。
+
+`0.008 m` 是**控制目标**，不是已达到的实车精度。
+
+**4.5 诊断**
+
+`execution_diagnostics.py` 新增结构化输出 `deadReckoning`
+（`active / decision / predictedPose / predictedCrossM / predictedHeadingDeg / staleS /
+anchorStamp / crossTrackTargetM / correctionCount / qrCorrectionResidual / corrections`），
+继续输出 `centering`、`centeringHistory`、`turnExit`、`localizationJump`。
+`web/backend/src/robot.ts` 的 zod schema 同步扩展，**不新增任何用户按钮**。
+
+### 5. 地图实时车体图标按真实外形绘制
+
+v7 的实时车体直接用 `map.vehicle`（设计占位包络 `length 0.8 m × width 0.4 m`，还带 `margin`），
+画出来比实车大一倍左右。
+
+v8 在 `web/shared/model.ts` 新增**显示专用**常量 `vehicleFootprintM = {length:0.46,width:0.36}`，
+`MapCanvas.vue` 按该米制尺寸乘世界单位（100 px/m）绘制，随地图缩放一起缩放：
+
+- 没有固定像素下限、没有固定像素膨胀；
+- 锚点仍是 `base_link`（矩形以 group 原点为中心），航向取 `yaw`，长轴沿本地 `+x`（前进方向）；
+- 航向指示条终点收在车身轮廓内，描边不会把轮廓撑大；
+- `map.vehicle` 仍是**规划 / 安全包络**（参与 `validate()` 的行宽余量与退出距离校验），两者故意分开；
+  0.46 m 是整车外形长度，**不是轮距 / 轴距**，底盘运动学、定位、IMU、相机均未改动。
+
+### 6. 测试与构建
+
+| 项目 | 结果 |
+| --- | --- |
+| `npm test`（`tests/run.ts`） | 208 / 208 通过 |
+| 新增 `tests/vehicle-icon-size.test.ts` | 7 例 |
+| `tests/test_boundary_centering.py` | 11 / 11 |
+| `tests/test_dead_reckoning.py` | 11 / 11 |
+| `tests/test_timing_calibration.py` | 10 / 10 |
+| `tests/test_start_gate.py`、`test_turn_calibration.py`、`test_turn_recenter.py` | 通过 |
+| `tests/test_office_map_reload.py`（需 ROS 环境） | 2 / 2 |
+| `tsc --noEmit` / `vue-tsc --noEmit` | rc=0 / rc=0 |
+| 隔离构建 | CSS 96.28 kB、JS 626.82 kB，Tailwind 工具类齐全 |
+
+**既有失败（与 v8 无关，改动前隔离基线同样失败）**：`tests/test_segment_execution.py` 3 个用例
+（两个 `test_mixed_route_and_return_finish_at_start_without_body_turn`、
+一个 `test_wrong_angle_wrong_gear_and_duplicates_cannot_finish_alignment`）。
+
+## 使用入口
+
+| 入口 | 说明 |
+| --- | --- |
+| `http://<Pi-IP>:3080` | 主控制台；侧栏切换「扫描建图 / 导航 / 摄像头预览 / 定位标定」 |
+| `?page=camera` | 直接打开摄像头预览（`?page=navigate` **无效**，只映射 camera/calibration） |
+| `GET /api/localization/scope` | 新增，查询目标地图的定位作用域 phase |
+| `python3 scripts/service_manager.py start robot --enable-execution` | 显式开启实体执行许可；不带该参数会把它覆盖为 false |
+
+## 已知限制（v8 尚未验证的部分）
+
+- **dead-reckoning 提前纠偏没有实车数据**：代码、参数、诊断、单元测试就位，
+  但还没有一次真实运行在偏差达到 8 mm 触发阈值的工况下进入 DR 纠偏。
+- **边界对中未在 >2 cm 工况下实车验证**：现场两次运行偏差分别为
+  `+25.7 / -27.0 / +21.7 / -23.4 mm`（对中上线前）与
+  `+12.1 / -19.4 / +15.3 / -15.4 mm`（对中上线后，四段都 <2 cm，因此没有实际进入 CENTER 相位）。
+- **QR rebase 残差统计只有单元测试**，没有真实「二维码重新出现」的现场样本。
+- `tests/test_segment_execution.py` 的 3 个既有失败未修复。
+- 定位精度未标定（`covariance_calibrated=false`），导航依赖用户确认的同步二维码融合定位；
+  本仓库不提供任何精度保证或合规认证。
+- `web/frontend/dist/` 是 2026-10-22 20:32 的构建产物，**不包含**第 5 节的车体图标改动。
+
+## 安装与启动
 
 ```bash
 npm ci
-./scripts/start.sh
+./scripts/start.sh                 # 只启动 Web（http://localhost:3080）
+./scripts/start.sh --foreground    # 前台调试
+./scripts/stop.sh                  # 停止 Web
+./scripts/start_robot.sh           # 托管 ROS2 反馈 / 状态机 / Web 桥，默认只读
+./scripts/start_robot.sh --enable-execution   # 显式开启实机执行能力；仍需在网页点「开始导航」
+./scripts/stop_robot.sh
 ```
 
-访问 `http://localhost:3080`。`scripts/start.sh` 会同时托管扫描相关服务；仅启动 Web 可使用 `./scripts/start.sh --foreground`。首次部署须按下方说明完成设备、ROS 环境及标定配置。仓库保留前端 `web/frontend/dist/`，修改前端后运行 `cd web/frontend && npm run build`。
+仓库保留前端 `web/frontend/dist/`，修改前端后从**项目根**构建：
 
-开发验证：`npm test`；浏览器回归使用 `node_modules/.bin/playwright test --config tests/browser/ui-commercial.config.ts distance.spec.ts route-editor.spec.ts ui-restyle.spec.ts guide.spec.ts`。
+```bash
+node_modules/.bin/vite build --config web/frontend/vite.config.ts
+```
 
-## 版本
+开发验证：`npm test`；浏览器回归 `npx playwright test`（配置见 `tests/browser/*.config.ts`）。
 
-- **v3**：固定紧凑路径工具栏，绘制/小手移动两种模式，默认关闭的浮层属性；同一地图多条命名路径持久化，任务保存路线快照；PDF 每整组中心安全白缝仅一个十字。
-
-### v3 路径与打印操作
-
-先选地图、再选执行路径。点“新建路径”开始空白路线；“保存路径”更新当前路径，“更多 / 属性”中的名称可编辑，“另存为新路径”创建独立路线。同图重名、过期地图或过期路径基准返回 409，保存失败保留草稿；编辑开始即锁存路径更新基准。旧任务不通过启动迁移重写 body/updated。
-
-编辑顶部保留绘制、小手移动、撤销、保存、退出和属性；桌面单行、手机固定两行。点击小手后左键拖图，切回绘制继续加点或拖路点。属性默认关闭，只覆盖地图，开关、路点增长和错误消息均不挤压画布。普通滚轮不缩放，Ctrl/Meta+滚轮缩放，也可使用地图 +/−/适应按钮。路线属性、偏离提示和路点共用一个滚动区，错误/状态在悬浮消息中显示。
-
-PDF 中心十字默认开启、可关闭，全长 8 mm、线宽 0.15 mm。偶数阵列的水平线沿中央水平白缝、垂直线沿中央垂直白缝延伸，不再缩成仅 1.85 mm 的小十字；不覆盖子码及其静区。奇数阵列中心位于子码内，没有安全空隙时明确提示选用 2×2、4×4 或 6×6，不改变既有定位板布局。保留 A4、100% / ACTUAL SIZE 和 50 mm 校对尺。
-
-v3 软件验收日志位于 `logs/editor-ux-v3-release/`；四尺寸截图与画布 rect、Konva scale/position 记录为 `logs/editor-ux-v3-compact-*`。迁移先在 `logs` 下数据库副本验证旧 versions、tasks、acceptances 数量/正文摘要及重复运行幂等，再由 web 启动执行新增 schema/route rows。导航仍要求最新地图、任务和路线版本一致，地图 digest/验收有效，路线快照重新校验，disabled/运行状态及底层运动安全门禁保持。
-
-本次 UI/PDF/多路线验证不代表 IMU 数据源切换或实车导航验证；不修改运动 Python 和硬件配置。
-
-- **v1**：建图后正交路径编辑器、商业化控制台 UI、五步工作流、使用指南、PDF 中心十字对位线及对应单元/API/浏览器测试。
-- **v2**：沿途定位组自动串联与逐码纠正；沿途 10 cm 内且可保持水平/垂直直线的中心成为节点，偏离码橙色标记并跳过，支持自动串码、节点/跳过数徽章和端点自动吸附。Python 运行时校验保持不变。
-
-v2 发布验收：`npm test` 105 项全通过；路径编辑、测距、商业 UI/PDF 与指南 Playwright 共 27 项全通过（含 375px / 760px 窄屏）。
-
-码间段始终为直线，每个串联码都是独立纠正节点。请按正交网格铺设，拐弯或折返处须有定位组。自动串码不会在两个码之间偷偷加入直角换向。长度、采样点数、航向及执行器限制仍有效。
-
-定位板打印文件 `prints/` 当前不足 50 MB，随仓库保留。可用 `node --import tsx scripts/generate_batch_print.ts` 重新生成打印资料。
-
-数据库、运行日志、依赖缓存、备份和 `config/bridge.key` 不入库；部署时需自行配置本机密钥。下面保留既有设备与运行说明。
+数据库、运行日志、依赖缓存、备份和 `config/bridge.key` 不入库；部署时需自行配置本机密钥。
+下面保留既有设备与运行说明。
 
 ---
 
