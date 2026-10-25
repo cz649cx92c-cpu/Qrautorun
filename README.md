@@ -1,54 +1,89 @@
 # QR 导航控制台
 
-基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端采用 Vue 3、TypeScript 和 Konva，Web 服务采用 Fastify，导航执行集成 ROS 2/Python。
+> **当前分支：`v4`**（代码提交 `40d26c3`）
+> 上一版本：`v3`（`9752051`）
+> 本页内容由一次**仅改 README** 的文档提交更新；分支最新 SHA 见 `git log -1`。
 
-## 功能
+基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端 Vue 3 + TypeScript + Konva，Web 服务 Fastify，导航执行 ROS 2 / Python。
 
-- 手柄示教扫描、地图整理、坐标确认与版本保存。
-- 建图后可在地图上设计横平竖直路线，支持吸附、拖动、撤销、测距和任务同步。
-- 商业化蓝白控制台、使用指南、统计卡片和高级诊断；扫描和导航页不再显示顶部五步条及地图版本卡。
-- 多码定位板 SVG/PDF、默认开启的 0.15 mm 中心十字对位线，以及 50 mm 校对尺。
-- 相机实时预览、标定和导航运行状态。
+## v4 改动（相对 `v3` / `9752051`）
 
-## 启动
+82 个文件，`+2693 / −426`。核心是**建图解耦**、**正交校正**、**点位错位修复**，以及**串口 IMU 直连**。
 
-安装本项目依赖后运行：
+### 建图解耦（map-only 地图）
+
+- 新增 `web/backend/src/map-only.ts`：扫描会话可直接落成只含定位码的 `map-only` 地图，
+  不再强制先有作物行 / 路径；`web/backend/src/server.ts` +32 接入对应接口。
+- `web/shared/model.ts` +14 扩展 schema：`map-only` 地图不能带 rows / order / motionSegments / 动作。
+
+### 正交校正与点位错位修复
+
+- 新增 `web/shared/map-orthogonal-correction.ts`（272 行）与
+  `web/frontend/src/components/OrthogonalCorrectionPanel.vue`（62 行）：
+  把扫描出来的斜码阵统一校正到正交网格，并输出校正前后的偏差。
+- 新增 `web/shared/map-alignment.ts`（55 行）、`tests/board-registration.test.ts`、
+  `tests/map-only-alignment.test.ts`，用于核对点位错位。
+- 画布 `MapCanvas.vue` +19 配合显示校正结果。
+
+### 分段策略与点位检查
+
+- 新增 `web/shared/segment-strategy.ts`（38 行）与
+  `web/frontend/src/components/SegmentStrategyEditor.vue`：按段选择 4T4D 前进 / 倒车 / 平移。
+- 新增 `web/frontend/src/components/TagInspector.vue`：单码详情与重打入口。
+- 新增 `web/backend/src/tag-reprint.ts`（59 行）：同规格重打保持原编号。
+
+### 串口 IMU 接入（Odin 仅 IMU / 串口 IMU）
+
+- 新增 `scripts/run_serial_imu.py`、`scripts/imu_serial.py`、`scripts/imu_protocol.py`、
+  `scripts/check_imu.py`、`scripts/check_imu_calibration.py`、`scripts/check_imu_source.py`、
+  `scripts/reload_imu_consumers.py`、`scripts/start_imu.sh`（改造）。
+- 新增 `config/imu_odin_legacy.yaml`、`docs/imu-integration.md`、`docs/v4-software.md`。
+- 融合侧 `src/greenhouse_navigation/fusion.py` +34、新增 `imu_source_health.py`（20 行）、
+  `node.py` +31：IMU 源健康度与在线判定。
+- 新增回归 `tests/test_serial_imu.py`、`test_serial_imu_ros.py`、`test_imu_maintenance.py`、
+  `test_imu_workbook.py`、`test_sensor_status.py` +102。
+
+## 使用入口
+
+| 入口 | 说明 |
+| --- | --- |
+| `http://<Pi-IP>:3080` | 主控制台 |
+| 扫描完成后「生成地图」 | 现在可直接得到 map-only 地图（只有定位码，无作物行） |
+| 「正交校正」面板 | 校正斜码阵并查看偏差 |
+| `./scripts/start_imu.sh` / `./scripts/stop_imu.sh` | 独立启停串口 IMU |
+
+## 已知限制（本分支）
+
+- 正交校正会改变点位坐标，属**地图数据变更**，必须重新验收后才能作为导航基准。
+- 串口 IMU 接入不等于 IMU 标定完成；`covariance_calibrated=false`，不提供精度保证或合规认证。
+- 导航执行默认只读，必须 `--enable-execution` 显式开启；没有独立避障。
+- 本分支不含 v5/v6 的转向执行、定位按图重锚、删除地图/路径与初始朝向编辑。
+
+## 安装与启动
 
 ```bash
 npm ci
-./scripts/start.sh
+npm run build
+./scripts/start.sh                 # 只启动 Web（http://localhost:3080）
+./scripts/start.sh --foreground
+./scripts/stop.sh
+./scripts/start_robot.sh           # 默认只读
+./scripts/start_robot.sh --enable-execution
+./scripts/stop_robot.sh
 ```
 
-访问 `http://localhost:3080`。`scripts/start.sh` 会同时托管扫描相关服务；仅启动 Web 可使用 `./scripts/start.sh --foreground`。首次部署须按下方说明完成设备、ROS 环境及标定配置。仓库保留前端 `web/frontend/dist/`，修改前端后运行 `cd web/frontend && npm run build`。
+ROS 侧：
 
-开发验证：`npm test`；浏览器回归使用 `node_modules/.bin/playwright test --config tests/browser/ui-commercial.config.ts distance.spec.ts route-editor.spec.ts ui-restyle.spec.ts guide.spec.ts`。
+```bash
+source /opt/ros/humble/setup.bash
+source /home/orangepi/ugv/install/setup.bash
+colcon build --packages-select greenhouse_navigation chassis_adapter --symlink-install
+```
 
-## 版本
+开发验证：`npm test`；`./scripts/test.sh`；浏览器回归 `npx playwright test`。
 
-- **v3**：固定紧凑路径工具栏，绘制/小手移动两种模式，默认关闭的浮层属性；同一地图多条命名路径持久化，任务保存路线快照；PDF 每整组中心安全白缝仅一个十字。
-
-### v3 路径与打印操作
-
-先选地图、再选执行路径。点“新建路径”开始空白路线；“保存路径”更新当前路径，“更多 / 属性”中的名称可编辑，“另存为新路径”创建独立路线。同图重名、过期地图或过期路径基准返回 409，保存失败保留草稿；编辑开始即锁存路径更新基准。旧任务不通过启动迁移重写 body/updated。
-
-编辑顶部保留绘制、小手移动、撤销、保存、退出和属性；桌面单行、手机固定两行。点击小手后左键拖图，切回绘制继续加点或拖路点。属性默认关闭，只覆盖地图，开关、路点增长和错误消息均不挤压画布。普通滚轮不缩放，Ctrl/Meta+滚轮缩放，也可使用地图 +/−/适应按钮。路线属性、偏离提示和路点共用一个滚动区，错误/状态在悬浮消息中显示。
-
-PDF 中心十字默认开启、可关闭，全长 8 mm、线宽 0.15 mm。偶数阵列的水平线沿中央水平白缝、垂直线沿中央垂直白缝延伸，不再缩成仅 1.85 mm 的小十字；不覆盖子码及其静区。奇数阵列中心位于子码内，没有安全空隙时明确提示选用 2×2、4×4 或 6×6，不改变既有定位板布局。保留 A4、100% / ACTUAL SIZE 和 50 mm 校对尺。
-
-v3 软件验收日志位于 `logs/editor-ux-v3-release/`；四尺寸截图与画布 rect、Konva scale/position 记录为 `logs/editor-ux-v3-compact-*`。迁移先在 `logs` 下数据库副本验证旧 versions、tasks、acceptances 数量/正文摘要及重复运行幂等，再由 web 启动执行新增 schema/route rows。导航仍要求最新地图、任务和路线版本一致，地图 digest/验收有效，路线快照重新校验，disabled/运行状态及底层运动安全门禁保持。
-
-本次 UI/PDF/多路线验证不代表 IMU 数据源切换或实车导航验证；不修改运动 Python 和硬件配置。
-
-- **v1**：建图后正交路径编辑器、商业化控制台 UI、五步工作流、使用指南、PDF 中心十字对位线及对应单元/API/浏览器测试。
-- **v2**：沿途定位组自动串联与逐码纠正；沿途 10 cm 内且可保持水平/垂直直线的中心成为节点，偏离码橙色标记并跳过，支持自动串码、节点/跳过数徽章和端点自动吸附。Python 运行时校验保持不变。
-
-v2 发布验收：`npm test` 105 项全通过；路径编辑、测距、商业 UI/PDF 与指南 Playwright 共 27 项全通过（含 375px / 760px 窄屏）。
-
-码间段始终为直线，每个串联码都是独立纠正节点。请按正交网格铺设，拐弯或折返处须有定位组。自动串码不会在两个码之间偷偷加入直角换向。长度、采样点数、航向及执行器限制仍有效。
-
-定位板打印文件 `prints/` 当前不足 50 MB，随仓库保留。可用 `node --import tsx scripts/generate_batch_print.ts` 重新生成打印资料。
-
-数据库、运行日志、依赖缓存、备份和 `config/bridge.key` 不入库；部署时需自行配置本机密钥。下面保留既有设备与运行说明。
+数据库、运行日志、依赖缓存、备份和 `config/bridge.key` 不入库。
+下面保留既有设备与运行说明。
 
 ---
 
