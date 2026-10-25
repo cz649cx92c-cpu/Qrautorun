@@ -125,6 +125,34 @@ anchorStamp / crossTrackTargetM / correctionCount / qrCorrectionResidual / corre
 继续输出 `centering`、`centeringHistory`、`turnExit`、`localizationJump`。
 `web/backend/src/robot.ts` 的 zod schema 同步扩展，**不新增任何用户按钮**。
 
+**4.6 转弯后轮子回正门禁（`TURN_RECENTER`）**
+
+转向到位后**不直接前进**。`segment_execution.py` 的流程是
+`TURN` →（yaw 进入容差且车停稳）`TURN_STOP` → `TURN_RECENTER`，在 `TURN_RECENTER` 阶段
+**只发零速**，必须同时满足三条才切到 `MOVE`：
+
+- 四轮转角回到直行角（4T4D 目标 0°，crab 段为目标轮角）且在 `angle_tolerance_deg`（默认 ±3°）内；
+- 档位匹配：4T4D 要求 body/steering gear ∈ {5,6}，crab 段 ∈ {7,8}；
+- 连续 `stable_feedback_samples`（默认 5）帧**新鲜**反馈都成立。
+
+否则保持零速；超过 `mode_timeout_s`（默认 8 s）则结构化 FAULT，绝不在带大转角的情况下下发 `vx`。
+诊断写入 `turnExit.recenter`：`status / targetAngleDeg / measuredAngleDeg / angleToleranceDeg / bodyGear / steeringGear / requiredSamples / stableSamples / elapsedS / timeoutS`。
+「停稳 + yaw 到位」不等于轮子已回正，这一阶段就是补上这个缺口。
+
+**4.7 历史实车记录（2026-10-22 现场日志，非本轮重跑）**
+
+下面的数字来自当时读取的运行日志，**不是本次提交重跑的结果**，也不构成精度承诺：
+
+- 20:54 的一次运行里边界对中真实触发：cross 由 2.6 cm 收敛到 1.7 cm，该次运行最大 cross 3.52 cm。
+- 21:41:10–21:43:01 的一次完整运行：七段全部 4T4D、正常 FINISHED，段间最大横向偏差 15.8 mm；
+  该次 5 次 `TURN_RECENTER` 全部以 5/5 稳定样本通过，等待 0.25–1.65 s。
+- 二维码校正 / `rebase` 在日志中有记录；但 `qr_track` / rebase 计数**不等于**机械纠偏次数，
+  DR 主动纠偏是否单独生效尚未逐次证实。
+- 这两次是不同路线，**不能**把上面的差异归因为某一项改动带来的改善。
+
+注意：`logs/navigation*.jsonl` 轮转很快，当前磁盘上只保留最近约十分钟的记录，
+上述历史行已不在磁盘上，引用时以当时的读数为准。
+
 ### 5. 地图实时车体图标按真实外形绘制
 
 v7 的实时车体直接用 `map.vehicle`（设计占位包络 `length 0.8 m × width 0.4 m`，还带 `margin`），
@@ -141,21 +169,25 @@ v8 在 `web/shared/model.ts` 新增**显示专用**常量 `vehicleFootprintM = {
 
 ### 6. 测试与构建
 
-| 项目 | 结果 |
-| --- | --- |
-| `npm test`（`tests/run.ts`） | 208 / 208 通过 |
-| 新增 `tests/vehicle-icon-size.test.ts` | 7 例 |
-| `tests/test_boundary_centering.py` | 11 / 11 |
-| `tests/test_dead_reckoning.py` | 11 / 11 |
-| `tests/test_timing_calibration.py` | 10 / 10 |
-| `tests/test_start_gate.py`、`test_turn_calibration.py`、`test_turn_recenter.py` | 通过 |
-| `tests/test_office_map_reload.py`（需 ROS 环境） | 2 / 2 |
-| `tsc --noEmit` / `vue-tsc --noEmit` | rc=0 / rc=0 |
-| 隔离构建 | CSS 96.28 kB、JS 626.82 kB，Tailwind 工具类齐全 |
+| 项目 | 结果 | 日期 / 来源 |
+| --- | --- | --- |
+| `npm test`（`tests/run.ts`） | 208 / 208 通过 | 2026-10-25 本次提交前实测 |
+| 新增 `tests/vehicle-icon-size.test.ts` | 7 例 | 2026-10-25 同上 |
+| `tsc --noEmit` / `vue-tsc --noEmit` | rc=0 / rc=0 | 2026-10-25 |
+| 隔离构建 | CSS 96.28 kB、JS 626.82 kB，Tailwind 工具类齐全 | 2026-10-25 |
+| `tests/test_boundary_centering.py` | 11 / 11 | 2026-10-22 |
+| `tests/test_dead_reckoning.py` | 11 / 11 | 2026-10-22 |
+| `tests/test_timing_calibration.py` | 10 / 10 | 2026-10-22 |
+| `tests/test_start_gate.py`、`test_turn_calibration.py`、`test_turn_recenter.py` | 通过 | 2026-10-21～22 |
+| `tests/test_office_map_reload.py`（需 ROS 环境） | 2 / 2 | 2026-10-22 |
+| Python 全量（历史记录） | 513 passed / 31 既有失败 | 2026-10-22，**非本次重跑** |
 
-**既有失败（与 v8 无关，改动前隔离基线同样失败）**：`tests/test_segment_execution.py` 3 个用例
-（两个 `test_mixed_route_and_return_finish_at_start_without_body_turn`、
-一个 `test_wrong_angle_wrong_gear_and_duplicates_cannot_finish_alignment`）。
+说明：
+
+- `npm test` 的 208 项与 Python 全量（513 passed / 31 失败）是**不同测试阶段**，不能相加或互相替代。
+- 本版本**不声称全部 Python 测试通过**：既有失败未统一清零，`tests/test_segment_execution.py` 等
+  仍保留已知失败（后续核对时数量有变化，这里不再写易过时的精确数字）。
+- 上表的 Python 单文件结果只在对应日期成立，本次提交没有重跑。
 
 ## 使用入口
 
@@ -166,17 +198,17 @@ v8 在 `web/shared/model.ts` 新增**显示专用**常量 `vehicleFootprintM = {
 | `GET /api/localization/scope` | 新增，查询目标地图的定位作用域 phase |
 | `python3 scripts/service_manager.py start robot --enable-execution` | 显式开启实体执行许可；不带该参数会把它覆盖为 false |
 
-## 已知限制（v8 尚未验证的部分）
+## 已知限制
 
-- **dead-reckoning 提前纠偏没有实车数据**：代码、参数、诊断、单元测试就位，
-  但还没有一次真实运行在偏差达到 8 mm 触发阈值的工况下进入 DR 纠偏。
-- **边界对中未在 >2 cm 工况下实车验证**：现场两次运行偏差分别为
-  `+25.7 / -27.0 / +21.7 / -23.4 mm`（对中上线前）与
-  `+12.1 / -19.4 / +15.3 / -15.4 mm`（对中上线后，四段都 <2 cm，因此没有实际进入 CENTER 相位）。
-- **QR rebase 残差统计只有单元测试**，没有真实「二维码重新出现」的现场样本。
-- `tests/test_segment_execution.py` 的 3 个既有失败未修复。
+- **dead-reckoning 主动纠偏未逐次证实**：代码、参数、诊断和单元测试就位，但 2026-10-22 的历史日志里
+  没有能把「DR 来源纠偏」与「QR 校正」区分开的独立证据，`correctionCount` / rebase 计数
+  不能当作机械纠偏次数。
+- **边界对中只在一次运行里真实触发过**：历史日志 2.6 → 1.7 cm、该次最大 cross 3.52 cm；
+  没有多次重复验证，也**没有超过 5 cm 的实测样本**。
+- **QR rebase 残差只有单元测试 + 历史日志中的校正记录**，没有独立复现的现场样本。
+- **Python 测试未统一清零**：历史全量 513 passed / 31 既有失败，本次未修复；详见第 6 节说明。
 - 定位精度未标定（`covariance_calibrated=false`），导航依赖用户确认的同步二维码融合定位；
-  本仓库不提供任何精度保证或合规认证。
+  本仓库不提供任何精度保证或合规认证，也不保证横向偏差 ≤10 mm。
 - `web/frontend/dist/` 是 2026-10-22 20:32 的构建产物，**不包含**第 5 节的车体图标改动。
 
 ## 安装与启动
@@ -243,7 +275,8 @@ Web默认在用户级systemd可用时使用 `qr-navigation-web.service` 托管�
 
 本次已启动Web和默认不执行运动的ROS2导航桥。正式版没有自动运动预览。页面位置来自正式 `/qr/localization/pose`，或明确标注的静止二维码地图定位 `/qr/localization/static_pose`。没有有效定位数据时不绘制小车位置。静止定位只用于当前地图显示，不替代运动导航定位条件。底盘速度和四轮原始角度来自实际反馈。
 
-源工程备份：`backups/20261009-103717/source-before-greenhouse.tar.gz` 与同目录SQLite备份；这只备份之前的新系统，不涉及修改原底盘。
+源工程备份：曾放在 `backups/20261009-103717/`（`source-before-greenhouse.tar.gz` 与同目录 SQLite 备份）。
+该本地备份已按用户要求于 2026-10-25 清理，源码与历史仍完整保留在 Git 中；原底盘未做任何修改。
 
 ## 整批生成与打印
 
