@@ -9,7 +9,15 @@ interface PreviewSocket {
  on(event:'message',listener:(data:Buffer)=>void):unknown;
  on(event:'close'|'error',listener:()=>void):unknown;
 }
-const configSchema=z.object({device:z.string().startsWith('/dev/v4l/by-id/'),vendor:z.string().regex(/^[0-9a-f]{4}$/),product:z.string().regex(/^[0-9a-f]{4}$/),name:z.string(),defaultProfile:z.string(),profiles:z.array(z.object({id:z.string(),label:z.string(),width:z.number().int().positive(),height:z.number().int().positive(),fps:z.number().int().min(1).max(60)})).min(1)});
+const configSchema=z.object({device:z.string().startsWith('/dev/v4l/by-id/'),vendor:z.string().regex(/^[0-9a-f]{4}$/),product:z.string().regex(/^[0-9a-f]{4}$/),name:z.string(),defaultProfile:z.string(),profiles:z.array(z.object({id:z.string(),label:z.string(),width:z.number().int().positive(),height:z.number().int().positive(),fps:z.number().int().min(1).max(60)})).min(1),rotate:z.union([z.literal(0),z.literal(180)]).default(0)});
+export const cameraPreviewConfigSchema=configSchema;
+// 180° = horizontal + vertical flip. Only 0/180 keeps width/height, FPS, camera
+// calibration and extrinsics untouched; other angles would change the frame size.
+export function cameraVideoOptions(rotate:number):string[]{
+ if(rotate===180)return ['-vf','hflip,vflip','-c:v','mjpeg','-q:v','2'];
+ if(rotate===0)return ['-c:v','copy'];
+ throw new Error('相机方向仅支持 0 或 180 度');
+}
 type Peer={socket:PreviewSocket,inFlight:number|null,sentAt:number,last:number,minIntervalMs:number};
 // Only browser peers explicitly request pacing; camera_stream consumers retain full rate.
 export const PREVIEW_ACK_TIMEOUT_MS=10000;
@@ -52,7 +60,7 @@ export class CameraPreview {
   this.error='';if(!this.identity()){this.error='HBVCAM 未连接';for(const p of this.peers)this.sendStatus(p);return;}
   this.starting=true;this.startedAt=Date.now();this.latest=null;this.frameAt=0;this.frames=[];for(const p of this.peers){p.inFlight=null;p.last=-1;}
   const profile=this.selected();
-  const child=spawn('/usr/bin/ffmpeg',['-nostdin','-hide_banner','-loglevel','warning','-f','v4l2','-input_format','mjpeg','-video_size',`${profile.width}x${profile.height}`,'-framerate',String(profile.fps),'-i',this.config.device,'-an','-c:v','copy','-f','mpjpeg','-boundary_tag','qrframe','-flush_packets','1','pipe:1'],{stdio:['ignore','pipe','pipe']});this.process=child;
+  const child=spawn('/usr/bin/ffmpeg',['-nostdin','-hide_banner','-loglevel','warning','-f','v4l2','-input_format','mjpeg','-video_size',`${profile.width}x${profile.height}`,'-framerate',String(profile.fps),'-i',this.config.device,'-an',...cameraVideoOptions(this.config.rotate),'-f','mpjpeg','-boundary_tag','qrframe','-flush_packets','1','pipe:1'],{stdio:['ignore','pipe','pipe']});this.process=child;
   let stderr='';const parser=new MultipartJpegParser(jpeg=>{if(this.process!==child)return;this.sequence=(this.sequence+1)>>>0;this.frameAt=Date.now();this.frames.push(this.frameAt);this.starting=false;this.latest=framePacket(jpeg,this.sequence,this.frameAt,profile.width,profile.height);for(const p of this.peers)this.offer(p);});
   child.stderr!.on('data',data=>{stderr=(stderr+data.toString()).slice(-3000);});
   child.stdout!.on('data',data=>{try{parser.push(data);}catch(e){this.error=(e as Error).message;void this.stop();}});

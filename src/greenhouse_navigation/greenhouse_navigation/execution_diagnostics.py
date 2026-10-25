@@ -49,12 +49,12 @@ class ExecutionDiagnostics:
         cross,tangent,remaining,end_distance=geometry(pose,points)
         a,b=points[-2:];length=math.hypot(b['x']-a['x'],b['y']-a['y'])
         along_to_end=((b['x']-pose.x)*(b['x']-a['x'])+(b['y']-pose.y)*(b['y']-a['y']))/length
-        stop_phase=phase in ('START_STOP','END_STOP','RECOVER_STOP')
+        stop_phase=phase in ('START_STOP','END_STOP','RECOVER_STOP','TURN_RECENTER')
         boundary=points[-1] if phase=='END_STOP' else points[0]
         tag=s['toId'] if phase=='END_STOP' else s['fromId']
         target_visible=any(o.get('id')==tag for o in observations)
         if phase=='END_STOP':heading=s['endYaw'];reference='区间终点录制朝向'
-        elif phase in ('START_STOP','RECOVER_STOP','ALIGN') or s['mode']=='crab':
+        elif phase in ('START_STOP','RECOVER_STOP','ALIGN','TURN_RECENTER') or s['mode']=='crab':
             heading=s['bodyYaw'];reference='区间录制车头朝向'
         else:
             heading=wrap(tangent+(math.pi if s['direction']=='reverse' else 0.));reference='当前路径切线对应车头方向'
@@ -68,7 +68,9 @@ class ExecutionDiagnostics:
         stopped=bool(feedback_fresh and finite(speed) and 0<=speed<=mission.config['stopped_speed_mps'])
         mode_ready=bool(feedback_fresh and executor.mode_ready(feedback)) if phase in ('ALIGN','MOVE') else None
         stage={'MOVE':'区间行驶','ALIGN':'换挡确认','START_STOP':'起点停车确认',
-               'END_STOP':'终点停车确认','RECOVER_STOP':'暂停恢复停车'}.get(phase,phase)
+               'END_STOP':'终点停车确认','RECOVER_STOP':'暂停恢复停车',
+               'CENTER_ALIGN':'横向对中换挡','CENTER_MOVE':'横向对中',
+               'CENTER_STOP':'对中停稳确认','TURN_RECENTER':'转向后轮子回正与档位确认'}.get(phase,phase)
         reason='已暂停，保持停车' if mission.paused else stage
         if phase=='MOVE' and not mission.paused:
             if not mode_ready:reason='区间模式或轮角反馈不匹配'
@@ -84,8 +86,21 @@ class ExecutionDiagnostics:
                     else '边界位置未进入容差' if boundary_distance>radius
                     else '车头方向未进入容差' if abs(heading_error)>.10 and phase!='RECOVER_STOP'
                     else '等待连续停稳确认')
+        elif phase=='TURN_RECENTER' and not mission.paused:
+            turn=executor.turn_info if isinstance(getattr(executor,'turn_info',None),dict) else {}
+            recenter=turn.get('recenter') or {}
+            reason=('等待轮子回正与档位确认（实测转角 %s°，目标 %s°，允许 ±%s°，车体/转向档位 %s/%s）'
+                    %(recenter.get('measuredAngleDeg'),recenter.get('targetAngleDeg'),
+                      recenter.get('angleToleranceDeg'),recenter.get('bodyGear'),recenter.get('steeringGear')))
         elif phase=='ALIGN' and not mission.paused:
             reason='等待档位或轮角确认' if not mode_ready else '等待连续停稳确认'
+        elif phase in ('CENTER_ALIGN','CENTER_MOVE','CENTER_STOP') and not mission.paused:
+            centering=getattr(executor,'centering_info',None) or {}
+            current=centering.get('endCrossM')
+            reason={'CENTER_ALIGN':'等待横移档位确认','CENTER_MOVE':'横移收敛横向偏差',
+                    'CENTER_STOP':'等待横移停稳确认'}[phase]
+            if finite(current):
+                reason+=f"（当前 {current*100:+.1f} cm，目标 {executor.centering_done_cross()*100:.1f} cm）"
         base.update(status='live',reason='',poseStamp=pose.stamp,poseAgeS=max(0.,now_ros-pose.stamp),
                     pose={'x':pose.x,'y':pose.y,'yaw':pose.yaw},
                     segment={'index':executor.index+1,'total':len(executor.segments),'fromId':s['fromId'],'toId':s['toId'],
@@ -95,7 +110,9 @@ class ExecutionDiagnostics:
                               'remainingM':remaining,'endDistanceM':end_distance,'alongToEndM':along_to_end,
                               'sigmaM':pose.sigma},
                     decision={'stage':stage,'reason':reason,'paused':mission.paused,
-                              'crossLimitM':mission.config['max_cross_track_m'] if phase=='MOVE' and remaining>.03 else None,
+                              'crossLimitM':mission.config['max_cross_track_m'] if ((phase=='MOVE' and remaining>.03) or phase in ('END_STOP','CENTER_ALIGN','CENTER_MOVE','CENTER_STOP')) else None,
+                              'centeringTriggerM':executor.centering_trigger_cross() if phase in ('END_STOP','CENTER_ALIGN','CENTER_MOVE','CENTER_STOP') else None,
+                              'centeringDoneM':executor.centering_done_cross() if phase in ('END_STOP','CENTER_ALIGN','CENTER_MOVE','CENTER_STOP') else None,
                               'headingLimitRad':heading_limit if (phase=='MOVE' and remaining>.03) or (stop_phase and phase!='RECOVER_STOP') else None,
                               'boundaryRadiusM':radius if stop_phase or phase=='MOVE' else None,
                               'boundaryDistanceM':boundary_distance if stop_phase else end_distance if phase=='MOVE' else None,
@@ -103,6 +120,36 @@ class ExecutionDiagnostics:
                               'targetTagVisible':target_visible if stop_phase else any(o.get('id')==s['toId'] for o in observations),
                               'stopped':stopped,'stopRequiredFrames':mission.config['stable_feedback_samples'],
                               'modeReady':mode_ready,'stopRemainingM':.03 if phase=='MOVE' else None})
+        # Structured turn / turn-exit / centering diagnostics (never only Chinese event text).
+        turn=getattr(executor,'turn_info',None)
+        exit_info=getattr(executor,'exit_info',None)
+        centering=getattr(executor,'centering_info',None)
+        base['turn']=copy.deepcopy(turn) if isinstance(turn,dict) else {}
+        base['turnExit']=copy.deepcopy(exit_info) if isinstance(exit_info,dict) else {}
+        base['centering']=copy.deepcopy(centering) if isinstance(centering,dict) else {}
+        history=getattr(executor,'centering_history',None)
+        base['centeringHistory']=copy.deepcopy(history) if isinstance(history,list) else []
+        dr_state=getattr(executor,'dr_state',None)
+        dr_history=getattr(executor,'dr_history',None)
+        if isinstance(dr_state,dict):
+            base['deadReckoning']={
+                'active':dr_state.get('segment_index')==executor.index and phase=='MOVE',
+                'decision':dr_state.get('last_decision'),
+                'predictedPose':dr_state.get('predictedPose'),
+                'predictedCrossM':dr_state.get('crossM'),
+                'predictedHeadingDeg':round(math.degrees((dr_state.get('predictedPose') or {}).get('yaw',0.)),1) if dr_state.get('predictedPose') else None,
+                'staleS':dr_state.get('staleS'),'anchorStamp':dr_state.get('anchor_stamp'),
+                'crossTrackTargetM':executor.dr_target() if hasattr(executor,'dr_target') else None,
+                'correctionCount':dr_state.get('corrections'),
+                'qrCorrectionResidual':{k:(dr_state.get('last_residual') or {}).get(k) for k in ('lateralResidualM','headingResidualDeg','decision')} if dr_state.get('last_residual') else None,
+                'corrections':copy.deepcopy(dr_history[-4:]) if isinstance(dr_history,list) else [],
+            }
+        else:
+            base['deadReckoning']={'active':False,'decision':'idle'}
+        jump=getattr(executor,'localization_jump',None)
+        base['localizationJump']=copy.deepcopy(jump) if isinstance(jump,dict) else {}
+        calibration=mission.config.get('turn_calibration') if hasattr(mission,'config') else None
+        base['calibration']=copy.deepcopy(calibration) if isinstance(calibration,dict) else {}
         return base
 
     def finalize(self, sample, mission):

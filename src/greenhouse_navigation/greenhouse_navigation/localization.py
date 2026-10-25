@@ -229,7 +229,11 @@ class GlobalLocalization(Node):
         if not path:raise ValueError('需要已保存的正式地图JSON；不自动使用示例地图定位')
         self.map_path=Path(path);self.map_content=self.map_path.read_text()
         field=json.loads(self.map_content);self.field=field.get('map',field);self.map_version=field.get('version')
-        if self.field.get('coordinateStatus')!='reviewed':raise ValueError('全局定位必须使用已接纳的地图')
+        # 多张地图共用同一批物理二维码板时，定位作用域必须跟随"当前选中的地图"。
+        # 坐标是否已验收只是来源标记，不再决定能否开始导航（自用版切换即生效）。
+        self.coordinate_reviewed=self.field.get('coordinateStatus')=='reviewed'
+        self.map_switch_seq=0
+        if not self.coordinate_reviewed:self.get_logger().info('定位地图坐标为扫描结果（未做人工验收）：'+str(self.field.get('id')))
         self.boards=validate_boards(self.field.get('groups',[]))
         self.tags={t['id']:t for t in self.field['tags']};self.history=deque(maxlen=300);self.estimate=None;self.covariance=np.eye(3);self.last=None;self.last_tag=0.
         self.formal_origin=False;self.formal_published_at=None;self.formal_preview_at=None
@@ -257,15 +261,17 @@ class GlobalLocalization(Node):
             content=self.map_path.read_text()
             if content==self.map_content:return
             raw=json.loads(content);field=raw.get('map',raw)
-            if field.get('coordinateStatus')!='reviewed':raise ValueError('切换地图必须已确认')
             boards=validate_boards(field.get('groups',[]));tags={t['id']:t for t in field['tags']}
             anchor=StationaryAnchor(field,timeout=self.get_parameter('max_observation_age_s').value,
                                     max_innovation=self.get_parameter('max_innovation_m').value)
+            reviewed=field.get('coordinateStatus')=='reviewed'
             self.field=field;self.boards=boards;self.tags=tags;self.map_version=raw.get('version');self.map_content=content
+            self.coordinate_reviewed=reviewed;self.map_switch_seq=getattr(self,'map_switch_seq',0)+1
             self.history.clear();self.estimate=None;self.covariance=np.eye(3);self.last=None;self.last_tag=0.
             self.formal_origin=False;self.formal_published_at=None;self.formal_preview_at=None
             self.anchor=anchor;self.pending_static.clear();self.last_odometry=None
-            self.get_logger().info('定位地图已切换：'+field['id']+'；旧原点已清除，等待当前地图二维码')
+            self.get_logger().info('定位地图已切换：'+field['id']+' v'+str(raw.get('version'))+'；旧原点与旧二维码缓存已清除，等待当前地图二维码重新锚定'
+                                   +('' if reviewed else '（坐标来自扫描，未做人工验收）'))
         except (OSError,ValueError,KeyError,TypeError) as exc:
             self.get_logger().error('定位地图切换失败：'+str(exc))
 
@@ -440,6 +446,7 @@ class GlobalLocalization(Node):
         # growing covariance visible; the diagnostic threshold is not a stop line.
         # A missing absolute origin, stale odometry or invalid covariance is never
         # promoted to navigation-ready by this mode.
+        # 坐标来源（扫描/已验收）不参与放行判定：真实门槛是 FORMAL 位姿、有效协方差与误差。
         navigation_ready=bool(formal and covariance_valid and (interval_navigation or within_limit))
         if formal and not covariance_valid:
             reason='定位协方差无效，等待有效融合位姿'

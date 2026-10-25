@@ -107,26 +107,33 @@ test('版本、证据和任务更新事务一致，任务异常时全部回滚',
  assert.equal(count(store,'runtime_log'),0);
 }));
 
-test('地图确认不启用实体执行、不入队命令；导航仍检查执行、连接和其他条件',async t=>{
+test('地图确认不启用实体执行、不入队命令；草稿质量与执行/定位条件仍逐条拦截',async t=>{
  t.mock.method(RobotLink.prototype,'enqueue',()=>{assert.fail('静止确认不应入队命令');});
  await fixture(async(app,store,map)=>{
   await app.inject({method:'POST',url:'/api/tasks',payload:task(map)});
   assert.equal((await app.inject({method:'POST',url:'/api/maps/confirm',payload:{...confirmation,updateTasks:true}})).statusCode,200);
-  let start=await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:'office-task'}});assert.equal(start.statusCode,423);assert.match(start.body,/ROS2/);assert.doesNotMatch(start.body,/来自草稿|实测坐标验收/);
+  // 新契约：用户确认只记录坐标来源，不再是导航放行条件；但草稿采集质量一律拦截。
+  let start=await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:'office-task'}});assert.equal(start.statusCode,423);assert.match(start.body,/草稿/);assert.doesNotMatch(start.body,/实体执行许可/);
+  assert.equal(store.get(map.id)!.map.captureQuality,'draft','用户确认不得把草稿质量改成 verified');
+  // 改成正式扫描质量后，拦截必须来自执行许可/正式定位，而不是地图质量。
+  const item=store.get(map.id)!;store.db.prepare('UPDATE versions SET body=? WHERE map_id=? AND version=?').run(JSON.stringify({...item.map,captureQuality:'verified'}),map.id,item.version);
   const status=new RobotLink().status();t.mock.method(RobotLink.prototype,'status',()=>({...status,connected:true,conditions:[{id:'execution',label:'实体执行许可',ready:false},{id:'pose',label:'正式定位',ready:false}]}));
   start=await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:'office-task'}});assert.equal(start.statusCode,423);assert.match(start.body,/实体执行许可/);assert.match(start.body,/正式定位/);
-  assert.equal((await app.inject('/api/health')).json().hardwareControl,false);assert.equal(store.get(map.id)!.map.captureQuality,'draft');
+  assert.equal((await app.inject('/api/health')).json().hardwareControl,false);
  });
 });
 
-test('导航分支承认合法摘要的用户确认草稿，离线替身验证入队内容',async t=>{
+test('导航不再要求人工验收：正式扫描地图没有任何 acceptance 记录也能入队（离线替身）',async t=>{
  const status=readyStatus();t.mock.method(RobotLink.prototype,'status',()=>status);
  const send=t.mock.method(RobotLink.prototype,'enqueue',(type:string,payload:unknown)=>({type,payload,offline:true}));
- await fixture(async(app,_store,map)=>{
+ await fixture(async(app,store,map)=>{
   await app.inject({method:'POST',url:'/api/tasks',payload:task(map)});
-  const confirmed=(await app.inject({method:'POST',url:'/api/maps/confirm',payload:{...confirmation,updateTasks:true}})).json();assert.equal(send.mock.callCount(),0);
+  // 只把采集质量改成正式扫描（草稿质量仍会被上一条用例拦下），不做任何人工确认。
+  const item=store.get(map.id)!;store.db.prepare('UPDATE versions SET body=? WHERE map_id=? AND version=?').run(JSON.stringify({...item.map,captureQuality:'verified'}),map.id,item.version);
+  assert.equal(count(store,'acceptances'),0,'本用例不得存在任何人工验收记录');
   const start=await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:'office-task'}});assert.equal(start.statusCode,200,start.body);
-  assert.equal(send.mock.callCount(),1);assert.equal(start.json().type,'start');assert.deepEqual(start.json().payload.map,confirmed.map);assert.equal(start.json().payload.task.mapVersion,2);
+  assert.equal(send.mock.callCount(),1);assert.equal(start.json().type,'start');
+  assert.equal(start.json().payload.map.captureQuality,'verified');assert.equal(start.json().payload.task.mapVersion,1);
  });
 });
 

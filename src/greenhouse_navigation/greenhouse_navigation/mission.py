@@ -26,6 +26,8 @@ class Mission:
         self.job_requests=[];self.field=None;self.task=None;self.row_index=0;self.events=[];self.fired=set();self.completed=[]
         self.entered=time.monotonic();self.last_sample=None;self.stable=0;self.wait_until=0.;self.mode='4t4d';self.target_angle=0.
         self.restore_started=False;self.speed_override=None;self.last_rules=time.monotonic()
+        # Read-only localization status snapshot for execution diagnostics/jump checks.
+        self.localization={}
 
     @property
     def row(self):
@@ -190,7 +192,8 @@ class Mission:
                     elif action=='CUSTOM':self.job_requests.append({'taskId':self.task['id'],'jobName':rule['customTask'],'tagId':tag['id'],'ruleId':rule['id']});self.log('作业请求：'+rule['customTask'])
                     elif action=='ROW_COMPLETE' and self.row['id'] not in self.completed:self.completed.append(self.row['id'])
 
-    def tick(self,pose,feedback,observations,conditions,dt):
+    def tick(self,pose,feedback,observations,conditions,dt,localization=None):
+        if isinstance(localization,dict):self.localization=localization
         zero=Command(mode=self.mode,wheel_angle=self.target_angle)
         if not self.running:return zero
         missing=[c['label'] for c in conditions if not c['ready']]

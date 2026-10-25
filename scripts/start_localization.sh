@@ -14,9 +14,12 @@ from pathlib import Path
 root=Path.cwd()
 p=yaml.safe_load(Path(sys.argv[1]).read_text())['qr_global_localization']['ros__parameters']
 path=Path(sys.argv[2] or p.get('map_file','')).resolve()
-if not path.is_file():raise SystemExit('需要已接纳地图JSON')
+if not path.is_file():raise SystemExit('需要已保存的地图JSON')
 m=json.loads(path.read_text());m=m.get('map',m)
-if m.get('coordinateStatus')!='reviewed':raise SystemExit('地图未接纳')
+# 定位作用域跟随"当前选中的地图"：坐标未启用时仍允许启动，但只发布诊断位姿，
+# 导航放行由 web 端与 start_gate 的"坐标已启用+验收+作用域匹配"把关。
+reviewed=m.get('coordinateStatus')=='reviewed'
+if not reviewed:print('WARN 定位地图坐标尚未启用：'+str(m.get('id'))+'；只发布诊断位姿，不参与导航放行',file=sys.stderr)
 if p.get('local_odom_topic')!='/qr/odometry/local':raise SystemExit('必须使用本工程局部融合')
 if p.get('publish_tf') is not False:raise SystemExit('当前定位服务不发布TF')
 # 静止模式仍保留原始采集质量，核对真实地图版本及接纳证据。
@@ -25,10 +28,11 @@ db=sqlite3.connect((root/web['database']).resolve().as_uri()+'?mode=ro',uri=True
 try:
     row=db.execute('SELECT version,body FROM versions WHERE map_id=? ORDER BY version DESC LIMIT 1',(m['id'],)).fetchone()
     if not row or json.loads(row[1])!=m:raise SystemExit('定位文件与当前地图版本不一致')
-    proof=db.execute('SELECT digest,body FROM acceptances WHERE map_id=? AND version=?',(m['id'],row[0])).fetchone()
-    if not proof or proof[0]!=hashlib.sha256(row[1].encode()).hexdigest():raise SystemExit('地图接纳证据缺失或摘要失效')
-    evidence=json.loads(proof[1])
-    if m.get('captureQuality')=='draft' and not (evidence.get('kind')=='user_confirmation' and evidence.get('confirm') is True and evidence.get('acceptedVersion')==row[0]):raise SystemExit('草稿地图需要有效用户确认')
+    if reviewed:
+        proof=db.execute('SELECT digest,body FROM acceptances WHERE map_id=? AND version=?',(m['id'],row[0])).fetchone()
+        if not proof or proof[0]!=hashlib.sha256(row[1].encode()).hexdigest():raise SystemExit('地图接纳证据缺失或摘要失效')
+        evidence=json.loads(proof[1])
+        if m.get('captureQuality')=='draft' and not (evidence.get('kind')=='user_confirmation' and evidence.get('confirm') is True and evidence.get('acceptedVersion')==row[0]):raise SystemExit('草稿地图需要有效用户确认')
 finally:db.close()
 print(path)
 PY

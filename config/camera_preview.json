@@ -7,5 +7,6 @@
   "profiles": [
     {"id": "720p", "label": "高清 720P", "width": 1280, "height": 720, "fps": 30},
     {"id": "480p", "label": "流畅 480P", "width": 640, "height": 480, "fps": 30}
-  ]
+  ],
+  "rotate": 180
 }

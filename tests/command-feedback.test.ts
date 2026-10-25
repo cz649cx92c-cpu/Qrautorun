@@ -82,7 +82,7 @@ type Request={url:string,options:RequestInit};
 function harness(handle:(request:Request)=>unknown|Promise<unknown>){
  let now=0,next=0;const timers=new Map<number,{at:number,run:()=>void}>(),requests:Request[]=[];
  const context=vm.createContext({AbortController,encodeURIComponent,
-  busy:{value:false},error:{value:''},message:{value:''},commandFeedback:{value:null},selectedTask:{value:'task-scan-test'},closed:false,navigationAbort:undefined,
+  busy:{value:false},error:{value:''},message:{value:''},commandFeedback:{value:null},selectedTask:{value:'task-scan-test'},orthogonalPreviewActive:{value:false},closed:false,navigationAbort:undefined,
   setTimeout:(run:()=>void,ms:number)=>{const id=++next;timers.set(id,{at:now+ms,run});return id;},clearTimeout:(id:number)=>timers.delete(id),
   fetch:async(url:string,options:RequestInit)=>{const request={url,options};requests.push(request);const body=await handle(request);return {ok:true,json:async()=>body};}
  });

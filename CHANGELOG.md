@@ -1,5 +1,21 @@
 # 变更记录
 
+## v8 — 2026-10-25
+
+自用版界面、切图即生效、相机预览 180° 与时序标定解耦、二维码区间连续纠偏。详见 `docs/26_v8自用版与二维码间连续纠偏.md`。
+
+- 自用版 UI：删除姓名字段、手填记录名/路径名、顶部流程图、作业概览与使用指南；保留地图/路径/点位/编辑/开始暂停停止。底层安全门一行未放宽。
+- 删除「启用此地图」按钮：定位作用域跟随当前选中的 `mapId + mapVersion`，切图即重锚。新增 `GET /api/localization/scope` 与 `localizationScopeBlock/Phase`；`/api/navigation/start` 去掉人工 `mapApproval`，改为对所有 `routeMode` 校验 `mapId + mapVersion + poseAvailable`。旧 `/api/maps/confirm`、`/api/maps/accept` 保留兼容。
+- 相机：`camera_preview.json` 支持 `rotate: 0|180`（180 = hflip+vflip，仅影响预览）；时序标定指纹改为只含采集/时间字段（device、分辨率、fps、曝光等），排除 rotate/hflip/vflip/preview，旧证据走 legacy 分支不重跑标定。修复旋转后 `captureTimestampVerified=false` 卡死导航门禁。
+- 起点门禁 `start_gate.py`：等待当前地图/epoch 的新鲜稳定样本，起点偏差按第一段沿程/横向分解，保留横向与航向门限，超时明确拒绝。
+- 转向残差标定 `turn_calibration.py`：只读 `calibration.db`，推导 `acceptance_deg`(≤2.5°) 与 `correction_tolerance_deg`(≤1.0°)，排除反向/无效试验，无分析时回退默认。
+- 边界横向对中 `CENTER_ALIGN/MOVE/STOP`：停稳后相对下一段计算有符号 cross-track，≤2 cm 直接进段、2–5 cm 有限 crab 收敛、>5 cm 或发散/超时/质量差则 FAULT。结构化记录 start/end/delta/direction/travel/duration/decision。
+- 二维码间 dead-reckoning：轮速 `vx/vy` + IMU yaw 积分得预测位姿与预测 cross-track，达 8 mm 触发低速有限 crab 提前纠偏；QR 重现时按 stamp 变化做 `dr_try_rebase`，仅接受同图/同 epoch/质量合格/时间戳有效，只重置 DR 锚点不瞬移控制位姿；残差连续超 5 cm 判发散停车。0.008 m 是控制目标，不是已实测精度。
+- 诊断：`executionDiagnostics` 新增 `deadReckoning`（predictedPose/predictedCrossM/qrCorrectionResidual/correctionCount 等），`robot.ts` schema 同步；不新增用户按钮。
+- 地图实时车体图标改按真实外形 0.46 m × 0.36 m 世界米制尺寸随缩放绘制（新增 `vehicleFootprintM` 显示常量），无固定像素下限/膨胀，保持 base_link 锚点与航向、长轴沿前进方向；`map.vehicle` 仍是规划/安全包络，0.46 m 不是轮距/轴距，底盘运动学未改。
+- 测试：`npm test` 208/208；boundary-centering 11/11、dead-reckoning 11/11、timing calibration 10/10、office map reload 2/2；`tsc`/`vue-tsc` rc=0。`tests/test_segment_execution.py` 3 个既有失败（改动前基线同样失败）未修复。
+- 未实车验证：DR 提前纠偏、>2 cm 边界对中、QR rebase 现场残差。dist 为 20:32 构建产物，不含车体图标改动。
+
 ### v3 十组打印占号提示修复 — 2026-10-19
 
 - 只读确认旧板 B000/B016/B032 连续使用 Q000–Q047，下一板 B049 使用 Q049–Q064。4×4 从0生成十组的步长16正确，但新 B048 会与已登记 B049 重叠；这是实际归属冲突，不是重打幂等失败。

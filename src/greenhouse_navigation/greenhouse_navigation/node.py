@@ -7,6 +7,7 @@ import os
 import queue
 import threading
 import time
+import types
 import uuid
 from pathlib import Path
 from urllib.request import Request,build_opener,ProxyHandler
@@ -22,6 +23,8 @@ from .control import Pose,Command
 from .mission import Mission
 from .segment_execution import TURN_EXECUTION_AVAILABLE
 from .execution_diagnostics import ExecutionDiagnostics
+from .turn_calibration import load_turn_calibration
+from .start_gate import evaluate_start_gate, pose_values
 from .motion_interface import ExistingMotionInterface,COMMAND_TOPICS
 from .can_health import CanHealth
 from .board_geometry import validate_boards,collapse_group_observations,validated_board_observations
@@ -50,9 +53,63 @@ class GreenhouseNode(Node):
         defaults['turn_timeout_s']=15.
         defaults['start_heading_tolerance_deg']=15.
         defaults['boundary_heading_tolerance_deg']=15.
+        defaults['turn_acceptance_deg']=2.5
+        defaults['turn_correction_tolerance_deg']=1.0
+        defaults['turn_correction_limit']=3
+        defaults['turn_correction_min_s']=.2
+        defaults['turn_correction_min_delta_deg']=.2
+        defaults['centering_max_offset_m']=.12
+        defaults['centering_done_cross_m']=.02
+        defaults['centering_lateral_speed_mps']=.02
+        defaults['centering_timeout_s']=8.
+        # 每个二维码边界的横向对中：>2 cm 触发、<=2 cm 收敛、>5 cm 直接 FAULT。
+        defaults['centering_enabled']=True
+        defaults['centering_trigger_cross_m']=.02
+        defaults['centering_max_travel_m']=.10
+        defaults['centering_max_sigma_m']=.03
+        defaults['centering_heading_drift_deg']=3.
+        defaults['centering_speed_limit_mps']=.06
+        # 二维码间 dead-reckoning（轮速+IMU航向）连续横向估计与提前有限纠偏。
+        defaults['dr_correction_enabled']=True
+        defaults['dr_cross_target_m']=.008
+        defaults['dr_correction_trigger_m']=.008
+        defaults['dr_correction_limit']=2
+        defaults['dr_correction_travel_m']=.05
+        defaults['dr_correction_min_remaining_m']=.15
+        defaults['dr_correction_min_stale_s']=.25
+        defaults['dr_rebase_residual_limit_m']=.05
+        defaults['dr_rebase_max_sigma_m']=.03
+        defaults['dr_divergence_frames']=3
+        defaults['calibration_database_path']=''
+        defaults['start_ahead_tolerance_m']=.15
+        defaults['start_behind_tolerance_m']=.05
+        defaults['start_gate_timeout_s']=12.
+        defaults['start_gate_stable_samples']=5
+        defaults['start_stable_jitter_m']=.01
+        defaults['start_stable_jitter_deg']=.5
+        defaults['localization_jump_step_m']=.005
+        defaults['localization_jump_low_ratio']=.5
+        defaults['localization_jump_sigma_m']=.02
+        defaults['localization_jump_high_ratio']=.75
+        defaults['localization_jump_high_sigma_m']=.02
+        defaults['localization_jump_hard_cross_m']=.08
+        defaults['localization_jump_confirm_s']=2.
+        defaults['localization_jump_confirm_m']=.08
+        defaults['localization_jump_speed_mps']=.03
+        defaults['localization_jump_max_vy_mps']=.01
+        defaults['localization_jump_low_quality_s']=1.5
+        defaults['localization_jump_recover_samples']=2
         for key,value in defaults.items():self.declare_parameter(key,value);self.config[key]=self.get_parameter(key).value
         if self.config['maintenance_mode'] and self.config['execution_enabled']:
             raise ValueError('IMU维护模式必须禁用实体执行')
+        # 只读最新有效标定分析，作为转向完成容差/修正容差的输入；不写回标定库。
+        calibration_path=(self.config.get('calibration_database_path') or
+                          str(Path(__file__).resolve().parents[3]/'maps/calibration.db'))
+        self.turn_calibration=load_turn_calibration(calibration_path=calibration_path)
+        self.config['turn_calibration']=self.turn_calibration
+        if self.turn_calibration.get('applied'):
+            self.config['turn_acceptance_deg']=float(self.turn_calibration['acceptanceDeg'])
+            self.config['turn_correction_tolerance_deg']=float(self.turn_calibration['correctionToleranceDeg'])
         self.execution_diagnostics=ExecutionDiagnostics();self.mission=Mission(self.config);self.feedback=None;self.received=0.;self.pose=None;self.pose_received=0.;self.imu_received=0.;self.observations=[];self.tag_received=0.;self.camera_received=0.;self.observation_received=0.;self.camera_frame_stamp=None;self.seq=0
         self.boot_id=str(uuid.uuid4());self.commands=queue.Queue();self.acks=queue.Queue();self.survey=queue.Queue(maxsize=500);self.motion_records=queue.Queue(maxsize=3000)
         # 融合标定：只被动收集带原始 ROS 时间戳的观测/IMU 样本；不参与任何运动决策。
@@ -62,6 +119,7 @@ class GreenhouseNode(Node):
         self.static_pose=None;self.static_pose_received=0.;self.static_pose_context=None
         self.localization_status=None;self.localization_received=0.;self.preview_pose=None;self.preview_pose_received=0.
         self.pending_start=None;self.pending_start_at=0.
+        self.start_gate={};self.start_samples=[];self.start_gate_reason=''
         self.create_subscription(ChassisInfoFb,self.config['feedback_topic'],self.feedback_cb,10)
         self.create_subscription(Odometry,self.config['fused_pose_topic'],self.pose_cb,10)
         self.create_subscription(Odometry,self.config['localization_preview_topic'],self.preview_pose_cb,10)
@@ -85,6 +143,13 @@ class GreenhouseNode(Node):
         self.create_timer(.05,self.tick)
         self.worker=threading.Thread(target=self.web_worker,daemon=True);self.worker.start()
         self.get_logger().info('温室导航已启动；实体执行许可='+str(self.config['execution_enabled'])+'；摄像头按最后接入顺序等待')
+        calib=self.turn_calibration
+        if calib.get('applied'):
+            self.get_logger().info('转向标定输入：session='+str(calib.get('sessionId'))+'；有效转向='+str(calib.get('validTurns'))+
+                                   '；误差均值='+str(calib.get('meanErrorDeg'))+'°；σ='+str(calib.get('stdDeg'))+
+                                   '°；完成容差='+str(calib.get('acceptanceDeg'))+'°；修正容差='+str(calib.get('correctionToleranceDeg'))+'°')
+        else:
+            self.get_logger().info('转向标定输入：使用固定默认（'+str(calib.get('reason'))+'）；完成容差='+str(self.config['turn_acceptance_deg'])+'°')
 
     def feedback_cb(self,msg):
         stamp=msg.header.stamp.sec+msg.header.stamp.nanosec/1e9
@@ -450,6 +515,7 @@ class GreenhouseNode(Node):
         started=time.monotonic()
         self.motion.prepare()  # Load only; never send body/steering/IO commands.
         self.pending_start=command;self.pending_start_at=started
+        self.start_gate={};self.start_samples=[];self.start_gate_reason=''
         self.mission.log('等待现有控制接口就绪，重新检查导航条件')
 
     def cancel_pending_start(self,reason):
@@ -460,19 +526,64 @@ class GreenhouseNode(Node):
     def advance_pending_start(self,conditions):
         command=self.pending_start
         if command is None:return
-        # Discovery may lag behind constructor completion. Keep the mission
-        # idle until every real condition has been checked again, without
-        # reusing the pose/feedback that preceded module loading.
-        if time.monotonic()-self.pending_start_at>=3.:
-            missing='、'.join(v['label'] for v in conditions if not v['ready'])
-            self.cancel_pending_start('启动等待超时：'+(missing or '控制接口未就绪'))
+        now=time.monotonic();elapsed=now-self.pending_start_at
+        missing='、'.join(v['label'] for v in conditions if not v['ready'])
+        if missing:
+            if elapsed>=3.:self.cancel_pending_start('启动等待超时：'+missing)
             return
-        if any(not v['ready'] for v in conditions) or not self.motion.prepare():return
+        if not self.motion.prepare():return
+        field=command['payload']['map'];task=copy.deepcopy(command['payload']['task'])
+        pose=self.pose;loc=self.localization_status if isinstance(self.localization_status,dict) else {}
+        fusion=self.fusion if isinstance(self.fusion,dict) else {}
+        pose_dict,_=pose_values(pose)
+        if pose_dict is not None and loc.get('mapId'):
+            self.start_samples.append({'t':now,'x':pose_dict['x'],'y':pose_dict['y'],'yaw':pose_dict['yaw'],
+                'mapId':loc.get('mapId'),'mapVersion':loc.get('mapVersion'),
+                'localEpoch':loc.get('localEpoch'),'sigma':loc.get('positionSigmaM')})
+            self.start_samples=[sample for sample in self.start_samples if now-sample['t']<=1.0]
         try:
-            self.mission.start(command['payload']['map'],copy.deepcopy(command['payload']['task']),self.pose)
+            gate=evaluate_start_gate(field,task,pose,loc,fusion,
+                (now-self.pose_received) if pose is not None else None,
+                (now-self.localization_received) if loc else None,
+                self.start_samples,self.config,elapsed)
+        except Exception as error:
+            # A start-gate integration error must never kill the navigation child.
+            segments=field.get('motionSegments') or []
+            self.start_gate={'mapId':field.get('id'),'mapVersion':task.get('mapVersion'),
+                             'routeId':task.get('routeId') or '',
+                             'firstTagId':segments[0].get('fromId') if segments else None,
+                             'actualPose':pose_dict,'finalDecision':'reject',
+                             'reasonCode':'start_gate_exception',
+                             'reason':f'起点门禁内部错误：{type(error).__name__}: {error}',
+                             'elapsedS':round(elapsed,3)}
+            message='起点门禁内部错误，已安全拒绝启动：'+type(error).__name__
+            self.mission.log(message+'；'+str(error))
+            self.cancel_pending_start(message)
+            return
+        self.start_gate=gate['diagnostics']
+        if gate['decision']=='wait':
+            reason=gate['diagnostics'].get('reasonCode','')
+            if reason!=self.start_gate_reason:
+                self.start_gate_reason=reason
+                self.mission.log('起点门禁等待：'+gate['message'])
+            if elapsed>=float(self.config.get('start_gate_timeout_s',12.)):
+                self.start_gate['finalDecision']='reject'
+                self.cancel_pending_start('启动等待超时：'+gate['message'])
+            return
+        if gate['decision']=='reject':
+            self.start_gate['finalDecision']='reject'
+            self.mission.log('起点门禁拒绝：'+gate['message'])
+            self.cancel_pending_start(gate['message'])
+            return
+        try:
+            filtered=gate.get('pose') or pose_dict
+            if not filtered:raise ValueError('起点门禁未返回有效位姿')
+            start_pose=types.SimpleNamespace(x=filtered['x'],y=filtered['y'],yaw=filtered['yaw'])
+            self.mission.start(field,task,start_pose)
             self.engaged=True
             self.acks.put({'id':command['id'],'ok':True,'message':'任务请求已由ROS2状态机处理'})
         except Exception as error:
+            self.start_gate['finalDecision']='reject'
             self.acks.put({'id':command['id'],'ok':False,'message':str(error)})
             self.mission.log(str(error))
         self.pending_start=None
@@ -530,7 +641,7 @@ class GreenhouseNode(Node):
         except Exception:
             # Display diagnostics must never interrupt mission decisions or command output.
             diagnostic_sample={'status':'unavailable','reason':'执行诊断数据暂不可用','sampledAt':diagnostic_time}
-        cmd=self.mission.tick(self.pose,self.feedback or {},observations,conditions,dt)
+        cmd=self.mission.tick(self.pose,self.feedback or {},observations,conditions,dt,localization=self.localization_status or {})
         while self.mission.job_requests:self.job_pub.publish(String(data=json.dumps(self.mission.job_requests.pop(0),ensure_ascii=False)))
         if cmd.mode=='4t4d':
             executor=getattr(self.mission,'segment_executor',None)
@@ -553,6 +664,7 @@ class GreenhouseNode(Node):
             telemetry['executionDiagnostics']=self.execution_diagnostics.finalize(diagnostic_sample,self.mission)
         except Exception:
             telemetry['executionDiagnostics']={'status':'unavailable','reason':'执行诊断数据暂不可用','sampledAt':diagnostic_time}
+        telemetry['startGate']=self.start_gate
         telemetry['maintenance']={'active':self.config.get('maintenance_mode',False),'executionEnabled':self.config['execution_enabled'],'pendingStart':self.pending_start is not None,'queuedLocalCommands':self.commands.qsize(),'taskCommandPolling':not self.config.get('maintenance_mode',False),'imuDirectionVerified':self.config.get('imu_direction_verified',False)}
         # Capability is reported by this node, never assumed by the web bridge.
         telemetry['capabilities']={'turnInPlace':bool(TURN_EXECUTION_AVAILABLE and float(self.config.get('turn_yaw_rate_max_radps',0.))>0 and float(self.config.get('turn_timeout_s',0.))>0),'turnToleranceDeg':float(self.config.get('turn_tolerance_deg',5.)),'turnMaxRateRadps':float(self.config.get('turn_yaw_rate_max_radps',.3)),'turnTimeoutS':float(self.config.get('turn_timeout_s',15.))}

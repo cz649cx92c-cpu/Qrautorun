@@ -37,3 +37,12 @@ import './route-fixes.test';
 import './calibration-analysis.test';
 import './calibration-api.test';
 import './calibration-ui.test';
+
+import './route-display-order.test';
+
+import './personal-ui-simple.test';
+
+import './map-switch-reanchor.test';
+
+import './auto-map-select.test';
+import './vehicle-icon-size.test';

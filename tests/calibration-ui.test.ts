@@ -22,13 +22,16 @@ test('地图验收区域已删除测量人员，且确认/统一朝向不再强�
  assert.equal(app.includes('请填写确认人姓名'),false,'不应再有确认人必填校验');
  assert.equal(app.includes('operator:verification'),false,'不应再把 verification.operator 传给后端');
  assert.equal(app.includes('const operator='),false,'不应再读取 operator 本地校验');
- assert.match(app,/api\('\/maps\/confirm',\{mapId:field\.value\.id,version:version\.value,confirm:true,updateTasks:true\}\)/,'/maps/confirm 仍应提交 mapId/version/confirm/updateTasks');
+ // 自用版：切图即生效，前端不再调用 /maps/confirm（旧接口保留兼容，由 personal-ui-simple / auto-map-select 覆盖）。
+ assert.equal(app.includes("api('/maps/confirm'"),false,'切图即生效后前端不应再调用 /maps/confirm');
  assert.match(app,/api\('\/maps\/unify-angles',\{mapId:field\.value\.id,version:version\.value,confirm:true,updateTasks:true\}\)/,'/maps/unify-angles 仍应提交 mapId/version/confirm/updateTasks');
- assert.match(app,/api\('\/maps\/accept',\{mapId:field\.value\.id,version:version\.value,measurements:/,'/maps/accept 仍应提交实测坐标');
+ // 自用版 UI 已取消“手工实测坐标”表单：前端不再提交 /maps/accept，
+ // 但后端该接口保留（旧数据与实测验收仍然兼容），由 personal-ui-simple 回归覆盖。
+ assert.equal(app.includes("api('/maps/accept'"),false,'自用版 UI 不应再提交手工实测坐标');
 });
 
-test('导航新增“融合标定”入口并保留 scan/navigate/print/camera/guide 页面',()=>{
- assert.match(app,/type ConsolePage='scan'\|'navigate'\|'print'\|'camera'\|'guide'\|'calibration'/);
+test('导航新增“融合标定”入口并保留 scan/navigate/print/camera 页面',()=>{
+ assert.match(app,/type ConsolePage='scan'\|'navigate'\|'print'\|'camera'\|'calibration'/);
  assert.match(app,/nav-calibration/);
  assert.match(app,/融合标定/);
  assert.match(app,/calibration:\{title:'融合标定'/);
@@ -36,7 +39,7 @@ test('导航新增“融合标定”入口并保留 scan/navigate/print/camera/g
  assert.match(app,/<KeepAlive>\s*<CalibrationWorkspace v-if="page==='calibration'" :maps="maps"\/>\s*<\/KeepAlive>/,'融合标定应使用常驻 KeepAlive 保留页面状态');
  assert.equal(/<KeepAlive v-else-if=/.test(app),false,'KeepAlive 不得再写成 v-else-if 分支');
  assert.ok(app.includes('v-else-if="page!==\'calibration\'"'),'原 v-else 控制台分支应改为 page!==calibration，避免与 KeepAlive 抢渲染');
- for(const page of ['scan','navigate','print','camera','guide'])assert.ok(app.includes(`page==='${page}'`)||app.includes(`page==='${page}'`)||app.includes(`'${page}'`),`原有页面 ${page} 入口不应被破坏`);
+ for(const page of ['scan','navigate','print','camera'])assert.ok(app.includes(`page==='${page}'`),`原有页面 ${page} 入口不应被破坏`);
 });
 
 test('融合标定工作区只读调用标定 API，不出现任何运动/导航指令',()=>{

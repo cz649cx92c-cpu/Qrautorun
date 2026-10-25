@@ -42,6 +42,22 @@ function routeMapSnapshot(source:z.infer<typeof mapSchema>,route:Route){
  const validation=validate(snapshot);if(validation.errors.length)throw new Error('路径快照校验失败：'+validation.errors.join('；'));
  return snapshot;
 }
+// 多张地图共用同一批物理二维码时，定位作用域必须跟着"当前选中的 mapId+mapVersion"走。
+// 这里把判定抽成纯函数，导航放行与前端状态展示共用同一套口径，避免只改提示或误放行。
+export function localizationScopeBlock(mapId:string,mapVersion:number,localization:{mapId?:string,mapVersion?:number,poseAvailable?:boolean}|null|undefined){
+ const loc=localization;
+ if(!loc||!loc.mapId)return '等待定位服务上报当前地图';
+ if(loc.mapId!==mapId||loc.mapVersion!==mapVersion)return '定位地图正在切换：当前锚定 '+(loc.mapId||'未知')+(loc.mapVersion?' v'+loc.mapVersion:'')+'，请等待所选地图 '+mapId+' v'+mapVersion+' 重新锚定';
+ if(loc.poseAvailable!==true)return '定位已切换到当前地图，等待二维码重新锚定';
+ return null;
+}
+export type LocalizationScopePhase='unknown'|'switching'|'waiting-anchor'|'anchored';
+export function localizationScopePhase(exists:boolean,mapId:string,mapVersion:number,localization:{mapId?:string,mapVersion?:number,poseAvailable?:boolean}|null|undefined):LocalizationScopePhase{
+ if(!exists)return 'unknown';
+ const loc=localization;
+ if(!loc||loc.mapId!==mapId||loc.mapVersion!==mapVersion)return 'switching';
+ return loc.poseAvailable===true?'anchored':'waiting-anchor';
+}
 export async function createApp(database?:string) {
  const config=JSON.parse(readFileSync(resolve(root,'config/web.json'),'utf8'));mkdirSync(resolve(root,'maps'),{recursive:true});
  const keyFile=resolve(root,config.bridgeKeyFile);if(!existsSync(keyFile))writeFileSync(keyFile,randomBytes(32).toString('hex'),{mode:0o600});const bridgeKey=readFileSync(keyFile,'utf8').trim();
@@ -243,16 +259,32 @@ export async function createApp(database?:string) {
   const body=z.object({mapId:z.string(),version:z.number().int().positive()}).strict().parse(req.body),item=store.get(body.mapId);
   if(!item||item.version!==body.version)throw new Error('请使用最新的导航地图版本');
   // 同一场地会被重复扫描成多张测试地图，它们共用同一批物理二维码板。
-  // 全局定位只关心“这张图的坐标是否已确认”以及“现场可见板组是否属于这张图”，
-  // 不再要求定位节点当前 mapId 与所选地图严格相等：切换定位地图本身就是重锚。
-  if(item.map.coordinateStatus!=='reviewed')throw new Error('请先确认该地图的扫描坐标，再切换定位地图');
+  // 定位作用域必须跟随"当前选中的地图"：否则切换地图后定位仍锚在旧图上，界面只能显示
+  // "当前定位属于其他地图"并永久卡住。这里只负责让定位跟随选择并清旧原点；
+  // 能否开始导航由 /api/navigation/start 的"坐标已启用+验收+作用域匹配"共同把关，不在此放宽。
   const status=robot.status();if(!status.connected||status.running||Math.abs(status.speed)>.001||!status.chassis.connected||typeof status.chassis.feedback?.vx!=='number'||Math.abs(status.chassis.feedback.vx)>.001||robot.poll().some(c=>c.type==='start'))throw new Error('请在小车停止且底盘反馈在线时切换定位地图');
   const visible=new Set<string>((status.detector?.groups??[]).map((group:{id:string})=>String(group.id))),known=new Set<string>((item.map.groups??[]).map(group=>String(group.id)));
   // 板组不一致只是提示，不拦截：融合节点在没有匹配板组时本来就不会锚定。
   if(visible.size&&!Array.from(visible).some(id=>known.has(id)))log('定位地图切换提示：当前可见板组 '+Array.from(visible).join(',')+' 不在 '+item.map.id+' 内，等待该地图板组');
   const path=resolve(root,'maps/office-confirmed.json'),content=JSON.stringify({map:item.map,version:item.version});
-  if(!existsSync(path)||readFileSync(path,'utf8')!==content){writeFileSync(path+'.tmp',content);renameSync(path+'.tmp',path);log('切换定位地图 '+item.map.id+' v'+item.version);}
-  return {mapId:item.map.id,version:item.version};
+  const previous=existsSync(path)?readFileSync(path,'utf8'):'';
+  const switched=previous!==content;
+  if(switched){writeFileSync(path+'.tmp',content);renameSync(path+'.tmp',path);}
+  const reviewed=item.map.coordinateStatus==='reviewed';
+  log((switched?'切换定位地图 ':'定位地图未变化 ')+item.map.id+' v'+item.version+(reviewed?'':'（坐标来自扫描：未做人工验收）'));
+  return {mapId:item.map.id,version:item.version,coordinateStatus:item.map.coordinateStatus??'draft',reviewed,switched,
+          localization:{mapId:status.localization?.mapId??'',mapVersion:status.localization?.mapVersion??null}};
+ });
+ app.get('/api/localization/scope',req=>{
+  const q=z.object({mapId:z.string().min(1),version:z.coerce.number().int().positive()}).parse(req.query??{});
+  const item=store.get(q.mapId),loc=robot.status().localization??null;
+  const sameMap=!!loc&&loc.mapId===q.mapId,sameVersion=!!loc&&loc.mapVersion===q.version;
+  const phase=localizationScopePhase(!!item,q.mapId,q.version,loc);
+  return {target:{mapId:q.mapId,version:q.version,name:item?.map.name??'',coordinateStatus:item?.map.coordinateStatus??null,
+                  accepted:item?mapApproval(item).accepted:false,isLatest:item?.version===q.version},
+          localization:loc?{mapId:loc.mapId??'',mapVersion:loc.mapVersion??null,state:loc.state,poseAvailable:loc.poseAvailable===true,
+                            navigationReady:loc.navigationReady===true,localEpoch:loc.localEpoch??'',reason:loc.reason??''}:null,
+          matched:sameMap&&sameVersion,phase};
  });
  app.get('/api/tasks',()=> (store.db.prepare('SELECT body FROM tasks ORDER BY updated DESC').all() as {body:string}[]).map(t=>JSON.parse(t.body)));
  app.post<{Params:{id:string}}>('/api/tasks/:id/speeds',(req,reply)=>{
@@ -269,13 +301,16 @@ export async function createApp(database?:string) {
   const {taskId}=z.object({taskId:z.string()}).parse(req.body);const row=store.db.prepare('SELECT body FROM tasks WHERE id=?').get(taskId) as {body:string}|undefined;if(!row)throw new Error('请先保存导航任务');const task=taskSchema.parse(JSON.parse(row.body));const latest=store.get(task.mapId),base=store.get(task.mapId,task.mapVersion),route=task.routeId?store.getRoute(task.routeId):null;if(!latest||!base||latest.version!==task.mapVersion||task.routeId&&(!route||route.mapId!==task.mapId||route.mapVersion!==task.mapVersion||route.mapDigest!==store.digest(base.map)))throw new Error('地图已有修改或执行路径绑定版本不一致，请重新验收并更新任务绑定版本');const item=route?{...base,map:routeMapSnapshot(base.map,route)}:base;
   if(task.routeSnapshot){const snapshot=task.routeSnapshot;if(!route||snapshot.routeId!==task.routeId||snapshot.mapId!==task.mapId||snapshot.mapVersion!==task.mapVersion||snapshot.mapDigest!==store.digest(base.map))throw new Error('任务路径快照与当前地图摘要或版本不一致');item.map=routeMapSnapshot(base.map,snapshot);}
   if(item.map.routeMode==='map-only')throw Object.assign(new Error('请先手动编辑并保存导航路径'),{statusCode:423});
-  const approval=mapApproval(base);
   const strategyBlockers=segmentExecutionBlockers(item.map.motionSegments,{turnInPlace:robot.status().capabilities?.turnInPlace===true});if(strategyBlockers.length)throw Object.assign(new Error('路径策略尚不可执行：'+strategyBlockers.join('；')),{statusCode:423});
   if(item.map.motionSegments?.some(segment=>segment.strategy==='left'||segment.strategy==='right')&&robot.status().mapping?.lateralSupported!==true)throw Object.assign(new Error('横移能力未由当前导航节点确认，禁止执行显式左/右平移策略'),{statusCode:423});
-  if(item.map.captureQuality==='draft'&&!(approval.accepted&&(approval.kind==='user_confirmation'||approval.kind==='office_test')))throw Object.assign(new Error('此地图来自草稿采集，需显式用户确认后才能接纳导航地图'),{statusCode:423});
-  const reasons=robot.status().conditions.filter(c=>!c.ready).map(c=>c.label);if(!approval.accepted)reasons.push('温室地图实测坐标验收或用户确认');
+  // 自用版：坐标直接读取扫描结果，切换地图即视为当前导航地图，不再要求人工"启用/确认坐标"。
+  // 真实安全门逐项保留：位姿/相机/IMU/底盘条件、路径策略、地图与路径版本一致性、定位作用域。
+  if(item.map.captureQuality==='draft')throw Object.assign(new Error('此地图来自草稿采集，请完成正式扫描后再导航'),{statusCode:423});
+  const reasons=robot.status().conditions.filter(c=>!c.ready).map(c=>c.label);
   if(!task.enabled)reasons.push('任务启用');if(!robot.status().connected)reasons.push('ROS2节点连接');if(reasons.length)throw Object.assign(new Error('尚未满足：'+[...new Set(reasons)].join('、')),{statusCode:423});
-  if(!database&&item.map.routeMode==='waypoints'&&(robot.status().localization?.mapId!==item.map.id||robot.status().localization?.mapVersion!==item.version))throw new Error('定位地图正在切换，请等待当前地图定位');const check=validate({...item.map,order:task.rowOrder});if(check.errors.length)throw new Error(check.errors.join('；'));log('请求启动任务 '+taskId);return robot.enqueue('start',{map:item.map,task});
+  // 生产实例(database 为空)必须让定位作用域与任务地图严格一致：同一批二维码被多张地图共用时，
+  // 只比较路线/版本会把"定位仍锚在别的图"当成可执行。单元测试不注入实时定位，故仅生产校验。
+  if(!database){const scopeBlock=localizationScopeBlock(item.map.id,item.version,robot.status().localization);if(scopeBlock)throw Object.assign(new Error(scopeBlock),{statusCode:423});}const check=validate({...item.map,order:task.rowOrder});if(check.errors.length)throw new Error(check.errors.join('；'));log('请求启动任务 '+taskId);return robot.enqueue('start',{map:item.map,task});
  });
  for(const command of ['pause','resume','stop'])app.post('/api/navigation/'+command,()=>{log('请求'+command);return robot.enqueue(command);});
  app.get('/api/logs',()=>store.db.prepare('SELECT stamp,event FROM runtime_log ORDER BY rowid DESC LIMIT 200').all());

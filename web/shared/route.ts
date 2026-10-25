@@ -17,3 +17,21 @@ export const routeSchema=z.object({
  updated:z.string().datetime()
 });
 export type Route=z.infer<typeof routeSchema>;
+
+// Display identity for stored route segments: order by the stable fromId->toId chain,
+// not by the persisted array index. A valid chain round-trips unchanged; a broken or
+// cyclic chain keeps every segment (best effort) so nothing silently disappears.
+export function orderMotionSegmentsByChain<T extends {fromId:number;toId:number}>(segments:T[]):T[]{
+ if(segments.length<2)return segments.slice();
+ const tos=new Set(segments.map(s=>s.toId));
+ const remaining=[...segments];
+ let start=remaining.findIndex(s=>!tos.has(s.fromId));
+ if(start<0)start=0;
+ const ordered:T[]=[remaining.splice(start,1)[0]!];
+ while(remaining.length){
+  const next=remaining.findIndex(s=>s.fromId===ordered[ordered.length-1]!.toId);
+  if(next<0)break;
+  ordered.push(remaining.splice(next,1)[0]!);
+ }
+ return [...ordered,...remaining];
+}

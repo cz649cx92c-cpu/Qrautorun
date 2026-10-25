@@ -2,8 +2,9 @@
 import Konva from 'konva';
 import {onMounted,onBeforeUnmount,ref,watch} from 'vue';
 import type {FieldMap,Point} from '../../../shared/model';
-import {exitPoint,heading,distance} from '../../../shared/model';
+import {exitPoint,heading,distance,orderedTagsById,vehicleFootprintM} from '../../../shared/model';
 import {orthogonalRoute,snapRoutePoint,chainRouteGroups,routeGroupCenters} from '../../../shared/route-design';
+import {orderMotionSegmentsByChain} from '../../../shared/route';
 import {planStrategies,choicesFromSegments,degrees,type SegmentPlan} from '../../../shared/segment-strategy';
 import {Plus,Minus,Scan,MousePointer2} from 'lucide-vue-next';
 import Button from './ui/Button.vue';
@@ -38,14 +39,14 @@ function redraw() {
   const mid=row.points[Math.floor(row.points.length/2)]!;layer.add(new Konva.Text({fontFamily:"QR Sans, QR CJK, sans-serif",x:mid.x*100+12/scale,y:-mid.y*100-26/scale,text:row.name,fontSize:16/scale,fill:'#56616d',listening:false}));
   if(props.editable&&props.tool!=='measure'&&props.rowId===row.id)row.points.forEach((p,i)=>{const [x,y]=px(p),handle=new Konva.Circle({x,y,radius:5/scale,fill:'#f7f8f9',stroke:'#2563a6',strokeWidth:2/scale,draggable:true});handle.on('dragend',()=>emit('point',row.id,i,{x:handle.x()/100,y:-handle.y()/100}));layer.add(handle);});
  }
- for(const [i,segment] of (props.map.motionSegments??[]).entries()){
+ const stored=orderMotionSegmentsByChain(props.map.motionSegments??[]);
+ for(const [i,segment] of stored.entries()){
   if(!segment.points?.length)continue;
   const color=segment.mode==='crab'?'#2563a6':'#2563a6',p=segment.points[Math.floor(segment.points.length/2)]!;
-  layer.add(new Konva.Line({points:segment.points.flatMap(px),stroke:color,strokeWidth:3/scale,listening:false}));
-  layer.add(new Konva.Text({fontFamily:'QR Sans, QR CJK, sans-serif',x:p.x*100+8/scale,y:-p.y*100+8/scale,text:(i+1)+' · '+(segment.mode==='crab'?'平移':segment.direction==='reverse'?'4T4D 倒车':'4T4D 前进'),fontSize:13/scale,fill:color,listening:false}));
+  layer.add(new Konva.Line({name:`segment-${segment.id}`,points:segment.points.flatMap(px),stroke:color,strokeWidth:3/scale,listening:false}));
+  layer.add(new Konva.Text({name:`segment-label-${segment.id}`,fontFamily:'QR Sans, QR CJK, sans-serif',x:p.x*100+8/scale,y:-p.y*100+8/scale,text:(i+1)+' · '+(segment.mode==='crab'?'平移':segment.direction==='reverse'?'4T4D 倒车':'4T4D 前进'),fontSize:13/scale,fill:color,listening:false}));
  }
  // The live trail is drawn on the overlay layer by drawOverlay(), never rebuilt with the map.
- const stored=props.map.motionSegments??[];
  const plans=props.segmentPlans??(stored.length&&stored.every(s=>s.points?.length)?planStrategies([{id:stored[0]!.fromId,...stored[0]!.points[0]!},...stored.map(s=>({id:s.toId,...s.points.at(-1)!}))],stored[0]!.bodyYaw,choicesFromSegments(stored)):[]);
  if(container.value)container.value.dataset.segmentPlans=JSON.stringify(plans.map(p=>({key:p.key,mode:p.mode,effective:p.effective,startYaw:p.startYaw,travelYaw:p.travelYaw,arrivalYaw:p.arrivalYaw,turn:p.turn,blocked:p.blocked,problem:p.problem})));
  // The route stays blue; only the selected segment is painted red along its whole length.
@@ -81,7 +82,7 @@ function redraw() {
   layer.add(new Konva.Line({points,stroke:'#2563a6',strokeWidth:3/scale,dash:[8/scale,8/scale],listening:false}));
   layer.add(new Konva.Line({points,stroke:'#2563a6',strokeWidth:3/scale,dash:[8/scale,8/scale],dashOffset:8/scale,listening:false}));
  }
- for(const t of props.map.tags){const selected=props.selected.includes(t.id)||(props.tool==='route-design'&&!!props.routeGroupIds?.includes(t.id)),[x,y]=px(t);const group=new Konva.Group({name:'tag-'+t.id,x,y,draggable:props.editable&&props.tool==='select'});
+ for(const t of orderedTagsById(props.map.tags)){const selected=props.selected.includes(t.id)||(props.tool==='route-design'&&!!props.routeGroupIds?.includes(t.id)),[x,y]=px(t);const group=new Konva.Group({name:'tag-'+t.id,x,y,draggable:props.editable&&props.tool==='select'});
   const skipped=props.tool==='route-design'&&props.routeSkippedGroups?.some(tag=>tag.id===t.id);
   const size=Math.max(t.size*100,9/scale);group.add(new Konva.Rect({x:-size/2,y:-size/2,width:size,height:size,cornerRadius:2/scale,fill:skipped?'#d97706':selected?'#2563a6':t.kind==='end'?'#2563a6':'#39444f',stroke:selected?'#c9d0d7':'white',strokeWidth:2/scale}));
   group.add(new Konva.Arrow({points:[0,0,Math.cos(t.angle*Math.PI/180)*16/scale,-Math.sin(t.angle*Math.PI/180)*16/scale],pointerLength:4/scale,pointerWidth:4/scale,stroke:'#2563a6',fill:'#2563a6',strokeWidth:1/scale,listening:false}));
@@ -164,15 +165,23 @@ function drawOverlay(){
    vehicleArrow=new Konva.Arrow({name:'live-vehicle-heading',points:[0,0,0,0],listening:false});
    vehicleGroup.add(vehicleBody,vehicleArrow);overlayLayer.add(vehicleGroup);
   }
-  const {length,width}=props.map.vehicle;
+  // The live body is drawn at the real vehicle footprint in world metres (0.46 m x 0.36 m) and
+  // inherits the stage scale, so zooming in grows it together with the map and zooming out shrinks
+  // it. There is no pixel floor and no fixed inflation: the icon can never be painted larger than
+  // the vehicle really is. map.vehicle stays the planning/safety envelope and is deliberately not
+  // used here, and the length below is a body outline, not a wheelbase or track width.
+  const bodyLength=vehicleFootprintM.length*100,bodyWidth=vehicleFootprintM.width*100;
   vehicleGroup.position({x:props.vehicle.x*100,y:-props.vehicle.y*100});
   vehicleGroup.rotation(-props.vehicle.yaw*180/Math.PI);
-  vehicleBody!.setAttrs({x:-length*50,y:-width*50,width:length*100,height:width*100,cornerRadius:5,fill:'#2563a6',stroke:'white',strokeWidth:2/scale});
-  vehicleArrow!.points([0,0,length*50,0]);
-  vehicleArrow!.setAttrs({stroke:'white',fill:'white',strokeWidth:2/scale,pointerWidth:6/scale,pointerLength:6/scale});
+  // base_link anchor: the outline is centred on the group origin and its long side runs along
+  // local +x, i.e. the vehicle's forward axis once the yaw rotation above is applied.
+  vehicleBody!.setAttrs({x:-bodyLength/2,y:-bodyWidth/2,width:bodyLength,height:bodyWidth,cornerRadius:bodyWidth*.16,fill:'#2563a6',stroke:'white',strokeWidth:1.5/scale});
+  // The heading tick ends inside the outline so the stroke can never inflate the footprint.
+  vehicleArrow!.points([0,0,bodyLength*.38,0]);
+  vehicleArrow!.setAttrs({stroke:'white',fill:'white',strokeWidth:1.5/scale,pointerWidth:bodyWidth*.18,pointerLength:bodyWidth*.22});
  }else if(vehicleGroup){vehicleGroup.destroy();vehicleGroup=undefined;vehicleBody=undefined;vehicleArrow=undefined;}
  overlayLayer.batchDraw();
- if(container.value){container.value.dataset.konvaVehicle=vehicleGroup?'1':'0';container.value.dataset.konvaTrailPoints=String(props.trail?.length??0);container.value.dataset.konvaOverlayUpdates=String(++overlayUpdates);}
+ if(container.value){container.value.dataset.konvaVehicle=vehicleGroup?'1':'0';container.value.dataset.konvaVehicleSizeM=vehicleGroup?`${vehicleFootprintM.length}x${vehicleFootprintM.width}`:'';container.value.dataset.konvaTrailPoints=String(props.trail?.length??0);container.value.dataset.konvaOverlayUpdates=String(++overlayUpdates);}
 }
 function pointer():Point{const p=stage.getRelativePointerPosition()!;return {x:p.x/100,y:-p.y/100};}
 function fit(){if(!isMounted||!stage)return;const ps=[...props.map.zone,...props.map.rows.flatMap(r=>r.points),...props.map.tags,...(props.tool==='route-design'?props.drawing:[])];if(!ps.length)return;const xs=ps.map(p=>p.x*100),ys=ps.map(p=>-p.y*100),minX=Math.min(...xs),minY=Math.min(...ys),width=Math.max(...xs)-minX,height=Math.max(...ys)-minY;const scale=Math.min((stage.width()-140)/Math.max(width,100),(stage.height()-120)/Math.max(height,100));stage.scale({x:scale,y:scale});stage.position({x:(stage.width()-width*scale)/2-minX*scale,y:(stage.height()-height*scale)/2-minY*scale});redraw();}

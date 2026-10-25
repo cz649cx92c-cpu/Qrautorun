@@ -11,12 +11,15 @@ import collections
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 from scipy.optimize import least_squares
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT/'src'/'greenhouse_navigation'))
+from greenhouse_navigation.timing_calibration import capture_fingerprint  # noqa: E402
 
 
 def prepare(record, group_id='B000'):
@@ -149,13 +152,17 @@ def analyze(paths):
             reasons.append('Correction did not improve the recorded motion alignment')
     hashes = {name: hashlib.sha256((ROOT/'config'/name).read_bytes()).hexdigest()
               for name in ['camera_calibration.json', 'camera_extrinsics.json', 'camera_preview.json']}
+    # 采集指纹只覆盖影响采集/时间的字段（device/分辨率/帧率等），排除 rotate/hflip/vflip。
+    capture_hashes = {name: capture_fingerprint(ROOT/'config'/name)
+                      for name in ['camera_preview.json']}
     return {'schemaVersion': 1, 'method': 'ground_board_motion_to_local_odometry',
             'timestampSource': 'server_receive_minus_calibrated_relative_delay',
             'relativeTimingVerified': not reasons, 'hardwareExposureTimestampMeasured': False,
             'appliedDelayS': delay, 'delayUncertaintyS': .02,
             'reference': '/qr/odometry/local, host ROS clock',
             'cameraProfile': {'width': 1280, 'height': 720, 'fps': 30},
-            'configurationSha256': hashes, 'runs': runs, 'rejectionReasons': reasons,
+            'configurationSha256': hashes, 'configurationCaptureSha256': capture_hashes,
+            'runs': runs, 'rejectionReasons': reasons,
             'validatedMaximumObservedSpeedMps': max(r['speedMaximumMps'] for r in runs),
             'notes': ['Calibration estimates the effective relative offset of the existing camera and local-odometry pipeline.',
                       'This does not measure a hardware exposure trigger, absolute map accuracy or navigation covariance.',

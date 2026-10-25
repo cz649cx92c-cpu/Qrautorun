@@ -8,7 +8,7 @@ from unittest.mock import patch
 import yaml
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src/greenhouse_navigation'))
-from greenhouse_navigation.control import Pose, wrap
+from greenhouse_navigation.control import Pose, geometry, wrap
 from greenhouse_navigation.mission import Mission
 from greenhouse_navigation.segment_execution import validate_segments
 
@@ -184,12 +184,13 @@ class SegmentExecutionTests(unittest.TestCase):
         self.assertEqual(m.state,'FAULT')
         self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
 
-        # 3) Cross-track beyond max_cross_track_m after the turn keeps the gate.
+        # 3) Cross-track beyond the centering limit after the turn faults instead of
+        #    silently driving on (inside the limit it is corrected with crab centering).
         m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
         self.enter_turn(m,pose)
         first,_,_=self.spin(m,pose)
         self.assertGreater(first.vx,0.)
-        pose.x=m.config['max_cross_track_m']+.02
+        pose.x=m.config.get('centering_max_offset_m',.12)+.05
         command=self.tick(m,pose)
         self.assertEqual(m.state,'FAULT')
         self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
@@ -225,84 +226,122 @@ class SegmentExecutionTests(unittest.TestCase):
         self.assertEqual(m.segment_executor.phase,'TURN')
         self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
 
-    def test_turn_exit_pose_jump_uses_boundary_reference_and_moves_forward(self):
-        # 现场数据：到达 Q193 后原地转 90°，转向期间融合位姿从 (-1.2296,-0.3402)
-        # 跳到 (-1.1904,-0.3145)（约 4.4cm），随后横向门限 5cm 立即 fault，一次都没前进。
+    def _spin_with_drift(self,m,pose,drift_deg=-4.0):
+        """Drive the turn, inject a post-stop residual drift once, then continue."""
+        injected=False
+        for _ in range(600):
+            command=self.tick(m,pose)
+            phase=m.segment_executor.phase
+            pose.yaw+=command.yaw_rate*.05
+            if phase=='TURN_STOP' and not injected:
+                pose.yaw=math.pi/2+math.radians(drift_deg)
+                injected=True
+            if m.state=='FAULT':return None,False
+            if phase=='MOVE':return command,True
+        return None,False
+
+    def _spin_with_offset(self,m,pose,offset_m=0.07,converge=True):
+        """Turn, then simulate crab centering (converge or diverge) until MOVE/fault."""
+        output=[]
+        for _ in range(1200):
+            command=self.tick(m,pose,mode='crab' if m.segment_executor.phase.startswith('CENTER') else None)
+            output.append(command)
+            pose.x+=command.vx*math.cos(pose.yaw)*.05-command.vy*math.sin(pose.yaw)*.05
+            pose.y+=command.vx*math.sin(pose.yaw)*.05+command.vy*math.cos(pose.yaw)*.05
+            pose.yaw+=command.yaw_rate*.05
+            if not converge and m.segment_executor.phase=='CENTER_MOVE':
+                pose.x+=0.003  # 故意向远离目标线方向漂移
+            if m.state=='FAULT':return output,False
+            if m.segment_executor.phase=='MOVE':
+                # 进入 MOVE 的这一周期先从 ALIGN 返回零指令，再取下一周期的真实前进指令。
+                command=self.tick(m,pose)
+                output.append(command)
+                return output,True
+        return output,False
+
+    def test_turn_correction_uses_stricter_tolerance_and_actually_rotates(self):
         m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
-        pose.x=.025  # 边界处已有 2.5cm 横向偏差（在到码容差 6cm 内）
         self.enter_turn(m,pose)
-        for _ in range(300):
-            command=self.tick(m,pose);pose.yaw+=command.yaw_rate*.05
+        first,ok=self._spin_with_drift(m,pose,drift_deg=-4.0)
+        self.assertTrue(ok,'转角修正后必须能进入前进：'+str(m.events))
+        self.assertIsNotNone(first,'转向完成后必须产生前进指令：'+str(m.events))
+        self.assertEqual(first.mode,'4t4d');self.assertGreater(first.vx,0.);self.assertEqual(first.vy,0.)
+        corrections=m.segment_executor.turn_info['corrections']
+        self.assertTrue(corrections,'4.0°残差必须触发真实修正，不能被5°旧门限吞掉：'+str(m.events))
+        for item in corrections:
+            self.assertGreaterEqual(abs(item['deltaDeg']),.2,'每次修正必须有真实姿态变化：'+str(item))
+            self.assertGreaterEqual(item['wzMaxRadps'],.06,'修正必须发出有符号非零wz：'+str(item))
+        self.assertLessEqual(abs(wrap(pose.yaw-math.pi/2)),m.segment_executor.turn_acceptance()+.06)
+        self.assertIn('转角修正', ' | '.join(m.events))
+
+    def test_turn_correction_without_pose_change_faults(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        # 先到 TURN_STOP，再制造 4° 残差漂移触发修正；之后冻结 yaw 模拟“发了wz但姿态没动”。
+        for _ in range(400):
+            command=self.tick(m,pose)
+            pose.yaw+=command.yaw_rate*.05
             if m.segment_executor.phase=='TURN_STOP':break
         self.assertEqual(m.segment_executor.phase,'TURN_STOP',str(m.events))
-        pose.x=.069  # 原地转向期间的位姿估计跳变，而不是指令平移
-        first=None
-        for _ in range(60):
-            command=self.tick(m,pose)
-            if m.segment_executor.phase=='MOVE':first=command;break
-        self.assertIsNotNone(first,'转向后必须产生前进命令：'+str(m.events))
-        self.assertEqual(first.mode,'4t4d');self.assertGreater(first.vx,0.);self.assertEqual(first.vy,0.)
-        events=' | '.join(m.events)
-        self.assertIn('转向期间位姿估计变化',events)
-        self.assertIn('转向出口容差生效',events)
-        for _ in range(10):
-            command=self.tick(m,pose)
-            self.assertEqual(m.segment_executor.phase,'MOVE',str(m.events))
-            self.assertGreater(command.vx,0.,'转向后必须持续前进：'+str(m.events));self.assertEqual(command.vy,0.)
-
-    def test_turn_exit_pose_jump_without_boundary_reference_faults_with_angles(self):
-        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
-        self.enter_turn(m,pose)
-        for _ in range(300):
-            command=self.tick(m,pose);pose.yaw+=command.yaw_rate*.05
-            if m.segment_executor.phase=='TURN_STOP':break
-        pose.x=.07  # 转向开始时边界偏差是 0，跳变 7cm 不能被“参考”掉
+        pose.yaw=math.pi/2+math.radians(4.0)
         command=None
         for _ in range(30):
             command=self.tick(m,pose)
-            if m.state=='FAULT' or m.segment_executor.phase=='MOVE':break
-        self.assertEqual(m.state,'FAULT')
-        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
-        events=' | '.join(m.events)
-        self.assertIn('横向偏差',events);self.assertIn('目标角',events)
-
-    def test_turn_exit_reference_window_expiry_still_faults(self):
-        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
-        pose.x=.025;self.enter_turn(m,pose)
-        for _ in range(300):
-            command=self.tick(m,pose);pose.yaw+=command.yaw_rate*.05
-            if m.segment_executor.phase=='TURN_STOP':break
-        pose.x=.069
-        # 位姿冻结（横向误差始终不收敛）：出口容差窗口用尽后必须停车，不能无限走。
-        for _ in range(400):
-            command=self.tick(m,pose)
             if m.state=='FAULT':break
         self.assertEqual(m.state,'FAULT')
-        self.assertIn('转向出口容差前进已用尽', ' | '.join(m.events))
-        self.assertEqual((command.vx,command.vy), (0.,0.))
+        self.assertIn('未产生姿态变化', ' | '.join(m.events))
+        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
 
-    def test_turn_residual_warning_reports_target_and_measured(self):
-        # 现场实测残差 -4.89°（在 5° 容差内但实际少转约 4.9°）：应先微调，再前进。
-        m,pose=setup([self.turn_forward_segment()],start_yaw=math.pi/2-math.radians(4.5))
-        self.enter_turn(m,pose)
-        first,_,_=self.spin(m,pose)
-        self.assertGreater(first.vx,0.,str(m.events))
-        self.assertLessEqual(abs(wrap(pose.yaw-math.pi/2)),m.segment_executor.turn_acceptance_warn()+.06)
-        events=' | '.join(m.events)
-        self.assertIn('转角修正',events)
-        self.assertIn('到码转向完成：目标',events)
-        self.assertIn('实测',events)
-
-    def test_turn_timeout_reports_angles_and_blocks_forward(self):
+    def test_turn_exit_centering_converges_then_moves_forward(self):
         m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
         self.enter_turn(m,pose)
-        self.now+=m.config['turn_timeout_s']+.1
-        command=self.tick(m,pose)
+        pose.x=.07  # 转向出口相对目标直线偏差 7cm（超过5cm门限，未超对中上限）
+        self.assertEqual(m.segment_executor.phase,'TURN',str(m.events))
+        outputs,ok=self._spin_with_offset(m,pose,.07,converge=True)
+        self.assertTrue(ok,'横移对中必须收敛并进入前进：'+str(m.events))
+        self.assertTrue(m.segment_executor.exit_info.get('converged'),str(m.segment_executor.exit_info))
+        self.assertTrue(m.segment_executor.centering_info.get('done'),str(m.segment_executor.centering_info))
+        last=outputs[-1]
+        self.assertEqual(last.mode,'4t4d');self.assertGreater(last.vx,0.);self.assertEqual(last.vy,0.)
+        cross,_,_,_=geometry(pose,m.segment_executor.segment['points'])
+        self.assertLessEqual(abs(cross),m.config['max_cross_track_m']+.01)
+
+    def test_turn_exit_centering_divergence_faults(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        pose.x=.07
+        outputs,ok=self._spin_with_offset(m,pose,.07,converge=False)
         self.assertEqual(m.state,'FAULT')
-        events=' | '.join(m.events)
-        self.assertIn('到码转向超时',events);self.assertIn('目标',events)
-        self.assertIn('容差',events);self.assertIn('未达到目标角',events)
-        self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
+        self.assertIn('横移对中方向异常', ' | '.join(m.events))
+        self.assertEqual((outputs[-1].vx,outputs[-1].vy),(0.,0.))
+
+    def test_turn_exit_beyond_centering_limit_faults(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        pose.x=.14
+        command=None
+        for _ in range(200):
+            command=self.tick(m,pose)
+            pose.yaw+=command.yaw_rate*.05
+            if m.state=='FAULT':break
+        self.assertEqual(m.state,'FAULT')
+        self.assertIn('超过对中上限', ' | '.join(m.events))
+        self.assertEqual((command.vx,command.vy),(0.,0.))
+
+    def test_crab_unavailable_faults_instead_of_forced_forward(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        m.config['existing_chassis_confirmed']=False
+        m.config['existing_runtime_conditions_accepted']=False
+        self.enter_turn(m,pose)
+        pose.x=.07
+        command=None
+        for _ in range(200):
+            command=self.tick(m,pose)
+            pose.yaw+=command.yaw_rate*.05
+            if m.state=='FAULT':break
+        self.assertEqual(m.state,'FAULT')
+        self.assertIn('无法正交对中', ' | '.join(m.events))
+        self.assertEqual((command.vx,command.vy),(0.,0.))
 
     def test_received_feedback_aliases_do_not_add_command_modes(self):
         for mode,body,steering in [('4t4d',5,5),('4t4d',5,6),('4t4d',6,6),('crab',7,7),('crab',8,7)]:
@@ -435,5 +474,136 @@ class SegmentExecutionTests(unittest.TestCase):
         with self.assertRaises(ValueError):validate_segments([bad])
         bad=segment((0,0),(.3,0));bad['bodyYaw']=math.pi
         with self.assertRaises(ValueError):validate_segments([bad])
+
+    # ---- localization-jump mitigation regressions (real 20:33:29 Q177->Q161 run) ----
+    @staticmethod
+    def jump_segment():
+        return {'id':'jump','fromId':0,'toId':1,'mode':'4t4d','direction':'forward',
+                'strategy':'turn_forward','bodyYaw':0.,'endYaw':0.,'wheelAngle':0.,
+                'points':[{'x':0.,'y':0.},{'x':.3,'y':0.}]}
+
+    def jump_setup(self):
+        m,pose=setup([self.jump_segment()],start_yaw=0.)
+        m.field['groups']=[{'id':'B0','referenceId':0,'members':[{'id':i} for i in range(16)]}]
+        ex=m.segment_executor
+        ex.phase='MOVE';ex.turn_done=True
+        m.state='FORWARD';m.mode='4t4d';m.target_angle=0.;m.stable=0;m.last_sample=None
+        pose.x=0.;pose.y=.0365;pose.yaw=0.
+        return m,pose
+
+    def jump_tick(self,m,pose,observations,vx=.05,vy=0.,mode='4t4d'):
+        self.now+=.05;self.seq+=1
+        crab=mode=='crab'
+        fb={'seq':self.seq,'aggregate_received':self.now,'speed':abs(vx),'vx':vx,'vy_raw':vy,
+            'body_gear':8 if crab else 6,'steering_gear':7 if crab else 5,'steering_angle':0.,
+            'angle_source':'existing_chassis','angles':[0.]*4}
+        return m.tick(pose,fb,observations,[],.05)
+
+    @staticmethod
+    def low_quality_observations():
+        return [{'id':1,'groupId':'B0','visibleCount':1,'sigma':.04}]
+
+    @staticmethod
+    def high_quality_observations():
+        return [{'id':1,'groupId':'B0','visibleCount':16,'sigma':.008}]
+
+    def test_low_quality_single_code_jump_does_not_fault_on_first_frame(self):
+        m,pose=self.jump_setup()
+        self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+        # real replay: Q161 1/16 visible; cross jumps 3.65 -> 5.09 cm in one update
+        pose.y=.0509
+        command=self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+        self.assertNotEqual(m.state,'FAULT','低质量单码更新不应单帧直接 FAULT：'+str(m.events))
+        self.assertEqual(command.mode,'4t4d')
+        self.assertGreater(command.vx,0.)
+        self.assertEqual(command.vy,0.)
+        jump=getattr(m.segment_executor,'localization_jump',{})
+        self.assertTrue(jump.get('decision','').startswith('suspected'),jump)
+        self.assertEqual(jump.get('tagId'),1)
+        self.assertEqual((jump.get('visible'),jump.get('total')),(1,16))
+        self.assertAlmostEqual(jump.get('deltaCrossM'),.0144,places=4)
+        self.assertTrue(jump.get('degraded'))
+        self.assertEqual(m.segment_executor.exit_info.get('localizationJump',{}).get('reasonCode'),'localization_jump_suspected')
+
+    def test_low_quality_jump_confirmation_window_times_out_to_fault(self):
+        m,pose=self.jump_setup()
+        self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+        pose.y=.0509
+        self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+        self.assertNotEqual(m.state,'FAULT')
+        for _ in range(60):
+            self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+            if m.state=='FAULT':break
+        self.assertEqual(m.state,'FAULT','连续低质量/窗口超时必须 FAULT：'+str(m.events))
+        jump=getattr(m.segment_executor,'localization_jump',{})
+        self.assertIn(jump.get('decision',''),('fault_timeout','fault_low_quality'))
+
+    def test_low_quality_jump_beyond_hard_cross_limit_faults(self):
+        m,pose=self.jump_setup()
+        self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+        pose.y=.10
+        self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+        self.assertEqual(m.state,'FAULT','超过跳变硬上限必须 FAULT：'+str(m.events))
+
+    def test_high_quality_real_cross_error_still_faults(self):
+        m,pose=self.jump_setup()
+        self.jump_tick(m,pose,self.high_quality_observations(),vx=.05,vy=0.)
+        pose.y=.0509
+        self.jump_tick(m,pose,self.high_quality_observations(),vx=.05,vy=0.)
+        self.assertEqual(m.state,'FAULT','高质量观测下真实 cross>5cm 必须 FAULT')
+
+    def test_low_quality_jump_with_chassis_vy_faults(self):
+        m,pose=self.jump_setup()
+        self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+        pose.y=.0509
+        self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=.05)
+        self.assertEqual(m.state,'FAULT','底盘存在横向速度时不得继续忽略：'+str(m.events))
+
+    def test_low_quality_jump_with_heading_error_faults(self):
+        m,pose=self.jump_setup()
+        self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+        pose.y=.0509;pose.yaw=.2
+        self.jump_tick(m,pose,self.low_quality_observations(),vx=.05,vy=0.)
+        self.assertEqual(m.state,'FAULT','航向异常时不得继续忽略：'+str(m.events))
+
+    def test_high_quality_normal_forward_still_moves(self):
+        m,pose=self.jump_setup()
+        pose.y=.03
+        command=self.jump_tick(m,pose,self.high_quality_observations(),vx=.05,vy=0.)
+        self.assertNotEqual(m.state,'FAULT')
+        self.assertEqual(m.segment_executor.phase,'MOVE')
+        self.assertGreater(command.vx,0.);self.assertEqual(command.vy,0.)
+
+
+    def test_low_quality_jump_does_not_cancel_active_centering_immediately(self):
+        m,pose=self.jump_setup()
+        ex=m.segment_executor
+        ex.phase='CENTER_MOVE'
+        ex.centering={'start_cross':.06,'start_pose':(pose.x,pose.y),'started':self.now,'moved':0.}
+        ex.centering_info={'required':True,'startCrossM':.06,'done':False,'mode':'crab','travelM':0.}
+        m.mode='crab';m.target_angle=0.;pose.y=.06
+        self.jump_tick(m,pose,self.low_quality_observations(),mode='crab')
+        pose.y=.075
+        command=self.jump_tick(m,pose,self.low_quality_observations(),mode='crab')
+        self.assertNotEqual(m.state,'FAULT','对中期间低质量单码更新不应取消对中或直接 FAULT：'+str(m.events))
+        self.assertEqual(command.mode,'crab')
+        self.assertTrue(getattr(ex,'localization_jump',{}).get('decision','').startswith('suspected'))
+        self.assertEqual(ex.centering_info.get('localizationJump',{}).get('reasonCode'),'localization_jump_suspected')
+        # A following high-quality observation confirms the pose; centering continues.
+        for _ in range(2):
+            self.jump_tick(m,pose,self.high_quality_observations(),mode='crab')
+        self.assertNotEqual(m.state,'FAULT','高质量观测确认后应继续对中，而不是越过对中安全状态：'+str(m.events))
+
+
+    def test_quality_unknown_cross_error_stops_conservatively(self):
+        m,pose=self.jump_setup()
+        unknown=[{'id':1}]
+        self.jump_tick(m,pose,unknown,vx=.05,vy=0.)
+        pose.y=.0509
+        self.jump_tick(m,pose,unknown,vx=.05,vy=0.)
+        self.assertEqual(m.state,'FAULT','质量字段缺失时不得启用跳变缓解，必须保守停车：'+str(m.events))
+        jump=getattr(m.segment_executor,'localization_jump',{})
+        self.assertEqual(jump.get('reasonCode'),'localization_jump_quality_unknown')
+
 
 if __name__=='__main__':unittest.main(verbosity=2)

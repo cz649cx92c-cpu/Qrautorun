@@ -54,7 +54,7 @@ test('旧库迁移不改 versions/tasks/acceptances，长ID、幂等及无tasks�
  const empty=new Store(':memory:');const route=first[0]!;empty.saveRoute(route);empty.deleteRoute(route.routeId);assert.deepEqual(empty.listRoutes(),[]);empty.close();rmSync(folder,{recursive:true,force:true});
 });
 
-test('任务使用保存路线快照，导航拒绝旧地图、无验收、损坏摘要和disabled（机器人替身）',async()=>{
+test('任务使用保存路线快照，导航拒绝旧地图、损坏摘要和disabled（机器人替身）',async()=>{
  const folder=join(process.cwd(),'logs','editor-ux-v3-safe-'+process.pid+'-'+Date.now());mkdirSync(folder,{recursive:true});const path=join(folder,'safe.db');
  const oldStatus=RobotLink.prototype.status,oldEnqueue=RobotLink.prototype.enqueue;const commands:any[]=[];
  RobotLink.prototype.status=function(){return {...oldStatus.call(this),connected:true,running:false,conditions:[{id:'mock',label:'纯软件替身',ready:true}]};};
@@ -68,7 +68,8 @@ test('任务使用保存路线快照，导航拒绝旧地图、无验收、损�
   const replace=(value:any)=>db.prepare('UPDATE tasks SET body=? WHERE id=?').run(JSON.stringify(value),task.id);
   replace({...task,enabled:false});assert.equal((await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:task.id}})).statusCode,423);
   replace({...task,routeSnapshot:{...task.routeSnapshot,mapDigest:'0'.repeat(64)}});assert.equal((await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:task.id}})).statusCode,400);
-  replace(task);const acceptance=db.prepare('SELECT * FROM acceptances WHERE map_id=? AND version=1').get(map.id) as any;db.prepare('DELETE FROM acceptances WHERE map_id=?').run(map.id);assert.equal((await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:task.id}})).statusCode,423);db.prepare('INSERT INTO acceptances VALUES(?,?,?,?)').run(acceptance.map_id,acceptance.version,acceptance.digest,acceptance.body);
-  assert.equal((await app.inject({method:'POST',url:'/api/maps',payload:{map,baseVersion:1}})).statusCode,200);const stale=await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:task.id}});assert.equal(stale.statusCode,400);assert.match(stale.body,/地图已有修改/);assert.equal(commands.length,1);
+  // 自用版：切图即生效，acceptance 记录不再是导航放行条件（前端也不再要求点击启用）。
+  replace(task);db.prepare('DELETE FROM acceptances WHERE map_id=?').run(map.id);assert.equal((await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:task.id}})).statusCode,200,'没有验收记录也不得阻止导航');
+  assert.equal((await app.inject({method:'POST',url:'/api/maps',payload:{map,baseVersion:1}})).statusCode,200);const stale=await app.inject({method:'POST',url:'/api/navigation/start',payload:{taskId:task.id}});assert.equal(stale.statusCode,400);assert.match(stale.body,/地图已有修改/);assert.equal(commands.length,2,'只有两次合法启动可以入队');
  }finally{db.close();await app.close();RobotLink.prototype.status=oldStatus;RobotLink.prototype.enqueue=oldEnqueue;rmSync(folder,{recursive:true,force:true});}
 });

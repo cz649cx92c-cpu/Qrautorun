@@ -12,6 +12,11 @@ export const ruleSchema = z.object({id:z.string().min(1).max(80),state:z.enum(st
 export const tagSchema = z.object({id:z.number().int().min(0).max(586),groupId:z.string().optional(),rowId:z.string().max(80),x:number,y:number,angle:number,size:z.number().min(0.02).max(0.18),kind:z.enum(['entry','end','waypoint','reference','exit']),rules:z.array(ruleSchema).max(30)});
 export const rowSchema = z.object({id:z.string().min(1).max(80),name:z.string().min(1).max(80),width:z.number().min(0.41).max(5),start:pointSchema.optional(),points:z.array(pointSchema).min(2).max(1000),exitDistance:z.number().min(0.4).max(10)});
 export const motionSegmentSchema=z.object({id:z.string().min(1).max(80),fromId:z.number().int().min(0).max(586),toId:z.number().int().min(0).max(586),mode:z.enum(['4t4d','crab']),direction:z.enum(['forward','reverse','lateral']),executionProfile:z.literal('recorded_slow_trial').optional(),strategy:strategyModeSchema.optional(),bodyYaw:number,endYaw:number,wheelAngle:z.number().finite().min(-90).max(90),points:z.array(pointSchema).min(2).max(1000)});
+// 地图画布用的真实车体外形（长 0.46 m × 宽 0.36 m），只决定「画多大」，不参与任何计算。
+// 注意：map.vehicle 仍是规划/安全包络（带 margin，参与 validate() 的行宽余量和退出距离校验），
+// 两者故意分开——显示外形不得放宽或收紧导航安全门；这里的长度也不是轮距/轴距，底盘运动学
+// 仍由 config/navigation.yaml 与底盘反馈决定。
+export const vehicleFootprintM = {length:0.46,width:0.36} as const;
 export const mapSchema = z.object({schemaVersion:z.literal(1),id:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),name:z.string().min(1).max(100),frame:z.literal('map'),family:z.literal('tag36h11'),source:z.enum(['design','survey']),coordinateStatus:z.enum(['draft','reviewed']).default('draft'),captureQuality:z.enum(['verified','draft']).optional(),routeMode:z.enum(['rows','waypoints','map-only']).optional(),motionSegments:z.array(motionSegmentSchema).min(1).max(100).optional(),rows:z.array(rowSchema).max(100),tags:z.array(tagSchema).max(587),groups:groupsSchema.optional(),order:z.array(z.string()).max(100),zone:z.array(pointSchema).length(4),vehicle:z.object({width:z.number().min(0.1).max(1),length:z.number().min(0.2).max(3),margin:z.number().min(0.01).max(0.1)}),notes:z.string().max(2000).default('')}).superRefine((map,ctx)=>{
  if(map.routeMode==='map-only'&&(map.rows.length||map.order.length||map.motionSegments||map.tags.length===0||map.tags.some(t=>t.rowId||t.rules.length)))ctx.addIssue({code:z.ZodIssueCode.custom,message:'定位码地图需要有效点位且不能包含导航路径或动作'});
  if(map.motionSegments){
@@ -103,3 +108,7 @@ export function validate(map:FieldMap):{errors:string[],warnings:string[]} {
 export function paths(map:FieldMap) {
  return map.order.map((id,i)=>{const r=map.rows.find(r=>r.id===id)!;const next=map.rows.find(r=>r.id===map.order[i+1]);return {rowId:id,forward:[exitPoint(r),...r.points],reverse:[...r.points].reverse().concat([exitPoint(r)]),lateral:next?[exitPoint(r),exitPoint(next)]:[],bodyYaw:heading(r),reverseBodyYaw:heading(r)};});
 }
+
+// Stable display identity for localization points: never rely on the stored array
+// order, and never treat this order as a navigation route order.
+export const orderedTagsById=<T extends {id:number}>(tags:T[]):T[]=>[...tags].sort((a,b)=>a.id-b.id);
