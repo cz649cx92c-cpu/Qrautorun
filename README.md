@@ -1,36 +1,74 @@
 # QR 导航控制台
 
-基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端采用 Vue 3、TypeScript 和 Konva，Web 服务采用 Fastify，导航执行集成 ROS 2/Python。
+> **当前分支：`v1`**（代码提交 `9c205fb`，仓库首个提交，**没有上一版本可对比**）
+> `main` / `v2` 之后的所有分支都在本分支基础上继续演进；本分支只代表最初交付的基线。
+> 本页内容由一次**仅改 README** 的文档提交更新；分支最新 SHA 见 `git log -1`。
 
-## 功能
+基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端 Vue 3 + TypeScript + Konva，Web 服务 Fastify，导航执行 ROS 2 / Python。
 
-- 手柄示教扫描、地图整理、坐标确认与版本保存。
-- 建图后可在地图上设计横平竖直路线，支持吸附、拖动、撤销、测距和任务同步。
-- 商业化蓝白控制台、五步工作流、使用指南、统计卡片和高级诊断。
-- 多码定位板 SVG/PDF、默认开启的 0.15 mm 中心十字对位线，以及 50 mm 校对尺。
-- 相机实时预览、标定和导航运行状态。
+## 本版本内容（`9c205fb`，根提交）
 
-## 启动
+这是仓库的初始导入，一次提交带进全部基线代码，因此「新增」就是整个工程本身。
+按目录可核对：`config/` 19 项、`scripts/` 51 项、`src/` 43 项、`tests/` 85 项、
+`web/` 52 项、`docs/` 24 篇。
 
-安装本项目依赖后运行：
+### 界面与交互
+
+- 商业化蓝白控制台（`web/frontend/src/style.css`、`components/ui/Button.vue`）。
+- **五步工作流条**（`components/WorkflowSteps.vue`）与**使用指南**页（`components/UserGuide.vue`）。
+- 地图画布 `components/MapCanvas.vue`：二维码点位、路线、测距、拖动。
+- 建图后**正交路径编辑器**：在地图上直接画横平竖直的路线，支持吸附、拖动、撤销。
+- 扫描记录管理 `components/ScanRecords.vue`；实时摄像头预览 `components/CameraPreview.vue`；
+  定位标定 `components/CameraCalibration.vue`。
+
+### 打印与定位板
+
+- 批量打印 `components/BatchPrint.vue`、单张/整组 PDF `components/PdfGenerator.vue`。
+- 官方 tag36h11 码本，ID 0–586；整组 PDF 带 0.15 mm **中心十字对位线**与 50 mm 校对尺。
+- 打印文件 `prints/` 随仓库保留。
+
+### 后端与导航
+
+- Fastify + better-sqlite3 + zod：地图版本、任务、验收证据、扫描会话
+  （`web/backend/src/{server,store,survey,scan-map}.ts`）。
+- ROS 2 导航节点 `src/greenhouse_navigation/`：状态机
+  （IDLE / INITIALIZING / FORWARD / ROW_END / REVERSE / ROW_EXIT / SWITCH_TO_LATERAL /
+  LATERAL_SHIFT / SWITCH_TO_ACKERMANN / NEXT_ROW / FINISHED / FAULT）、
+  四轮里程计、局部 EKF、全局二维码校正、AprilTag 检测。
+- 服务托管 `scripts/service_manager.py`、`scripts/start*.sh` / `stop*.sh`。
+
+## 使用入口
+
+| 入口 | 说明 |
+| --- | --- |
+| `http://<Pi-IP>:3080` | 主控制台 |
+| `?page=camera` | 直接打开摄像头预览 |
+| `./scripts/start.sh` / `./scripts/start_robot.sh` | 分别启动 Web 与 ROS2 桥（后者默认只读） |
+
+## 已知限制（本分支）
+
+- 导航执行默认只读，必须 `--enable-execution` 显式开启，且仍需在网页点「开始导航」。
+- 定位精度未标定（`covariance_calibrated=false`），不提供精度保证或合规认证。
+- 没有独立障碍物检测 / 自动避障。
+- 商业化流程较重：扫描名 / 路径名 / 姓名需手填，坐标需两步人工确认（后续版本才简化）。
+- 本分支不含 v2 的沿途定位组自动串联，路径必须手工串联。
+
+## 安装与启动
 
 ```bash
 npm ci
-./scripts/start.sh
+npm run build                      # vue-tsc + tsc + vite build
+./scripts/start.sh                 # 只启动 Web（http://localhost:3080）
+./scripts/start.sh --foreground    # 前台调试
+./scripts/stop.sh
+./scripts/start_robot.sh           # 托管 ROS2 反馈 / 状态机 / Web 桥，默认只读
+./scripts/stop_robot.sh
 ```
 
-访问 `http://localhost:3080`。`scripts/start.sh` 会同时托管扫描相关服务；仅启动 Web 可使用 `./scripts/start.sh --foreground`。首次部署须按下方说明完成设备、ROS 环境及标定配置。仓库保留前端 `web/frontend/dist/`，修改前端后运行 `cd web/frontend && npm run build`。
+开发验证：`npm test`；浏览器回归 `npx playwright test`。
 
-开发验证：`npm test`；浏览器回归使用 `node_modules/.bin/playwright test --config tests/browser/ui-commercial.config.ts distance.spec.ts route-editor.spec.ts ui-restyle.spec.ts guide.spec.ts`。
-
-## 版本
-
-- **v1**：建图后正交路径编辑器、商业化控制台 UI、五步工作流、使用指南、PDF 中心十字对位线及对应单元/API/浏览器测试。
-- **v2**：将在 v1 基础上加入沿途定位组自动串联、逐码纠正语义与自动串码操作。
-
-定位板打印文件 `prints/` 当前不足 50 MB，随仓库保留。可用 `node --import tsx scripts/generate_batch_print.ts` 重新生成打印资料。
-
-数据库、运行日志、依赖缓存、备份和 `config/bridge.key` 不入库；部署时需自行配置本机密钥。下面保留既有设备与运行说明。
+数据库、运行日志、依赖缓存、备份和 `config/bridge.key` 不入库。
+下面保留既有设备与运行说明。
 
 ---
 
