@@ -1,40 +1,67 @@
 # QR 导航控制台
 
-基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端采用 Vue 3、TypeScript 和 Konva，Web 服务采用 Fastify，导航执行集成 ROS 2/Python。
+> **当前分支：`v2`**（代码提交 `59246f9`）
+> 上一版本：`v1`（`9c205fb`）
+> ⚠️ 本分支与 `main` 的**代码基线是同一个提交** `59246f9`。本次重写 README 后两者各自多了一次
+> **仅改 README** 的文档提交，因此 SHA 不同，但**代码逐字节相同**（`git diff v2 main -- . ':(exclude)README.md'` 为空）。
+> 本页内容由一次**仅改 README** 的文档提交更新；分支最新 SHA 见 `git log -1`。
 
-## 功能
+基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端 Vue 3 + TypeScript + Konva，Web 服务 Fastify，导航执行 ROS 2 / Python。
 
-- 手柄示教扫描、地图整理、坐标确认与版本保存。
-- 建图后可在地图上设计横平竖直路线，支持吸附、拖动、撤销、测距和任务同步。
-- 商业化蓝白控制台、五步工作流、使用指南、统计卡片和高级诊断。
-- 多码定位板 SVG/PDF、默认开启的 0.15 mm 中心十字对位线，以及 50 mm 校对尺。
-- 相机实时预览、标定和导航运行状态。
+## v2 改动（相对 `v1` / `9c205fb`）
 
-## 启动
+15 个文件，`+536 / −317`。
 
-安装本项目依赖后运行：
+### 沿途定位组自动串联与逐码纠正
+
+- `web/shared/route-design.ts`（+117）：沿途 10 cm 内且能保持水平/垂直直线的组中心成为节点；
+  自动按二维码顺序串成一条正交路线。
+- `web/backend/src/route-design.ts`（+46 / −…）：服务端同步这套串联规则，前后端口径一致。
+- `web/frontend/src/components/MapCanvas.vue`（+22）：
+  **偏离码橙色标记**并在串联时跳过；节点数 / 跳过数徽章；端点自动吸附。
+- `web/frontend/src/App.vue`（+37）：串联结果接入路径编辑流程。
+- `web/frontend/src/components/UserGuide.vue`（+7）：补充串联说明。
+- 新增回归 `tests/route-design.test.ts`（+65）、`tests/browser/route-editor.spec.ts`（+51）。
+
+### 不变的部分
+
+- Python 运行时校验、状态机、运动控制、安全门一行未改。
+- 码间段**始终是直线**，每个串联码都是独立纠正节点；自动串码不会在两个码之间偷偷加直角换向。
+- 长度、采样点数、航向及执行器限制仍然有效。
+
+## 使用入口
+
+| 入口 | 说明 |
+| --- | --- |
+| `http://<Pi-IP>:3080` | 主控制台；路径编辑页可看到自动串联结果 |
+| `?page=camera` | 直接打开摄像头预览 |
+| `./scripts/start.sh` / `./scripts/start_robot.sh` | 启动 Web / ROS2 桥（后者默认只读） |
+
+## 已知限制（本分支）
+
+- 自动串联只在**正交网格**上成立：拐弯或折返处必须有定位组，斜向布置会被跳过。
+- 仍需手填扫描名 / 路径名，坐标仍需两步人工确认（v8 才简化）。
+- 导航执行默认只读，必须 `--enable-execution` 显式开启；定位精度未标定，
+  不提供精度保证或合规认证；没有独立避障。
+
+## 安装与启动
 
 ```bash
 npm ci
-./scripts/start.sh
+npm run build
+./scripts/start.sh                 # 只启动 Web（http://localhost:3080）
+./scripts/start.sh --foreground    # 前台调试
+./scripts/stop.sh
+./scripts/start_robot.sh           # 默认只读
+./scripts/start_robot.sh --enable-execution
+./scripts/stop_robot.sh
 ```
 
-访问 `http://localhost:3080`。`scripts/start.sh` 会同时托管扫描相关服务；仅启动 Web 可使用 `./scripts/start.sh --foreground`。首次部署须按下方说明完成设备、ROS 环境及标定配置。仓库保留前端 `web/frontend/dist/`，修改前端后运行 `cd web/frontend && npm run build`。
+开发验证：`npm test`；浏览器回归 `npx playwright test`。
 
-开发验证：`npm test`；浏览器回归使用 `node_modules/.bin/playwright test --config tests/browser/ui-commercial.config.ts distance.spec.ts route-editor.spec.ts ui-restyle.spec.ts guide.spec.ts`。
-
-## 版本
-
-- **v1**：建图后正交路径编辑器、商业化控制台 UI、五步工作流、使用指南、PDF 中心十字对位线及对应单元/API/浏览器测试。
-- **v2**：沿途定位组自动串联与逐码纠正；沿途 10 cm 内且可保持水平/垂直直线的中心成为节点，偏离码橙色标记并跳过，支持自动串码、节点/跳过数徽章和端点自动吸附。Python 运行时校验保持不变。
-
-v2 发布验收：`npm test` 105 项全通过；路径编辑、测距、商业 UI/PDF 与指南 Playwright 共 27 项全通过（含 375px / 760px 窄屏）。
-
-码间段始终为直线，每个串联码都是独立纠正节点。请按正交网格铺设，拐弯或折返处须有定位组。自动串码不会在两个码之间偷偷加入直角换向。长度、采样点数、航向及执行器限制仍有效。
-
-定位板打印文件 `prints/` 当前不足 50 MB，随仓库保留。可用 `node --import tsx scripts/generate_batch_print.ts` 重新生成打印资料。
-
-数据库、运行日志、依赖缓存、备份和 `config/bridge.key` 不入库；部署时需自行配置本机密钥。下面保留既有设备与运行说明。
+定位板打印文件 `prints/` 当前不足 50 MB，随仓库保留。
+数据库、运行日志、依赖缓存、备份和 `config/bridge.key` 不入库。
+下面保留既有设备与运行说明。
 
 ---
 
