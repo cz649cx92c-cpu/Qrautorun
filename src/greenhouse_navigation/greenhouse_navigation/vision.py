@@ -3,6 +3,11 @@ import math
 import cv2
 import numpy as np
 from .board_geometry import validate_boards
+try:
+    from .diag_log import get as _diag_get
+    _diag = _diag_get('vision')
+except Exception:
+    _diag = None
 
 
 def calibration_board_diagnostic(gray, target):
@@ -73,7 +78,7 @@ def camera_parameters(data, width=None, height=None):
 
 
 def solve_board_pose(board, detections, k, d, rotation, translation,
-                     max_reprojection=1.5, max_distance=1., max_ground_height=.08):
+                     max_reprojection=1.5, max_distance=1., max_ground_height=.08, diag=None):
     correspondence = board_correspondences(board, detections)
     if correspondence is None:
         return None
@@ -140,6 +145,18 @@ def solve_board_pose(board, detections, k, d, rotation, translation,
                 np.linalg.norm(best[1][:2]-alternate[1][:2])>.02 or abs(yaw_difference)>.1):
             return None
     error, point, yaw, rvec, tvec, jacobian = best
+    member_rms = None
+    if diag is not None:
+        # 旁路诊断：最优解下逐子码四角重投影 RMS（真实角点-projectPoints），不影响选解与过滤。
+        try:
+            projected_best, _ = cv2.projectPoints(objects, rvec, tvec, k, d)
+            _diff = projected_best.reshape(-1, 2) - pixels
+            member_rms = [float(np.sqrt(np.mean(np.sum(_diff[i*4:(i+1)*4]**2, axis=1))))
+                          for i in range(len(ids))]
+            rejected_ids = sorted(set(correspondence[2]) - set(ids))
+        except Exception:
+            member_rms = None
+            rejected_ids = []
     pixel_noise = max(.5,error)
     j = jacobian[:,:6]
     covariance = np.linalg.pinv(j.T @ j)*pixel_noise**2
@@ -156,9 +173,21 @@ def solve_board_pose(board, detections, k, d, rotation, translation,
     penalty = math.sqrt(len(board['members'])/len(ids))
     if len(ids)==1:
         penalty = max(1.5,penalty)
-    return {'id':board['referenceId'], 'groupId':board['id'], 'memberIds':ids,
+    result_sigma=max(.01*penalty,position_sigma); result_angle_sigma=max(.02*penalty,yaw_sigma)
+    result={'id':board['referenceId'], 'groupId':board['id'], 'memberIds':ids,
             'visibleCount':len(ids), 'detectedCount':detected_count,
             'rejectedMemberIds':sorted(set(correspondence[2])-set(ids)),
             'x':float(point[0]), 'y':float(point[1]), 'angle':yaw,
-            'sigma':max(.01*penalty,position_sigma), 'angleSigma':max(.02*penalty,yaw_sigma),
+            'sigma':result_sigma, 'angleSigma':result_angle_sigma,
             'size':board['sizeMm']/1000, 'reprojectionPx':error}
+    if _diag is not None and member_rms is not None:
+        try:
+            _diag.write({'type':'boardPnp','diag':diag,'groupId':board['id'],'referenceId':board['referenceId'],
+                'memberIds':list(ids),'memberReprojPx':[round(v,4) for v in member_rms],
+                'rejectedMemberIds':sorted(set(correspondence[2])-set(ids)),
+                'rejectedReproj':'unavailable:noCorrespondence',
+                'reprojRmsPx':round(error,4),'sigma':result_sigma,'angleSigma':result_angle_sigma,
+                'visibleCount':len(ids),'detectedCount':detected_count})
+        except Exception:
+            pass
+    return result

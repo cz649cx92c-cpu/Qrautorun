@@ -719,7 +719,18 @@ class SegmentExecutor:
     def move_command(self,pose,fb,observations,dt):
         """Generate the ordinary segment command after all live safety gates."""
         m=self.m;s=self.segment;zero=self.zero()
-        if not self.mode_ready(fb):m.fault('区间运行中底盘模式或轮角反馈不匹配');return zero
+        if not self.mode_ready(fb):
+            try:
+                from .diag_log import get as _diag_get
+                _diag_get('control').write({'type':'modeMismatchDetail','segment':[s['fromId'],s['toId']],
+                    'phase':self.phase,'bodyGear':fb.get('body_gear'),'steerGear':fb.get('steering_gear'),
+                    'anglesRaw':fb.get('angles_raw'),'steerAngle':fb.get('steering_angle'),
+                    'seq':fb.get('seq'),'aggregateReceived':fb.get('aggregate_received'),
+                    'vx':fb.get('vx'),'recv':round(time.time(),6),
+                    'action':'protectiveStopRootCauseUnfixed'})
+            except Exception:
+                pass
+            m.fault('区间运行中底盘模式或轮角反馈不匹配');return zero
         points=s['points'];cross,tangent,remaining,end=geometry(pose,points)
         # 二维码间的连续推算与提前纠偏：预测横向偏差不等 END_STOP 才处理。
         cross,dr_action=self.dr_update(pose,fb,observations,dt,cross,remaining)

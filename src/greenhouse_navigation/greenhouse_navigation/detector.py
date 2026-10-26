@@ -152,7 +152,8 @@ class GroundDetector(Node):
                         pose=solve_board_pose(board,detections,k,d,rotation,translation,
                             self.get_parameter('max_reprojection_px').value,
                             self.get_parameter('max_tag_distance_m').value,
-                            self.get_parameter('max_ground_height_m').value)
+                            self.get_parameter('max_ground_height_m').value,
+                            diag={'stamp':stamp,'recv':round(time.time(),6)})
                         if pose is not None:tags.append(pose)
                     verified=True
                 except Exception as error:reason='缺少安装外参或位姿计算失败：'+str(error)

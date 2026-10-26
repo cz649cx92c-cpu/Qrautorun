@@ -1,5 +1,18 @@
 # 变更记录
 
+## v9 — 2026-10-26
+
+仅新增后台诊断旁路（不改控制数学/门限/EKF/IMU/地图/相机，不加前端面板）。详见 README「v9 改动」与 `logs/diagnostics/measurement-v9/`。
+
+- 新增 `diag_log.py`：异步有界队列 JSONL，20MB 分片/200MB 会话上限 + `diag-alert.jsonl` 告警，队列满与 IO 失败只计数不抛出，`QR_DIAG_DISABLE=1` 可关。
+- `vision.py`/`detector.py`：最优解上逐子码四角真实重投影 RMS、memberIds、被拒子码标记、整组 RMS 与 sigma/角度 sigma、采集/接收时间；求解与选解不变。
+- `localization.py`：`correction_update` 只读 audit（innovation/门限/接受拒绝原因/gain/后验/delta），`observe()` 记录聚类丢弃与早返回原因；原更新行为与门限不变。
+- `node.py`/`segment_execution.py`：`chassisFeedback`（15Hz+异常帧）、`command`（tick 输出）、`modeMismatchDetail`（fault 前快照）；fault 行为零改动。
+- 测试新增：test_diag_log 6/6、test_diag_innovation 6/6、test_diag_vision_member_rms 4/4；回归 7 套 OK；既有失败 test_segment_execution 3、test_existing_chassis_feedback 3 未修复。
+- 前端无新增面板；一并提交 v8 遗留的 0.46 m × 0.36 m 车体图标已构建 dist。
+- 缺口：未采集最终 send 回执/四轮速度；16:20 第 7 段 FAULT 根因未证实（保护未改）。
+- 已知问题（拟 v10）：DR 预测链三项——vy_raw 未换 SI、yaw_deg(deg/s)被当角增量、rebase/stale 用融合 pose stamp 判 QR 新鲜度。
+
 ## v8 — 2026-10-25
 
 自用版界面、切图即生效、相机预览 180° 与时序标定解耦、二维码区间连续纠偏。详见 `docs/26_v8自用版与二维码间连续纠偏.md`。

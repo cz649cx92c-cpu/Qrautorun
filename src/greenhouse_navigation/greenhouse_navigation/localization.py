@@ -17,6 +17,11 @@ from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
 from yhs_can_interfaces.msg import ChassisInfoFb
 from .control import wrap
+try:
+    from .diag_log import get as _diag_get
+    _diag = _diag_get('localization')
+except Exception:
+    _diag = None
 from .board_geometry import collapse_group_observations,validated_board_observations,validate_boards
 
 
@@ -52,19 +57,37 @@ def process_covariance_increment(previous,current,dt,position_noise,angle_noise,
     return np.diag([position_noise**2,position_noise**2,angle_noise**2])*dt
 
 
-def correction_update(estimate,covariance,observed,noise,max_innovation=.2):
+def correction_update(estimate,covariance,observed,noise,max_innovation=.2,audit=None):
     if not all(np.all(np.isfinite(v)) for v in (estimate,covariance,observed,noise)):
+        if audit is not None:audit.append({'accepted':False,'reason':'nonFiniteInput'})
         return None
     if np.any(np.linalg.eigvalsh(covariance)<=0) or np.any(np.linalg.eigvalsh(noise)<=0):
+        if audit is not None:audit.append({'accepted':False,'reason':'nonPositiveCovariance'})
         return None
     innovation=np.asarray(observed)-estimate;innovation[2]=wrap(innovation[2])
     total=covariance+noise
-    if (np.linalg.norm(innovation[:2])>max_innovation or abs(innovation[2])>.3
-            or innovation@np.linalg.solve(total,innovation)>11.34):return None
+    gate_position=np.linalg.norm(innovation[:2])>max_innovation
+    gate_yaw=abs(innovation[2])>.3
+    gate_mahalanobis=innovation@np.linalg.solve(total,innovation)>11.34
+    if (gate_position or gate_yaw or gate_mahalanobis):
+        if audit is not None:
+            reason=('positionOver'+str(max_innovation) if gate_position else
+                    'yawOver0.3rad' if gate_yaw else 'mahalanobisOver11.34')
+            audit.append({'accepted':False,'reason':reason,
+                'innovation':[float(innovation[0]),float(innovation[1]),float(innovation[2])],
+                'positionThresholdM':max_innovation,'yawThresholdRad':.3,'mahalanobisThreshold':11.34})
+        return None
     gain=np.linalg.solve(total.T,covariance.T).T
     result=estimate+gain@innovation;result[2]=wrap(result[2]);identity=np.eye(3)
     posterior=(identity-gain)@covariance@(identity-gain).T+gain@noise@gain.T
-    return result,(posterior+posterior.T)/2
+    posterior=(posterior+posterior.T)/2
+    if audit is not None:
+        audit.append({'accepted':True,'innovation':[float(innovation[0]),float(innovation[1]),float(innovation[2])],
+            'positionThresholdM':max_innovation,'yawThresholdRad':.3,'mahalanobisThreshold':11.34,
+            'gain':[[float(x) for x in row] for row in gain],
+            'posterior':[float(posterior[i][i]) for i in range(3)],
+            'delta':[float(result[0]-estimate[0]),float(result[1]-estimate[1]),float(wrap(result[2]-estimate[2]))]})
+    return result,posterior
 
 
 def finite_number(value):
@@ -316,9 +339,13 @@ class GlobalLocalization(Node):
     def observe(self,msg):
         try:
             data=json.loads(msg.data);stamp=float(data['stamp']);now=self.get_clock().now().nanoseconds/1e9
-            if data.get('calibrated') is not True or data.get('synchronized') is not True or data.get('frame')!='base_link' or not 0<=now-stamp<=self.get_parameter('max_observation_age_s').value:return
+            if data.get('calibrated') is not True or data.get('synchronized') is not True or data.get('frame')!='base_link' or not 0<=now-stamp<=self.get_parameter('max_observation_age_s').value:
+                if _diag is not None:_diag.write({'type':'observeSkip','reason':'invalidMetaOrStale','stamp':stamp,'now':now,'recv':round(time.time(),6)})
+                return
             local=self.local_at(stamp)
-            if local is None or self.last is None:return
+            if local is None or self.last is None:
+                if _diag is not None:_diag.write({'type':'observeSkip','reason':'noLocalTimeCoverage' if local is None else 'noPriorEstimate','stamp':stamp,'recv':round(time.time(),6)})
+                return
             if data.get('representation')=='board-centers':
                 tags=validated_board_observations(data['tags'],self.boards,data.get('groupLayouts',[]))
             else:
@@ -332,14 +359,38 @@ class GlobalLocalization(Node):
                 angle_sigma=max(.02,float(t.get('angleSigma',.02)))
                 position_sigma=math.hypot(max(.01,float(t['sigma'])),math.hypot(t['x'],t['y'])*angle_sigma)
                 candidates.append((candidate,position_sigma,angle_sigma))
-            if not candidates:return
+            if not candidates:
+                if _diag is not None:_diag.write({'type':'observeSkip','reason':'noQualifiedCandidate','stamp':stamp,'recv':round(time.time(),6)})
+                return
             position=np.median(np.array([p for p,_,_ in candidates])[:,:2],axis=0)
-            candidates=[(p,s,a) for p,s,a in candidates if np.linalg.norm(p[:2]-position)<.08]
+            kept=[(p,s,a) for p,s,a in candidates if np.linalg.norm(p[:2]-position)<.08]
+            if _diag is not None:_diag.write({'type':'observeCluster','stamp':stamp,'recv':round(time.time(),6),
+                'candidates':len(candidates),'kept':len(kept),'droppedByConsensus':len(candidates)-len(kept),
+                'mapId':self.field.get('id'),'mapVersion':self.map_version,
+                'epoch':getattr(getattr(self,'anchor',None),'epoch','')})
+            if not kept:
+                if _diag is not None:_diag.write({'type':'observeSkip','reason':'consensusFilteredAll','stamp':stamp,'recv':round(time.time(),6)})
+                return
+            candidates=kept
             accepted=False
             for observed,sigma,angle_sigma in candidates:
-                if self.estimate is None:self.estimate=observed.copy();self.covariance=np.diag([sigma**2,sigma**2,angle_sigma**2]);accepted=True;continue
+                audit=[] if _diag is not None else None
+                if self.estimate is None:
+                    self.estimate=observed.copy();self.covariance=np.diag([sigma**2,sigma**2,angle_sigma**2]);accepted=True
+                    if audit is not None:
+                        audit.append({'accepted':True,'reason':'firstEstimate','delta':[0.,0.,0.],'posterior':[sigma**2,sigma**2,angle_sigma**2]})
+                    if _diag is not None:_diag.write({'type':'innovation','source':'synchronized_qr','stamp':stamp,
+                        'recv':round(time.time(),6),'mapId':self.field.get('id'),'mapVersion':self.map_version,
+                        'epoch':getattr(getattr(self,'anchor',None),'epoch',''),'audit':audit})
+                    continue
                 update=correction_update(self.estimate,self.covariance,observed,
-                    np.diag([sigma**2,sigma**2,angle_sigma**2]),self.get_parameter('max_innovation_m').value)
+                    np.diag([sigma**2,sigma**2,angle_sigma**2]),self.get_parameter('max_innovation_m').value,audit=audit)
+                if _diag is not None:
+                    for a in audit:
+                        a.update({'source':'synchronized_qr','stamp':stamp,'recv':round(time.time(),6),
+                            'mapId':self.field.get('id'),'mapVersion':self.map_version,
+                            'epoch':getattr(getattr(self,'anchor',None),'epoch','')})
+                        _diag.write({'type':'innovation','record':a})
                 if update is None:continue
                 self.estimate,self.covariance=update
                 accepted=True

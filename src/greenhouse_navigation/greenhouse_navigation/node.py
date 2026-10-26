@@ -168,6 +168,21 @@ class GreenhouseNode(Node):
         # independent steering sequence/timestamp. Body arrivals cannot prove
         # steering freshness or alignment; retain the angle for diagnostics.
         aligned=False if existing else (angles is not None and all(abs(a-target)<self.config['angle_tolerance_deg'] for a in angles))
+        self._fb_frame=getattr(self,'_fb_frame',0)+1
+        _bg=int(msg.ctrl_fb.ctrl_fb_gear); _sg=int(msg.steering_ctrl_fb.steering_ctrl_fb_gear)
+        _dev=max((abs(v) for v in raw), default=0.)
+        if self._fb_frame%5==0 or _bg not in (5,6) or _sg not in (5,6) or _dev>3.0:
+            try:
+                from .diag_log import get as _diag_get
+                ctl=_diag_get('control')
+                ctl.write({'type':'chassisFeedback','frame':self._fb_frame,'seq':self.seq,
+                    'bodyGear':_bg,'steerGear':_sg,'steerAngle':steering_angle,
+                    'anglesRaw':[float(v) for v in raw],'vx':float(msg.ctrl_fb.ctrl_fb_x_linear),
+                    'unlock':bool(msg.io_fb.io_fb_unlock),'estop':bool(msg.io_fb.io_fb_estop),
+                    'remote':bool(msg.io_fb.io_fb_joypad_ctrl),
+                    'headerStamp':stamp,'recv':round(time.time(),6)})
+            except Exception:
+                pass
         self.feedback={'seq':self.seq,'aggregate_received':self.received,'vx':float(msg.ctrl_fb.ctrl_fb_x_linear),'vy_raw':float(msg.ctrl_fb.ctrl_fb_y_linear),'yaw_deg':float(msg.ctrl_fb.ctrl_fb_z_angular),'speed':max(math.hypot(msg.ctrl_fb.ctrl_fb_x_linear,msg.ctrl_fb.ctrl_fb_y_linear*(.1 if existing else 1.)),abs(msg.steering_ctrl_fb.steering_ctrl_fb_velocity),*(abs(v) for v in wheels)),'angles_raw':raw,'angles':angles,'steering_angle':steering_angle,'angle_source':'existing_chassis' if existing else 'four_wheels','steering_seq':None,'steering_received':None,'steering_fresh':False,'steering_aligned_diagnostic':steering_aligned,'steering_gear':int(msg.steering_ctrl_fb.steering_ctrl_fb_gear),'body_gear':int(msg.ctrl_fb.ctrl_fb_gear),'estop':bool(msg.io_fb.io_fb_estop),'remote_control':bool(msg.io_fb.io_fb_joypad_ctrl),'charge_state':bool(msg.io_fb.io_fb_charge_state or msg.bms_flag_fb.bms_flag_fb_charge_flag),'unlock':bool(msg.io_fb.io_fb_unlock),'lateral_aligned':aligned,'field_freshness_verified':self.config['field_freshness_verified']}
         if hasattr(self,'motion_records'):
             fusion=getattr(self,'fusion',None) or {}
@@ -642,6 +657,23 @@ class GreenhouseNode(Node):
             # Display diagnostics must never interrupt mission decisions or command output.
             diagnostic_sample={'status':'unavailable','reason':'执行诊断数据暂不可用','sampledAt':diagnostic_time}
         cmd=self.mission.tick(self.pose,self.feedback or {},observations,conditions,dt,localization=self.localization_status or {})
+        self._cmd_frame=getattr(self,'_cmd_frame',0)+1
+        try:
+            from .diag_log import get as _diag_get
+            ctl=_diag_get('control')
+            _active=abs(getattr(cmd,'vx',0.))+abs(getattr(cmd,'vy',0.))+abs(getattr(cmd,'wz',0.))>1e-9
+            if _active or self._cmd_frame%50==0 or getattr(self,'_last_cmd_active',False):
+                fbk=self.feedback or {}
+                ctl.write({'type':'command','frame':self._cmd_frame,
+                    'vx':getattr(cmd,'vx',None),'vy':getattr(cmd,'vy',None),'wz':getattr(cmd,'wz',None),
+                    'mode':getattr(cmd,'mode',None),
+                    'fb':{'seq':fbk.get('seq'),'bodyGear':fbk.get('body_gear'),'steerGear':fbk.get('steering_gear'),
+                          'vx':fbk.get('vx'),'anglesRaw':fbk.get('angles_raw'),'steerAngle':fbk.get('steering_angle'),
+                          'unlock':fbk.get('unlock'),'estop':fbk.get('estop'),'remote':fbk.get('remote_control')},
+                    'recv':round(time.time(),6)})
+            self._last_cmd_active=_active
+        except Exception:
+            pass
         while self.mission.job_requests:self.job_pub.publish(String(data=json.dumps(self.mission.job_requests.pop(0),ensure_ascii=False)))
         if cmd.mode=='4t4d':
             executor=getattr(self.mission,'segment_executor',None)

@@ -7,6 +7,42 @@
 
 基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端 Vue 3 + TypeScript + Konva，Web 服务 Fastify，导航执行 ROS 2 / Python。
 
+## v9 改动（相对 `v8` / `7d96cac`）— 2026-10-26
+
+v9 **只新增后台诊断旁路**，不改任何控制数学、门限、EKF/IMU/地图/相机参数，不加前端面板或按钮。目的：让 QR 观测质量、融合实际 innovation、控制指令与故障快照可从日志复核，不再靠推断。
+
+### 1. 专用诊断日志（不影响实时控制）
+- 新增 `src/greenhouse_navigation/greenhouse_navigation/diag_log.py`：异步有界队列写 JSONL，单文件 20MB 滚动（保留 `.1`），会话总量上限 200MB 后停写并在同目录 `diag-alert.jsonl` 写 `sessionCapReached` 告警；队列满计 `dropped`、IO 失败计 `writeErrors`，**不向控制/视觉回调抛异常**；`QR_DIAG_DISABLE=1` 可整体关闭。
+- 输出目录：`logs/diagnostics/measurement-v9/<会话时间>/`，与 9 分钟滚动覆盖的 `navigation.jsonl` 分离；不写数据库、无凭据。
+
+### 2. 逐子码真实重投影 RMS（`vision.py` / `detector.py`）
+- 在最优板解上对每个参与子码四角 `projectPoints` 后按 member 分组求 RMS，日志含：板 ID/referenceId、memberIds、逐码 RMS、被拒子码 ID（无投影数据标 `unavailable:noCorrespondence`）、整组 RMS、sigma/angleSigma、采集 stamp/接收时间。
+- **不改变 PnP 求解、RANSAC、选解、权重、过滤及发布字典**；逐码 RMS 只进日志。
+
+### 3. 融合 innovation 实际记录（`localization.py`）
+- `correction_update` 增加只读 `audit` 参数（原数学逐行不变，单测与参考实现零容差同值）：记录 innovation dx/dy/dyaw、位置/航向/马氏门限、接受或拒绝的具体原因（`positionOver0.2` / `yawOver0.3rad` / `mahalanobisOver11.34` / `nonFiniteInput` / `nonPositiveCovariance`）、gain、后验协方差、实际 delta。
+- `observe()` 旁路记录预测/观测/噪声、聚类丢弃数、早返回原因（`invalidMetaOrStale` / `noLocalTimeCoverage` / `noPriorEstimate` / `noQualifiedCandidate` / `consensusFilteredAll`）、mapId/version/epoch。
+- **不改变更新行为与门限**；融合位姿不被替换成"独立 QR"。
+
+### 4. 控制侧实况（`node.py` / `segment_execution.py`）
+- `chassisFeedback`：15Hz 节流 + 异常帧全记（body/steer gear、四轮 `anglesRaw`、steerAngle、vx、unlock/estop/remote、headerStamp/接收时间）。
+- `command`：记录 **mission.tick 输出**的 vx/vy/wz/mode 与同刻反馈快照。
+- `modeMismatchDetail`：`move_command` 模式/轮角不匹配分支的故障前快照（gear/四轮角/steering/seq/headerStamp），**fault 触发行为零改动**。
+
+### 5. 前端与 dist
+- 前端**无新增面板/按钮/遥测 schema 变更**；本次一并提交 v8 遗留的 0.46 m × 0.36 m 车体图标已构建 dist（`web/frontend/dist/`）。
+
+### 6. 测试与部署
+- 新增 `tests/test_diag_log.py`（6/6）、`tests/test_diag_innovation.py`（6/6）、`tests/test_diag_vision_member_rms.py`（4/4）全绿。
+- 相关回归：turn_recenter / boundary_centering / dead_reckoning / vision / correction / static_localization / motion_interface 全 OK；`test_segment_execution` 3 个与 `test_existing_chassis_feedback` 3 个失败为改动前基线既有，未修复。
+- 部署只重启 vision/localization/robot 三个消费者（保持 executionEnabled）；web/fusion/imu 未动；build 为 symlink-install，未跑 colcon build。
+
+### 7. 明确缺口与已知问题（不夸大）
+- **未采集**：最终 send 回执（CAN 层实际帧）与四轮速度字段——当前 `command` 是 tick 输出、`chassisFeedback` 无 wheels；因此"轮速是否反号 / 制动沿程分歧是否复现"仍不足以判定。
+- **未根治**：2026-10-26 16:20 第 7 段“底盘模式或轮角反馈不匹配”FAULT 的真实根因未证实；v9 未去抖、未放宽容差、未屏蔽 FAULT，保护保持。
+- **已知缺陷（拟在 v10 修复，本次 v9 未修）**：DR 预测链三项——(a) `dr_integrate` 与 jump 门限把 `vy_raw` 当 SI 用（应为 raw×0.1，`chassis_odometry`/`localization` 已按 SI）；(b) `yaw_deg` 实为底盘角速度 deg/s，却被当绝对角做 `yaw_deg-last_yaw_deg` 差分积分；(c) `dr_try_rebase`/`stale` 用融合 pose 的 header stamp 判 QR 新鲜度，QR 缺失时被融合 pose 不断刷新。
+- 不声称精度优于 10 mm、不声称合规或替代外部实测；所有 mm 仍是相对规划线/地图的模型量。
+
 ## v8 改动（相对 `v7` / `700459c`）
 
 48 个文件，`+3120 / −1871`。下面每一条都能在本分支的提交差异里逐项核对。
