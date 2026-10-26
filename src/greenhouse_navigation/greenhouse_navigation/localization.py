@@ -17,6 +17,7 @@ from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
 from yhs_can_interfaces.msg import ChassisInfoFb
 from .control import wrap
+from .dr_anchor import build_anchor_event
 try:
     from .diag_log import get as _diag_get
     _diag = _diag_get('localization')
@@ -274,6 +275,8 @@ class GlobalLocalization(Node):
         self.preview_pub=self.create_publisher(Odometry,'/qr/localization/provisional',10)
         self.static_pub=self.create_publisher(Odometry,'/qr/localization/static_pose',10)
         self.status_pub=self.create_publisher(String,'/qr/localization/status',10)
+        self.anchor_event_pub=self.create_publisher(String,'/qr/localization/accepted_anchor',10)
+        self.anchor_event_seq=0
         self.tf=TransformBroadcaster(self) if self.get_parameter('publish_tf').value else None
         self.create_timer(.05,self.status)
         self.create_timer(.5,self.reload_map)
@@ -379,6 +382,7 @@ class GlobalLocalization(Node):
                     self.estimate=observed.copy();self.covariance=np.diag([sigma**2,sigma**2,angle_sigma**2]);accepted=True
                     if audit is not None:
                         audit.append({'accepted':True,'reason':'firstEstimate','delta':[0.,0.,0.],'posterior':[sigma**2,sigma**2,angle_sigma**2]})
+                    self.publish_anchor_event('firstEstimate',stamp,sigma,local)
                     if _diag is not None:_diag.write({'type':'innovation','source':'synchronized_qr','stamp':stamp,
                         'recv':round(time.time(),6),'mapId':self.field.get('id'),'mapVersion':self.map_version,
                         'epoch':getattr(getattr(self,'anchor',None),'epoch',''),'audit':audit})
@@ -394,8 +398,28 @@ class GlobalLocalization(Node):
                 if update is None:continue
                 self.estimate,self.covariance=update
                 accepted=True
+                self.publish_anchor_event('update',stamp,sigma,local)
             if accepted:self.last_tag=stamp;self.formal_origin=True
         except (ValueError,KeyError,TypeError,AttributeError):self.get_logger().warning('已拒绝不合法标记观测')
+
+    def publish_anchor_event(self,kind,source_stamp,sigma,local_ref):
+        """真正接受 QR 校正处发布内用锚事件（含真实 scope/后验/局部里程参照）。"""
+        try:
+            if self.estimate is None or self.last is None:return
+            self.anchor_event_seq+=1
+            pose=[float(self.estimate[0]),float(self.estimate[1]),float(self.estimate[2])]
+            # 严格同刻：后验 estimate 由 local=self.last 的传播更新，localRef 必须取同一 self.last
+            local_pose=self.last[1]
+            ref=(float(local_pose[0]),float(local_pose[1]),float(local_pose[2]),float(self.last[0]))
+            event=build_anchor_event(kind,'%s-%d'%(getattr(self,'map_switch_seq',0),self.anchor_event_seq),
+                source_stamp,self.field.get('id'),self.map_version,
+                getattr(getattr(self,'anchor',None),'epoch',''),getattr(self,'map_switch_seq',0),
+                pose,sigma,ref,time.monotonic(),posterior_stamp=float(self.last[0]))
+            event['recvWall']=round(time.time(),6)
+            self.anchor_event_pub.publish(String(data=json.dumps(event,ensure_ascii=False)))
+            if _diag is not None:_diag.write({'type':'acceptedAnchor','event':event})
+        except Exception:
+            pass
 
     def publish(self,msg,local):
         if not self.formal_origin:return

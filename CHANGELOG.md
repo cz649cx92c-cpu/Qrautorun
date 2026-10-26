@@ -1,5 +1,18 @@
 # 变更记录
 
+## v10 — 2026-10-26（已推送 `refs/heads/v10`）
+
+三项 DR 预测源与其锚/时间链修复；不改 EKF/IMU/地图/相机/速度/安全阈值，无前端改动。
+
+- A 横向 SI：`vy_mps=raw*0.1`（existing 才换算，缺失=None 不伪造 0）；`feedback_lateral_velocity()` 唯一消费；DR/jump 吃 SI。
+- B 航向：订阅 `/qr/odometry/local`；`local_yaw_step()` epoch/source 身份先于 duplicate，倒序/过期/换 epoch 清基准；`dr_integrate` 失效冻结 xy/yaw，恢复仅重建基准并需新 accepted 锚；底盘 z_angular 仅诊断。
+- C 锚事件链：localization 在真正接受 QR 校正处发布 `/qr/localization/accepted_anchor`（correctionId、源 stamp、真实 mapId+mapVersion+epoch、同刻 posteriorStamp/localRef、sigma、recv）；node 补 `recvMonoLocal` 并透传；`dr_anchor.py` 校验 scope/版本/epoch/同刻/新鲜/去重；`propagate_anchor` 修正为 SE2 `R(anchorYaw-refYaw)`（旧版仅 refYaw=0 偶然正确）；无裸观测重锚；可见但被拒绝不主动纠偏；初始无有效事件不锚定、不纠偏；机械预算独立 `mechanicalCorrections`，原次数/距离/时间/航向/5cm 硬限保留，无 de-bounce。
+- 诊断：`vyRaw/vyMps/yawSource/...`、`qrSourceStamp/drDecision/...`、`acceptedAnchor`。
+- 测试：test_v10_chain 18（SE2 全象限/同刻/时钟域/scope/重复/可见拒绝/13s 无码/yaw 冻结）、test_dr_v10 14、test_centering_v10 3、test_dead_reckoning 11；其余相关套件全绿；基线既有失败 test_segment_execution 3、test_existing_chassis_feedback 3。
+- 实跑暴露接线缺口修复（19:36）：`node.local_odom_cb` 未存 x/y → `propagate_anchor` 返回 `badLocalOdom:x` → 全程 no_anchor/qr_visible_rejected、CENTER 0。已补 x/y 与有限性/frame/四元数校验，诊断补 `localX/localY/localEpoch/drAnchorValid/drAnchorRejectReason/drCorrections/drMechanicalCorrections`；新增 `test_v10_integration.py` 5 例（真实消息→实际回调→actual tick→dr_try_rebase，RED→GREEN）；诊断 bag 启动脚本改 `set +u` 修复跨 SSH 存活（SIGINT 优雅收尾）。
+- 运动语义修正（19:58）：撤销 DR 中途与到码/转向出口的自动 crab 横移；4T4D 保持 vy=0、用既有 tracker 有界左右转向纠偏（QR 失联时以预测 cross 为唯一横向反馈）；到码残余在 5cm 硬门内直接进入下一计划动作，超硬门停车；显式 crab 路线、原地 TURN/TURN_RECENTER 保留。测试新增/迁移（no_auto_lateral 4、boundary 8、centering/DR/chain 断言迁移），基线 3+3 不变。
+- 只重载 robot/bridge。已在该版本完成一次自动运行：20:06:46→20:08:38 FINISHED（7/7 段）；内部定位估计终点距目标约 11.5mm（前段日志轮转缺失、1Hz 内部估计，非外部实测）；4T4D 转向实车效果/长期精度未验证；不声称所有超限都继续、不声称全部 <10mm；16:20 FAULT 根因未证。
+
 ## v9 — 2026-10-26
 
 仅新增后台诊断旁路（不改控制数学/门限/EKF/IMU/地图/相机，不加前端面板）。详见 README「v9 改动」与 `logs/diagnostics/measurement-v9/`。

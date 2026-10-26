@@ -32,13 +32,14 @@ class DeadReckoningTests(unittest.TestCase):
     def feedback(self, mode='4t4d', angle=0., speed=0., vx=None, vy=0., yaw_deg=0.):
         self.seq += 1
         return {'seq': self.seq, 'aggregate_received': self.now, 'speed': speed,
-                'vx': speed if vx is None else vx, 'vy_raw': vy, 'yaw_deg': yaw_deg,
+                'vx': speed if vx is None else vx, 'vy_mps': vy, 'vy_raw': vy * 10., 'yaw_deg': yaw_deg,
                 'body_gear': 8 if mode == 'crab' else 6,
                 'steering_gear': 7 if mode == 'crab' else 5, 'steering_angle': angle,
                 'angle_source': 'existing_chassis', 'angles': [angle] * 4}
 
-    def tick(self, m, pose, speed=0., vx=None, vy=0., yaw_deg=0., observations=None, stamp=None):
+    def tick(self, m, pose, speed=0., vx=None, vy=0., yaw_deg=0., observations=None, stamp=None, qr_stamp=None):
         self.now += .05
+        self._loco_stamp = getattr(self, '_loco_stamp', 100.0) + .05
         mode = m.mode
         ex = getattr(m, 'segment_executor', None)
         if ex is not None and ex.phase.startswith('CENTER'):
@@ -49,7 +50,25 @@ class DeadReckoningTests(unittest.TestCase):
         obs = observations if observations is not None else [{'id': m.segment_executor.segment['fromId']}]
         if stamp is not None:
             pose.stamp = stamp
-        return m.tick(pose, fb, obs, [], .05)
+        mloc = m.localization if isinstance(m.localization, dict) else {}
+        loc = {'mapId': mloc.get('mapId') or (m.field or {}).get('id'), 'localEpoch': mloc.get('localEpoch') or 'E1',
+               'localOdom': {'x': pose.x, 'y': pose.y, 'yaw': pose.yaw, 'stamp': self._loco_stamp,
+                             'recvMono': self.now, 'epoch': 'E1', 'wz': 0.}}
+        accepted = any(isinstance(o, dict) and o.get('groupId') for o in obs) and qr_stamp != 'reject'
+        if accepted:
+            loc['qrRaw'] = {'sourceStamp': qr_stamp if qr_stamp is not None else pose.stamp,
+                            'recvMono': self.now, 'localEpoch': loc['localEpoch'], 'mapId': loc['mapId']}
+            self._anchor_seq = getattr(self, '_anchor_seq', 0) + 1
+            loc['qrAnchor'] = {'kind': 'update', 'correctionId': 'ev%d' % self._anchor_seq,
+                               'sourceStamp': qr_stamp if qr_stamp is not None else pose.stamp,
+                               'recvMono': self.now, 'recvMonoLocal': self.now,
+                               'posteriorStamp': self._loco_stamp - .05,
+                               'mapId': loc['mapId'], 'mapVersion': 5,
+                               'localEpoch': loc['localEpoch'], 'scopeGeneration': 1,
+                               'anchorPose': [pose.x, pose.y, pose.yaw], 'sigma': .008,
+                               'localRef': {'x': pose.x, 'y': pose.y, 'yaw': pose.yaw,
+                                            'stamp': self._loco_stamp - .05}}
+        return m.tick(pose, fb, obs, [], .05, localization=loc)
 
     def enter_move(self, m, pose, stamp=1.0):
         pose.stamp = stamp
@@ -57,106 +76,90 @@ class DeadReckoningTests(unittest.TestCase):
             self.tick(m, pose, stamp=stamp)
             if m.segment_executor.phase == 'MOVE':
                 break
-        # DR 在首个真正执行 move_command 的 MOVE tick 建立，再推 2 帧确保激活
+        # DR 在首个 MOVE tick 建立；再用一次被接受的 QR 事件建立有效锚（v10 禁止任意 pose 锚定）
         for _ in range(2):
             self.tick(m, pose, stamp=stamp, speed=.08, vx=.08)
+        self.tick(m, pose, stamp=stamp, speed=.08, vx=.08,
+                  observations=[{'id': m.segment_executor.segment['toId'], 'groupId': 'B0',
+                                 'visibleCount': 16, 'sigma': .008}])
         if m.segment_executor.phase != 'MOVE':
             self.fail(str(m.events))
         assert m.segment_executor.dr_state is not None, str(m.events)
 
     # ---------- 1. 无 QR：IMU+轮速识别横向趋势并有限纠偏 ----------
 
-    def drive_with_drift(self, m, pose, lateral_drift_mps=0.012, stamp=1.0, max_ticks=600):
-        """前进段注入持续 vy 漂移（模拟轮速横漂），DR 应识别并触发纠偏。
 
-        真实底盘会跟随指令：CENTER_MOVE 期间反馈 vy 取上一条指令的 vy，
-        使 DR 积分闭环反映纠偏效果。返回 (commands, entered_center, finished_center)。
-        """
+    def drive_with_drift(self, m, pose, lateral_drift_mps=0.012, stamp=1.0, max_ticks=600):
+        """前进段注入持续 vy 漂移：DM 用 4T4D 左右转向纠偏，不横移。"""
         commands = []
-        entered = False
+        saw_steer = False
         finished = False
-        last_cmd_vy = 0.
         s = m.segment_executor.segment
         for i in range(max_ticks):
-            fb_vy = last_cmd_vy if (m.segment_executor.phase == 'CENTER_MOVE') else lateral_drift_mps
-            command = self.tick(m, pose, speed=.08, vx=.08, vy=fb_vy,
+            command = self.tick(m, pose, speed=.08, vx=.08, vy=lateral_drift_mps,
                                 observations=[{'id': s['toId']}], stamp=stamp)
-            last_cmd_vy = command.vy
             commands.append(command)
             ex = m.segment_executor
-            # 世界系运动学：车体 yaw≈π（沿 -x 前进），vy 为体轴左移
             yaw = pose.yaw
             pose.x += (command.vx * math.cos(yaw) - command.vy * math.sin(yaw)) * .05
             pose.y += (command.vx * math.sin(yaw) + command.vy * math.cos(yaw)) * .05
-            if ex.phase == 'MOVE' and i > 0:
-                # 真实漂移：车体存在真实 vy（与 DR 积分同方向），叠加在被指令运动之上
-                pose.x += lateral_drift_mps * .05 * -math.sin(yaw)
-                pose.y += lateral_drift_mps * .05 * math.cos(yaw)
-            # CENTER_MOVE 期间车按指令 vy 横移（反馈 vy 已跟随指令，运动学一致）
-            if ex.phase.startswith('CENTER'):
-                entered = True
-            if entered and ex.phase == 'MOVE' and i > 5:
-                finished = True
+            pose.yaw += command.yaw_rate * .05
+            if ex.phase == 'MOVE' and abs(command.yaw_rate) > 1e-4:
+                saw_steer = True
+            if ex.phase != 'MOVE' or m.state in ('FAULT', 'FINISHED'):
+                finished = m.state != 'FAULT'
                 break
-            if m.state == 'FAULT':
-                break
-        else:
-            pass
-        return commands, entered, finished
+        return commands, saw_steer, finished
 
-    def test_dr_detects_lateral_drift_and_corrects(self):
-        """无 QR 更新时，DR 从 vy 积分发现横向偏差并触发有限纠偏，随后恢复前进。"""
+
+    def test_dr_detects_lateral_drift_and_steers_in_4t4d(self):
+        """无 QR 更新时 DR 识别横向偏差，用 4T4D 左右转向纠正，不进入 crab 横移。"""
         m, pose = setup()
         self.enter_move(m, pose, stamp=1.0)
-        commands, entered, finished = self.drive_with_drift(m, pose)
-        self.assertTrue(entered, 'DR 必须在 MOVE 中识别横向漂移并进入 CENTER：' + str(m.events[:5]))
-        self.assertTrue(finished, '纠偏后必须恢复原方向前进：' + str(m.events[:5]))
+        commands, steered, finished = self.drive_with_drift(m, pose)
+        self.assertTrue(steered, 'DR 必须给出行进转向：' + str(m.events[:5]))
+        bad = [c for c in commands if c.mode == 'crab' or abs(c.vy) > 1e-9]
+        self.assertFalse(bad, '不得自动横移：%r' % (bad[:2],))
+        self.assertFalse(m.segment_executor.phase.startswith('CENTER'))
         state = m.segment_executor.dr_state
         self.assertIsNotNone(state)
-        self.assertGreaterEqual(state.get('corrections', 0), 1)
-        # 目标 ≤10mm
-        self.assertLessEqual(m.segment_executor.dr_target(), .010)
-        record = [r for r in m.segment_executor.centering_history if r.get('source') == 'dead_reckoning']
-        self.assertTrue(record, 'centering_history 必须含 source=dead_reckoning 记录')
-        # 纠偏行程有限
-        self.assertLessEqual(record[-1]['travelM'], .05 + .002)
+        self.assertGreaterEqual(int(state.get('mechanicalCorrections', 0)), 1)
 
-    def test_dr_correction_direction_sign(self):
-        """漂移方向与纠偏方向相反：正漂移（cross>0）纠偏指令必须朝 cross 减小方向。"""
+
+    def test_dr_steering_direction_opposes_cross(self):
+        """漂移方向与转向方向相反：预测 cross 与 yaw_rate 符号相反（同一符号约定）。"""
         for drift in (+0.012, -0.012):
             with self.subTest(drift=drift):
                 m, pose = setup()
                 self.enter_move(m, pose, stamp=1.0)
-                commands, entered, _ = self.drive_with_drift(m, pose, lateral_drift_mps=drift)
-                self.assertTrue(entered, str(m.events[:5]))
-                lateral = [c for c in commands
-                           if m.segment_executor and abs(c.vx) + abs(c.vy) > 1e-9
-                           and m.segment_executor.centering is not None
-                           and m.segment_executor.phase == 'CENTER_MOVE']
-                if not lateral:  # 至少存在一段 CENTER_MOVE 指令
-                    lateral = [c for c in commands if c.mode == 'crab' and (abs(c.vx) + abs(c.vy)) > 1e-9]
-                self.assertTrue(lateral, 'CENTER_MOVE 必须发出横移指令')
-                cmd = lateral[0]
-                self.assertEqual(cmd.mode, 'crab')
-                self.assertEqual(cmd.yaw_rate, 0., '纠偏不允许旋转')
+                commands, steered, _ = self.drive_with_drift(m, pose, lateral_drift_mps=drift)
+                self.assertTrue(steered, str(m.events[:5]))
+                st = m.segment_executor.dr_state
+                bias = st.get('steerBiasM')
+                self.assertIsNotNone(bias, '应记录横向上转向偏置')
+                turn = [c.yaw_rate for c in commands if abs(c.yaw_rate) > 1e-4]
+                self.assertTrue(turn)
+                self.assertLess(turn[0] * bias, 0., 'yaw_rate 必须与预测 cross 反向')
+                self.assertLessEqual(abs(turn[0]), m.config.get('max_yaw_rate_radps', .25) + 1e-9)
+
 
     def test_dr_zero_vy_no_false_correction(self):
-        """无漂移（vy=0）时 DR 不触发纠偏，正常前进到段末。"""
+        """无漂移（vy=0）时 DR 不得触发转向纠偏，正常前进到段末。"""
         m, pose = setup()
         self.enter_move(m, pose, stamp=1.0)
         s = m.segment_executor.segment
+        steered = []
         for i in range(120):
             command = self.tick(m, pose, speed=.08, vx=.08, vy=0., observations=[{'id': s['toId']}], stamp=1.0)
+            if abs(command.yaw_rate) > 1e-4:
+                steered.append(command.yaw_rate)
             pose.x += command.vx * math.cos(pose.yaw) * .05
             pose.y += command.vx * math.sin(pose.yaw) * .05
             if m.state == 'FAULT' or m.segment_executor.phase != 'MOVE':
                 break
-        self.assertEqual(m.segment_executor.dr_state.get('corrections', 0), 0,
-                         '无漂移不得触发纠偏：' + str(m.events[:4]))
-        self.assertIn(m.segment_executor.phase, ('END_STOP', 'ALIGN'),
-                      '无漂移必须正常行进到段末：' + str(m.events[:3]))
-
-    # ---------- 2. QR 重现：残差计算与基准校正 ----------
+        self.assertEqual(int(m.segment_executor.dr_state.get('mechanicalCorrections', 0)), 0,
+                         '无漂移不得触发 DR 转向纠偏：' + str(m.events[:4]))
+        self.assertIn(m.segment_executor.phase, ('END_STOP', 'ALIGN'), '无漂移必须正常行进到段末')
 
     def test_qr_reappearance_rebases_anchor(self):
         """QR 重现（stamp 前进+高质量）时记录残差并重锚，控制位姿不瞬移。"""
@@ -178,8 +181,8 @@ class DeadReckoningTests(unittest.TestCase):
         self.assertTrue(history)
         entry = history[-1]
         self.assertEqual(entry['decision'], 'rebased')
-        self.assertIn('lateralResidualM', entry)
-        self.assertIsNotNone(entry['qrPose'])
+        self.assertIn('rebaseResidualM', entry)
+        self.assertIsNotNone(entry['anchorPose'])
         self.assertIsNotNone(entry['predictedPose'])
         # 控制位姿没瞬移：pose 对象的 x/y 不因 rebase 改变
         self.assertAlmostEqual(pose.y, -0.0 + .015, delta=.02)
@@ -195,11 +198,12 @@ class DeadReckoningTests(unittest.TestCase):
         pose.sigma = .01
         good = [{'id': s['toId'], 'groupId': 'B0', 'visibleCount': 16, 'sigma': .008}]
         m.field['groups'] = [{'id': 'B0', 'referenceId': s['toId'], 'members': [{'id': k} for k in range(16)]}]
-        self.tick(m, pose, stamp=10.3, observations=good)
+        before = m.segment_executor.dr_state.get('corrections', 0)
+        for _ in range(2):
+            self.tick(m, pose, stamp=10.3, observations=good)
         state = m.segment_executor.dr_state
-        entry = m.segment_executor.dr_history[-1]
-        self.assertEqual(entry['decision'], 'skipped_map_or_epoch', str(entry))
-        self.assertEqual(state.get('last_decision'), 'reanchored', str(state))
+        self.assertEqual(state.get('anchor_reject_reason'), 'mapMismatch', str(state))
+        self.assertEqual(state.get('corrections', 0), before, '错 scope 不得重锚')
 
     def test_low_quality_single_frame_no_correction(self):
         """单帧低质量 QR（1/16 可见）不得纠偏，只记录。"""
@@ -210,13 +214,12 @@ class DeadReckoningTests(unittest.TestCase):
         m.field['groups'] = [{'id': 'B0', 'referenceId': s['toId'], 'members': [{'id': k} for k in range(16)]}]
         pose.stamp = 10.3
         pose.sigma = .01
-        self.tick(m, pose, stamp=10.3, observations=low)
+        for _ in range(2):
+            self.tick(m, pose, stamp=10.3, observations=low, qr_stamp='reject')
         state = m.segment_executor.dr_state
         self.assertIsNotNone(state, str(m.events[:4]))
-        self.assertEqual(state.get('last_decision'), 'skip_low_quality', str(state))
-        # anchor 不被低质量帧移动
-        entry = m.segment_executor.dr_history[-1]
-        self.assertEqual(entry['decision'], 'skipped_low_quality')
+        self.assertEqual(state.get('corrections', 0), 0, '低质量不得重锚')
+        self.assertNotEqual(state.get('last_decision'), 'rebased')
 
     def test_divergence_beyond_limit_faults(self):
         """QR 与预测差异连续超硬限（5cm）N 帧必须 FAULT 停车。"""
@@ -240,18 +243,21 @@ class DeadReckoningTests(unittest.TestCase):
 
     # ---------- 3. 安全与行程 ----------
 
-    def test_dr_correction_preserves_target_mileage(self):
-        """纠偏不得改变目标行程：纠偏后仍按原路线到达段末（END_STOP 正常）。"""
+
+    def test_dr_steering_preserves_target_mileage(self):
+        """转向纠偏不得改变目标行程：仍按原路线到段末，不故障。"""
         m, pose = setup()
         self.enter_move(m, pose, stamp=1.0)
-        commands, entered, finished = self.drive_with_drift(m, pose)
-        self.assertTrue(entered and finished)
-        # 继续跑到段末
+        commands, steered, finished = self.drive_with_drift(m, pose)
+        self.assertTrue(steered and finished)
+        self.assertFalse(any(c.mode == 'crab' or abs(c.vy) > 1e-9 for c in commands))
+        self.assertNotEqual(m.state, 'FAULT')
         s = m.segment_executor.segment
         for i in range(600):
             command = self.tick(m, pose, speed=.08, vx=.08, observations=[{'id': s['toId']}], stamp=1.0)
             pose.x += command.vx * math.cos(pose.yaw) * .05
             pose.y += command.vx * math.sin(pose.yaw) * .05
+            pose.yaw += command.yaw_rate * .05
             if m.segment_executor.phase == 'END_STOP' or m.state in ('FAULT', 'IDLE'):
                 break
         self.assertIn(m.segment_executor.phase, ('END_STOP', 'ALIGN'), '纠偏后必须仍能到段末')
@@ -290,7 +296,7 @@ class DeadReckoningTests(unittest.TestCase):
             self.tick(m, pose, stamp=0.0)
         self.assertIsNotNone(m.segment_executor.dr_state)
         if m.segment_executor.phase == 'MOVE':
-            self.assertEqual(m.segment_executor.dr_state.get('last_decision'), 'passive',
+            self.assertEqual(m.segment_executor.dr_state.get('last_decision'), 'no_anchor',
                              str(m.segment_executor.dr_state))
 
 

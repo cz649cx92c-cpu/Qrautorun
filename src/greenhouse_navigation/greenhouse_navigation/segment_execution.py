@@ -3,6 +3,7 @@ import copy
 import math
 import time
 from .control import Command, Pose, geometry, wrap
+from .dr_anchor import anchor_event_ok, mission_scope, propagate_anchor
 from .recorded_trial import limits_for
 from .start_gate import segment_start_check
 
@@ -78,6 +79,61 @@ def validate_segments(segments):
             # shared QR centre; the rotation itself is executed at that standstill.
             if segment.get('strategy')!=TURN_STRATEGY and abs(wrap(previous['endYaw']-segment['bodyYaw']))>.15:raise ValueError('相邻区间车头方向不连续')
         previous=segment
+
+
+def feedback_lateral_velocity(fb):
+    """返回横向速度 SI（m/s）；来源不明返回 None，绝不把缺失伪装成有效 0。
+
+    既有成熟底盘协议里 ctrl_fb_y_linear 为 /100 单位（SI 的 10 倍），
+    只有确认走 existing_chassis 适配时才乘 0.1；node 若已给出 vy_mps 则直接采用，
+    不重复缩放。其他适配源未验证缩放，返回 None。
+    """
+    value = (fb or {}).get('vy_mps')
+    if _finite(value):
+        return float(value)
+    raw = (fb or {}).get('vy_raw')
+    if _finite(raw) and (fb or {}).get('angle_source') == 'existing_chassis':
+        return float(raw) * .1
+    return None
+
+
+YAW_LOCAL_MAX_GAP_S = .3
+
+
+def local_yaw_step(state, loco, now_mono, max_gap=YAW_LOCAL_MAX_GAP_S):
+    """局部 EKF 连续 yaw 增量；身份(epoch/source)先于重复判定，失效即重置基准。
+
+    规则：invalid → (0,False,reason) 并清空 last_local_yaw/stamp（禁止跨失效区间补积）；
+    stamp 相同且 epoch 相同 → (0,True,'duplicate')；stamp 相同但 epoch 不同 → invalid。
+    """
+    if not isinstance(loco, dict):
+        return 0., False, 'noLocalOdom'
+    yaw = loco.get('yaw'); stamp = loco.get('stamp'); recv = loco.get('recvMono'); epoch = loco.get('epoch')
+    if not _finite(yaw) or not _finite(stamp) or not _finite(recv):
+        state['last_local_yaw']=None; state['last_local_stamp']=None
+        return 0., False, 'localOdomInvalid'
+    age = now_mono - recv
+    if age < -.05 or age > max_gap:
+        state['last_local_yaw']=None; state['last_local_stamp']=None
+        return 0., False, 'stale'
+    last_epoch = state.get('local_epoch')
+    if epoch is not None and last_epoch is not None and epoch != last_epoch:
+        state['last_local_yaw']=None; state['last_local_stamp']=None
+        state['local_epoch']=epoch
+        return 0., False, 'epochChanged'
+    last_stamp = state.get('last_local_stamp')
+    if _finite(last_stamp) and stamp < last_stamp:
+        state['last_local_yaw']=None; state['last_local_stamp']=None
+        return 0., False, 'stampReversed'
+    if _finite(last_stamp) and stamp == last_stamp:
+        return 0., True, 'duplicate'
+    last_yaw = state.get('last_local_yaw')
+    dyaw = 0. if not _finite(last_yaw) else wrap(float(yaw) - last_yaw)
+    state['last_local_yaw'] = float(yaw)
+    state['last_local_stamp'] = float(stamp)
+    if epoch is not None:
+        state['local_epoch'] = epoch
+    return dyaw, True, 'ok'
 
 
 class SegmentExecutor:
@@ -243,12 +299,19 @@ class SegmentExecutor:
                     m.completed=[m.row['id']];m.running=False;m.transition('FINISHED');m.log('全部二维码区间已完成并停稳');return zero
                 # 每个二维码边界都先把「下一段」的横向偏差收敛，再进入下一段；
                 # 不是只在原地转向出口做对中。
-                action=self.prepare_boundary_center(pose)
-                if action=='fault':return zero
-                if action=='center':
-                    self.phase='CENTER_ALIGN';m.transition('SEGMENT_CENTER')
-                    m.mode='crab';m.target_angle=0.;m.stable=0;m.last_sample=None
-                    return zero
+                # 新运动语义：到码不做自动横移对中。残余在 5cm 硬门内直接进入下一计划动作
+                # （原地 TURN / TURN_RECENTER / 4T4D 行进转向纠偏），超过硬门才停车。
+                # 这里不再调用 prepare_boundary_center 的 crab 分支；保留其 fault 语义不可用，
+                # 因为其判据完全围绕横移运动设计。
+                if self.index+1<len(self.segments):
+                    nxt=self.segments[self.index+1]
+                    if nxt.get('mode')=='4t4d':
+                        nx_cross,_,_,_=geometry(pose,nxt['points'])
+                        self.exit_info['boundaryCrossM']=round(nx_cross,4)
+                        hard=float(m.config['max_cross_track_m'])
+                        if abs(nx_cross)>hard:
+                            m.fault(f"到码后下一段横向偏差 {nx_cross*100:.1f} cm 超过硬门 {hard*100:.1f} cm（不做自动横移）；停车")
+                            return zero
                 self.index+=1;self.arrival_seen=False;return self.align()
             if elapsed>max(timeout,m.task['endWaitSeconds']+timeout):m.fault('二维码边界停车超时或未确认目标二维码')
             return zero
@@ -417,7 +480,7 @@ class SegmentExecutor:
         if not self.jump_scope():return cross,False
         m=self.m;config=m.config
         quality=self.observation_quality(observations)
-        vx=fb.get('vx',fb.get('speed',0.));vy=fb.get('vy_raw',0.)
+        vx=fb.get('vx',fb.get('speed',0.));vy=feedback_lateral_velocity(fb)
         heading_error=wrap(pose.yaw-self.segment['bodyYaw'])
         heading_limit=float(config['max_heading_rad'])
         cross_limit=float(config['max_cross_track_m'])
@@ -427,7 +490,7 @@ class SegmentExecutor:
         if state is None:
             previous=self.last_gate_pose;previous_cross=self.last_gate_cross
             if (previous is not None and previous_cross is not None and quality['quality']=='low'
-                    and _finite(vx) and vx>=-.005 and _finite(vy) and abs(vy)<=max_vy
+                    and _finite(vx) and vx>=-.005 and vy is not None and abs(vy)<=max_vy
                     and _finite(heading_error) and abs(heading_error)<=heading_limit
                     and abs(cross)<=hard_cross):
                 delta=cross-previous_cross
@@ -448,9 +511,9 @@ class SegmentExecutor:
             self._jump_fault('localization_jump_hard_cross',
                              f"定位跳变横向超过硬上限：{cross*100:.1f} cm（硬上限 {hard_cross*100:.1f} cm）")
             return cross,False
-        if not _finite(vy) or abs(vy)>max_vy:
+        if vy is None or abs(vy)>max_vy:
             self._jump_fault('localization_jump_chassis_vy',
-                             f"定位跳变期间底盘横向速度异常：vy={vy} m/s（允许 {max_vy:.2f}）")
+                             f"定位跳变期间底盘横向速度异常：vy={vy} m/s（SI，允许 {max_vy:.2f}）")
             return cross,False
         if not _finite(vx) or vx<-.005:
             self._jump_fault('localization_jump_forward_velocity',
@@ -554,99 +617,106 @@ class SegmentExecutor:
     def dr_start(self,pose,fb,cross):
         """MOVE 进入时建立锚点。stamp<=0（无时间戳的桩/离线）保持被动，只记录。"""
         loc=self.m.localization if isinstance(getattr(self.m,'localization',None),dict) else {}
-        self.dr_state={'segment_index':self.index,'anchor_stamp':float(getattr(pose,'stamp',0.) or 0.),
-                       'anchor_cross':cross,'anchor_pose':(pose.x,pose.y,pose.yaw),
+        self.dr_state={'segment_index':self.index,'anchor_stamp':0.,
+                       'anchor_cross':cross,'anchor_pose':None,'anchor_valid':False,
+                       'last_correction_id':None,'needs_anchor':False,'frozen':False,
                        'anchor_epoch':loc.get('localEpoch'),
                        'pred':{'x':pose.x,'y':pose.y,'yaw':pose.yaw},
                        'last_yaw_deg':fb.get('yaw_deg') if _finite(fb.get('yaw_deg')) else None,
+                       'local_epoch':(self.m.localization or {}).get('localEpoch') if isinstance(getattr(self.m,'localization',None),dict) else None,
                        'last_stamp':float(getattr(pose,'stamp',0.) or 0.),
+                       'last_local_yaw':None,'last_local_stamp':None,
+                       'yawSourceOk':True,'yawSourceReason':'init','vySourceOk':True,'mechanicalCorrections':0,
+                       'last_qr_source':None,'last_qr_qualified_source':None,
+                       'qr_qualified_mono':None,'last_rebase_source':None,
+                       'last_qr_recv_mono':None,'qr_skipped_reason':None,
                        'stamp_time':time.monotonic(),'corrections':0,'travel':0.,
                        'divergence_pending':0,'last_decision':'anchor','crossM':cross,
                        'last_residual':None}
 
-    def dr_integrate(self,fb,dt):
-        """轮速 vx/vy + 底盘(IMU) yaw 增量积分；缺字段的桩保持不动。"""
+    def dr_integrate(self,fb,dt,loco=None):
+        """轮速 vx/vy(SI) + 局部 EKF 连续 yaw 增量积分；来源失效时不瞎积分。"""
         state=self.dr_state
         if state is None or dt<=0:return
-        yaw_deg=fb.get('yaw_deg')
-        dyaw=0.
-        if _finite(yaw_deg) and _finite(state.get('last_yaw_deg')):
-            dyaw=wrap(math.radians(yaw_deg-state['last_yaw_deg']))
-        if _finite(yaw_deg):state['last_yaw_deg']=yaw_deg
+        # 底盘原始角速度仅保留诊断，绝不再当绝对角做差
+        if _finite(fb.get('yaw_deg')):state['last_chassis_yaw_rate_deg']=fb.get('yaw_deg')
+        dyaw,yaw_ok,yaw_reason=local_yaw_step(state,loco,time.monotonic())
+        state['yawSourceOk']=bool(yaw_ok)
+        state['yawSourceReason']=yaw_reason
+        if not yaw_ok:
+            # 源失效：冻结 xy/yaw，禁止继续用旧航向积分；要求新合格锚才能恢复纠偏
+            state['frozen']=True;state['needs_anchor']=True
+            return
+        if state.get('frozen'):
+            # 恢复首帧只重建局部基准，不补积失联区间
+            state['frozen']=False;state['needs_anchor']=True
+            return
         vx=fb.get('vx') if _finite(fb.get('vx')) else 0.
-        vy=fb.get('vy_raw') if _finite(fb.get('vy_raw')) else 0.
+        vy=feedback_lateral_velocity(fb)
+        state['vySourceOk']=vy is not None
+        lateral=0. if vy is None else vy   # 无有效来源时不加横向位移，但不标记为有效
         yaw=state['pred']['yaw']
-        state['pred']['x']+= (vx*math.cos(yaw)-vy*math.sin(yaw))*dt
-        state['pred']['y']+= (vx*math.sin(yaw)+vy*math.cos(yaw))*dt
+        state['pred']['x']+= (vx*math.cos(yaw)-lateral*math.sin(yaw))*dt
+        state['pred']['y']+= (vx*math.sin(yaw)+lateral*math.cos(yaw))*dt
         state['pred']['yaw']=wrap(yaw+dyaw)
 
-    def dr_try_rebase(self,pose,fb,observations,pose_cross,remaining):
-        """QR 解算更新（stamp 前进）时：显式比较预测 vs 绝对位姿并校正基准。
-
-        只接受当前地图、质量合格、sigma 达标、epoch 一致的 QR 校正；
-        单帧低质量跳变只记录不纠偏；残差超硬限连续出现按发散停车。
-        校正只移动 DR 锚点，绝不瞬移控制位姿。
-        """
+    def dr_try_rebase(self,pose,fb,observations,pose_cross,remaining,anchor=None,loco=None):
+        """只用 localization 真正接受 QR 校正的事件锚；事件须同 scope/版本/epoch/新鲜/未重复，
+        且能用同源局部里程把后验位姿传播到当前局部里程时刻；不拿任意当前全局 pose 冒充。"""
         m=self.m;state=self.dr_state
-        stamp=float(getattr(pose,'stamp',0.) or 0.)
-        if not _finite(stamp) or stamp<=0 or stamp==state['last_stamp']:
+        if not isinstance(anchor,dict):
             return False
-        state['last_stamp']=stamp;state['stamp_time']=time.monotonic()
-        quality=self.observation_quality(observations)
+        now=time.monotonic()
         loc=m.localization if isinstance(getattr(m,'localization',None),dict) else {}
-        field=getattr(m,'field',None) or {}
-        sigma=getattr(pose,'sigma',None)
-        entry={'stamp':round(stamp,3),'tagId':quality.get('tagId'),'groupId':quality.get('groupId'),
-               'quality':quality.get('quality'),'visible':quality.get('visible'),'total':quality.get('total'),
-               'epoch':loc.get('localEpoch'),'mapId':loc.get('mapId'),'mapVersion':loc.get('mapVersion'),
-               'predictedPose':dict(state['pred']),'qrPose':self._dr_snapshot(pose),
-               'predictedCrossM':round(state['crossM'],4),'poseCrossM':round(pose_cross,4)}
-        # 同地图/版本/epoch 才接受；跨图或换 epoch 只重锚不当作误差。
-        map_ok=(not field.get('id') or loc.get('mapId')==field.get('id'))
-        epoch_changed=state.get('anchor_epoch') is not None and loc.get('localEpoch')!=state.get('anchor_epoch')
-        sigma_ok=_finite(sigma) and sigma<=self.dr_rebase_max_sigma()
-        lat_res=pose_cross-state['crossM']
-        along_res=remaining-(remaining-(state['pred']['x']-pose.x))  # along 残差用位移差近似
-        heading_res=wrap(pose.yaw-state['pred']['yaw'])
-        entry.update({'lateralResidualM':round(lat_res,4),'headingResidualDeg':round(math.degrees(heading_res),3),
-                      'sigmaM':round(sigma,4) if _finite(sigma) else None})
-        if epoch_changed or not map_ok:
-            entry.update({'decision':'skipped_map_or_epoch','reason':'地图或epoch变化，重锚不纠偏'
-                          if epoch_changed else '跨地图QR拒绝'})
-            state['pred']={'x':pose.x,'y':pose.y,'yaw':pose.yaw}
-            state['anchor_pose']=(pose.x,pose.y,pose.yaw);state['anchor_epoch']=loc.get('localEpoch')
-            state['anchor_stamp']=stamp;state['crossM']=pose_cross;state['divergence_pending']=0
-            state['last_decision']='reanchored'
+        ok,why=anchor_event_ok(anchor,mission_scope(m),now,max_age=.5,
+                               current_epoch=loc.get('localEpoch'),
+                               last_correction_id=state.get('last_correction_id'))
+        if not ok:
+            state['anchor_reject_reason']=why
+            return False
+        pose_now,prop_ok,prop_why=propagate_anchor(anchor,loco)
+        if not prop_ok:
+            state['anchor_reject_reason']=prop_why
+            return False
+        state['anchor_reject_reason']=None
+        entry={'stamp':round(float(anchor['sourceStamp']),3),'qrSourceStamp':round(float(anchor['sourceStamp']),3),
+               'correctionId':anchor.get('correctionId'),'kind':anchor.get('kind'),
+               'eventRecvMono':round(float(anchor['recvMono']),3),'mapId':anchor.get('mapId'),
+               'mapVersion':anchor.get('mapVersion'),'epoch':anchor.get('localEpoch'),
+               'anchorPose':[round(v,5) for v in pose_now],'predictedPose':dict(state['pred']),
+               'poseCrossM':round(pose_cross,4),'sigmaM':anchor.get('sigma'),
+               'anchorSource':'accepted_qr_event+local_odom'}
+        if not state.get('anchor_valid') or state.get('needs_anchor'):
+            state['pred']={'x':pose_now[0],'y':pose_now[1],'yaw':pose_now[2]}
+            state['anchor_pose']=tuple(pose_now);state['anchor_valid']=True
+            state['anchor_stamp']=float(anchor['sourceStamp']);state['anchor_cross']=pose_cross
+            state['crossM']=pose_cross;state['needs_anchor']=False;state['divergence_pending']=0
+            state['last_correction_id']=anchor.get('correctionId')
+            state['qr_qualified_mono']=float(anchor['recvMono'])
+            state['last_decision']='anchored'
+            entry['decision']='anchored'
             self.dr_history.append(entry);self.dr_history=self.dr_history[-8:]
             return True
-        if quality['quality']=='low' or quality['quality']=='unknown':
-            entry.update({'decision':'skipped_low_quality','reason':'单帧低质量/未知质量QR不得纠偏'})
-            self.dr_history.append(entry);self.dr_history=self.dr_history[-8:]
-            state['last_decision']='skip_low_quality'
-            return True
-        if not sigma_ok:
-            entry.update({'decision':'skipped_sigma','reason':'sigma超限'})
-            self.dr_history.append(entry);self.dr_history=self.dr_history[-8:]
-            state['last_decision']='skip_sigma'
-            return True
-        if abs(lat_res)>self.dr_rebase_limit():
+        res=math.hypot(pose_now[0]-state['pred']['x'],pose_now[1]-state['pred']['y'])
+        entry['rebaseResidualM']=round(res,4)
+        if res>self.dr_rebase_limit():
             state['divergence_pending']+=1
             entry.update({'decision':'diverged','frames':state['divergence_pending'],
-                          'reason':'预测与QR绝对位姿差异超硬限'})
+                          'reason':'accepted QR 锚与预测差异超硬限'})
             self.dr_history.append(entry);self.dr_history=self.dr_history[-8:]
             if state['divergence_pending']>=self.dr_divergence_frames():
-                m.fault(f"dead-reckoning 与二维码绝对定位差异连续 {state['divergence_pending']} 帧超过 {self.dr_rebase_limit()*100:.1f} cm（本次横向残差 {lat_res*100:+.1f} cm）：预测发散，停车")
+                m.fault(f"dead-reckoning 与二维码绝对定位差异连续 {state['divergence_pending']} 帧超过 {self.dr_rebase_limit()*100:.1f} cm（本次残差 {res*100:+.1f} cm，correctionId={anchor.get('correctionId')}）：预测发散，停车")
             state['last_decision']='diverged'
             return True
-        # 校正：把锚点/预测重置到 QR 绝对位姿，累计误差被吸收，控制位姿不变。
-        delta=(pose.x-state['pred']['x'],pose.y-state['pred']['y'])
-        entry.update({'decision':'rebased','deltaX':round(delta[0],4),'deltaY':round(delta[1],4),
-                      'correctionIndex':state['corrections']+1})
-        state['pred']={'x':pose.x,'y':pose.y,'yaw':pose.yaw}
-        state['anchor_pose']=(pose.x,pose.y,pose.yaw);state['anchor_stamp']=stamp
+        state['pred']={'x':pose_now[0],'y':pose_now[1],'yaw':pose_now[2]}
+        state['anchor_pose']=tuple(pose_now);state['anchor_stamp']=float(anchor['sourceStamp'])
         state['anchor_cross']=pose_cross;state['crossM']=pose_cross
         state['corrections']+=1;state['divergence_pending']=0;state['last_decision']='qr_track'
+        state['last_correction_id']=anchor.get('correctionId')
+        state['qr_qualified_mono']=float(anchor['recvMono'])
+        state['last_rebase_source']=float(anchor['sourceStamp'])
         state['last_residual']=entry
+        entry.update({'decision':'rebased','correctionIndex':state['corrections']})
         self.dr_history.append(entry);self.dr_history=self.dr_history[-8:]
         return True
 
@@ -665,55 +735,67 @@ class SegmentExecutor:
             self.dr_state['last_decision']='disabled'
             return pose_cross,None
         state=self.dr_state
-        self.dr_integrate(fb,dt)
+        loc=(m.localization if isinstance(getattr(m,'localization',None),dict) else {})
+        loco=loc.get('localOdom');anchor=loc.get('qrAnchor');raw=loc.get('qrRaw')
+        self.dr_integrate(fb,dt,loco)
         pred=Pose(state['pred']['x'],state['pred']['y'],state['pred']['yaw'])
         dr_cross,_,_,_=geometry(pred,self.segment['points'])
         state['crossM']=dr_cross;state['predictedPose']=dict(state['pred'])
-        stale_s=time.monotonic()-state['stamp_time']
+        now=time.monotonic()
+        mono=state.get('qr_qualified_mono')
+        stale_s=now-float(mono) if _finite(mono) else now-float(state['stamp_time'])
         state['staleS']=round(stale_s,3)
-        anchored=state['anchor_stamp']>0
-        if not anchored:
-            state['last_decision']='passive'
+        state['qrLastQualifiedAgeS']=round(stale_s,3)
+        state['qrSourceStamp']=state.get('last_qr_qualified_source') or state.get('anchor_stamp')
+        rebased=False
+        if isinstance(anchor,dict):
+            rebased=self.dr_try_rebase(pose,fb,observations,pose_cross,remaining,anchor=anchor,loco=loco)
+            mono=state.get('qr_qualified_mono')
+            stale_s=now-float(mono) if _finite(mono) else now-float(state['stamp_time'])
+            state['staleS']=round(stale_s,3);state['qrLastQualifiedAgeS']=round(stale_s,3)
+        raw_fresh=isinstance(raw,dict) and _finite(raw.get('recvMono')) and 0<=now-float(raw['recvMono'])<=.4
+        accepted_recent=_finite(state.get('qr_qualified_mono')) and now-float(state['qr_qualified_mono'])<=.4
+        state['qrRawFresh']=bool(raw_fresh)
+        if raw_fresh and not accepted_recent:
+            # 板可见但观测未被接受（低质/scope 等原因）：不得当作真实无码去主动纠偏
+            state['last_decision']='qr_visible_rejected'
             return pose_cross,None
-        rebased=self.dr_try_rebase(pose,fb,observations,pose_cross,remaining)
+        if not state.get('anchor_valid'):
+            state['last_decision']='no_anchor'
+            return pose_cross,None
+        if state.get('needs_anchor'):
+            state['last_decision']='needs_anchor'
+            return pose_cross,None
         if m.state=='FAULT':return pose_cross,'zero'
         if self.centering is not None:
             state['last_decision']='correcting'
+            return pose_cross,None
+        if not state.get('yawSourceOk',True):
+            state['last_decision']='yaw_source_invalid'
             return pose_cross,None
         # try_rebase 已给出明确决策（skip_low_quality/rebased/diverged...）时保留之
         if not rebased:
             state['last_decision']='predict' if stale_s>self.dr_min_stale_s() else 'qr_track'
         trigger=self.dr_trigger();hard=float(m.config['max_cross_track_m'])
-        budget=(state['corrections']<self.dr_correction_limit()
+        budget=(int(state.get('mechanicalCorrections',0))<self.dr_correction_limit()
                 and state['travel']<self.dr_correction_travel())
-        if abs(dr_cross)>=trigger and budget and remaining>=self.dr_min_remaining() and stale_s>=self.dr_min_stale_s():
-            if not m.body_velocity_crab():
-                state['last_decision']='blocked_no_crab'
-                m.log(f"DR 预测横向偏差 {dr_cross*100:+.1f} cm 超过控制目标 {trigger*100:.1f} cm，但底盘未确认横移能力，仅记录不纠偏")
-                return pose_cross,None
+        s=self.segment
+        if (s.get('mode')=='4t4d' and s.get('direction')=='forward'
+                and abs(dr_cross)>=trigger and budget and remaining>=self.dr_min_remaining()
+                and stale_s>=self.dr_min_stale_s()):
             if abs(dr_cross)>hard:
                 m.fault(f"DR 预测横向偏差 {dr_cross*100:+.1f} cm 超过硬上限 {hard*100:.1f} cm（二维码间丢失校正），停车")
                 return pose_cross,'zero'
-            # 提前有限纠偏：减速(零指令)->换 crab 短暂横移->恢复原方向；端点不变。
-            s=self.segment
-            self.centering={'start_cross':dr_cross,'start_pose':(pose.x,pose.y),'started':time.monotonic(),
-                            'moved':0.,'points':s['points'],'body_yaw':s['bodyYaw'],'on_done':'resume',
-                            'for_index':self.index,'tag_id':s['toId'],'start_yaw':pose.yaw,
-                            'source':'dead_reckoning','dr_travel_cap':self.dr_correction_travel(),
-                            'last_command':{'vx':0.,'vy':0.,'wz':0.,'mode':'crab'},
-                            'direction':'left' if dr_cross>0 else 'right'}
-            self.centering_info={'required':True,'startCrossM':round(dr_cross,4),'done':False,'mode':'crab',
-                                 'travelM':0.,'for_index':self.index,'source':'dead_reckoning',
-                                 'doneCrossM':self.dr_target(),'triggerCrossM':trigger,
-                                 'limitCrossM':round(hard,4),'direction':self.centering['direction'],
-                                 'decision':'centering'}
-            self.exit_info.update({'status':'centering','centeringUsed':True,'endCrossM':round(dr_cross,4)})
-            state['last_decision']='correcting'
-            state['corrections']=state.get('corrections',0)+1
-            m.log(f"DR 提前纠偏：预测横向 {dr_cross*100:+.1f} cm（目标 {trigger*100:.1f} cm，QR 失联 {stale_s:.1f}s，本段第 {state['corrections']} 次）：减速->短暂横移->恢复前进")
-            self.phase='CENTER_ALIGN';m.transition('SEGMENT_CENTER')
-            m.mode='crab';m.target_angle=0.;m.stable=0;m.last_sample=None
-            return pose_cross,'zero'
+            # 新运动语义：行驶中只允许 4T4D 左右行进转向，不切 crab、不平移、不原地转、不倒退。
+            # 转向由下方 Tracker 的既有航向/横向负反馈闭环消费（预测 cross 作为唯一码间参考）。
+            state['mechanicalCorrections']=int(state.get('mechanicalCorrections',0))+1
+            state['last_decision']='steer_4t4d'
+            state['steerBiasM']=round(dr_cross,4)
+            state['steeringActive']=True
+            self.exit_info.update({'status':'steering_4t4d','centeringUsed':False,
+                                   'steerCrossM':round(dr_cross,4)})
+            m.log(f"DR 4T4D 转向纠偏：预测横向 {dr_cross*100:+.1f} cm（QR 失联 {stale_s:.1f}s），保持 vy=0，仅左右行进转向")
+            return pose_cross,None
         return pose_cross,None
 
     def move_command(self,pose,fb,observations,dt):
@@ -784,9 +866,20 @@ class SegmentExecutor:
             return Command(mode='crab',vx=speed*math.cos(travel),vy=speed*math.sin(travel),wheel_angle=m.target_angle)
         target=m.task['reverseSpeed'] if s['direction']=='reverse' else m.task['forwardSpeed']
         scale=max(1.,abs(cross)/.025,abs(angle)/heading_limit);target*=max(.25,1./scale)
+        st=self.dr_state
+        cross_override=None
+        if (s['direction']=='forward' and st is not None and st.get('anchor_valid')
+                and float(st.get('staleS',0.))>=self.dr_min_stale_s() and _finite(st.get('steerBiasM'))):
+            # QR 失联期间：DR 预测 cross 是唯一横向反馈来源；位姿/剩余距离仍用实测融合位姿。
+            cross_override=float(st['steerBiasM'])
+            self.exit_info['steeringSource']='predicted_cross_4t4d'
+            self.exit_info['steerCrossM']=round(cross_override,4)
+        else:
+            self.exit_info['steeringSource']='fused_4t4d'
         command=(m.tracker.reverse(pose,points,target,dt,profile=s.get('executionProfile'))[0]
                  if s['direction']=='reverse' else
-                 m.tracker.forward(pose,points,target,dt,profile=s.get('executionProfile'))[0])
+                 m.tracker.forward(pose,points,target,dt,profile=s.get('executionProfile'),
+                                   cross_override=cross_override)[0])
         # A 4T4D interval only ever translates along the body x axis. Forcing the
         # mode/vy here means a lateral body velocity can never be passed off as
         # forward progress, whatever the tracker returns.
@@ -877,9 +970,14 @@ class SegmentExecutor:
         action=self.prepare_turn_exit(pose)
         if action=='fault':return zero
         if action=='center':
-            self.phase='CENTER_ALIGN';m.transition('SEGMENT_CENTER')
-            m.mode='crab';m.target_angle=0.;m.stable=0;m.last_sample=None
-            return zero
+            # 新运动语义：转向出口不再自动横移；只在超过 5cm 硬门时停车，
+            # 否则直接进入 TURN_RECENTER（轮角回正、零速），随后由 4T4D 行进转向纠偏。
+            exit_cross,_,_,_=geometry(pose,s['points'])
+            self.exit_info['turnExitCrossM']=round(exit_cross,4)
+            hard=float(m.config['max_cross_track_m'])
+            if abs(exit_cross)>hard:
+                m.fault(f"转向出口横向偏差 {exit_cross*100:.1f} cm 超过硬门 {hard*100:.1f} cm（不做自动横移）；停车")
+                return zero
         self.turn_done=True
         # 只确认“停稳 + yaw 到位”不等于轮子已回正：实车此时四轮仍在大转角回正中。
         # 必须先进入独立的回正/档位确认阶段（只发零速），确认后才允许下发 vx。
@@ -1109,7 +1207,8 @@ class SegmentExecutor:
             # DR 触发的纠偏期间继续轮速积分：横移指令的效果必须反映到预测位姿，
             # 否则预测 cross 永不收敛、纠偏窗口必然耗尽。
             if info.get('source')=='dead_reckoning' and self.dr_state is not None:
-                self.dr_integrate(fb,dt)
+                mloc=m.localization if isinstance(getattr(m,'localization',None),dict) else {}
+                self.dr_integrate(fb,dt,mloc.get('localOdom'))
         if self.phase=='CENTER_ALIGN':
             m.mode='crab';m.target_angle=0.
             ready=(m.body_crab_feedback_ready(fb) if m.body_velocity_crab() else m.canonical_steering_ready(fb,0.))

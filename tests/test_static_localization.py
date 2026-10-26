@@ -238,7 +238,9 @@ class StaticNodeTests(unittest.TestCase):
         self.assertIn(('publish_tf',False),[call.args for call in declarations.call_args_list])
         self.assertIn(('qr_interval_navigation',False),[call.args for call in declarations.call_args_list])
         topics={call.args[1] for call in publishers.call_args_list}
-        self.assertEqual(topics,{'/qr/localization/pose','/qr/localization/provisional','/qr/localization/static_pose','/qr/localization/status'})
+        # v10：新增内用 accepted-anchor 事件话题（仅供 node/DR 内部消费，不是前端/公共定位输出）
+        self.assertEqual(topics,{'/qr/localization/pose','/qr/localization/provisional','/qr/localization/static_pose',
+                                 '/qr/localization/status','/qr/localization/accepted_anchor'})
         self.assertEqual({call.args[1] for call in subscribers.call_args_list},
                          {'/qr/odometry/local','/qr/tags/observations','/qr/tags/provisional','/chassis_info_fb','/qr/fusion/status'})
 

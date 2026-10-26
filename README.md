@@ -1,11 +1,49 @@
 # QR 导航控制台
 
-> **当前分支：`v9`**（最新代码在 `v9`，2026-10-26）
-> 基线：`v8`（`7d96cac`）· 本分支相对 `v8` 的实际差异见下方「v9 改动」——**仅新增后台诊断日志**，控制行为未改
-> `main` 分支停留在 v2 代码基线，**不包含**本分支的任何功能。要使用本版本请切到 `v9`。
-> 分支最新 SHA 见 `git log -1`；v9 的缺口、已知 DR 缺陷与"拟 v10 修复"见「v9 改动」第 7 节。
+> **当前分支：`v10`**（最新代码在本地 `v10`，基于 `v9`；未推送远端）
+> 基线：`v9`（`b1bcf33`）· v10 相对 v9 修复 DR 三项预测源缺陷，见下方「v10 改动」；v9 的「仅新增后台诊断日志」内容保留为历史
+> `main` 分支停留在 v2 代码基线，**不包含**本分支的任何功能。要使用本版本请切到 `v10`。
+> 分支最新 SHA 见 `git log -1`；v10 尚未实车验证项与历史缺口见「v10 改动」第 6 节与「v9 改动」第 7 节。
 
 基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端 Vue 3 + TypeScript + Konva，Web 服务 Fastify，导航执行 ROS 2 / Python。
+
+## v10 改动（相对 `v9` / `b1bcf33`）— 2026-10-26（已推送 `refs/heads/v10`）
+
+只修已证的三项 DR 预测源缺陷及其暴露出的锚/时间链；不改 EKF/IMU/地图/相机/速度/安全阈值，不加前端面板。
+
+### 1. 横向速度统一 SI（A）
+`node` 反馈新增 `vy_mps=raw*0.1`（仅 `existing_chassis_confirmed`；否则 `None`，不伪造 0），保留 `vy_raw`；`feedback_lateral_velocity()` 为唯一消费边界；DR 与 jump 门限吃 SI，命令侧不变。缺失来源时只积纵向并标记 `vySourceOk=False`。
+
+### 2. 航向增量（B）
+新增 `/qr/odometry/local` 订阅（局部 EKF 中继：去偏 IMU+轮速，不含全局 QR 校正）。`local_yaw_step()`：**先校验 source/epoch 身份，再判重复**；stamp 相同且 epoch 相同才 duplicate(0)；倒序/过期(>0.3s)/epoch 变化返回 invalid 并**清空局部基准**；`dr_integrate` 在失效时**冻结 xy/yaw**，恢复首帧只重建基准，**必须等新的合格 accepted-QR 锚**才允许机械纠偏。底盘 `z_angular` 仅诊断。
+
+### 3. accepted-QR 锚事件链（C）
+- `localization.observe()` 在**真正接受**更新（首估计或 correction_update 成功）处发布内用话题 `/qr/localization/accepted_anchor`（JSON String）：`correctionId`、`sourceStamp`、实际 `mapId/mapVersion/localEpoch/scopeGeneration`、**同刻 posterior 位姿与 posteriorStamp**、`localRef`（同一 `self.last` 局部里程样本，stamp 必须等于 posteriorStamp）、`sigma`、`recvMono`；node 收到时补 `recvMonoLocal`（本机时钟域）并写入 `acceptedAnchor` 诊断日志。
+- `dr_anchor.py`（新，纯函数）：`anchor_event_ok()` 校验 correctionId 去重、**mapId+mapVersion 真实字段**、epoch、`posteriorStamp==localRef.stamp`、node 本机接收年龄；`propagate_anchor()` 用 **SE2 正确旋转**把事件后验从 ref 局部时刻推到当前局部 odom 时刻：`dG=R(anchorYaw-refYaw)·dL`，`yaw=anchorYaw+wrap(curYaw-refYaw)`（旧版误用 `R(anchorYaw)`，仅 refYaw=0 偶然正确）。
+- `segment.dr_try_rebase` 只接受上述事件：无裸观测重锚；Scope 不符/版本不符/epoch 不符/过期/重复/`posterior` 与 `localRef` 非同刻一律拒绝并记录 `anchor_reject_reason`；首次有效事件建立锚（不计纠偏），后续有效事件按残差重锚；`needs_anchor` 期间禁止纠偏。
+- 裸观测仅用于"板是否可见"判断：可见但未被接受（低质/scope 等）→ `qr_visible_rejected`，不得误当真实无码主动纠偏；真实无码（无裸观测且无接受事件）超过 `min_stale` 才允许 DR 机械纠偏。初始 DR 不再从任意 pose 构造有效锚。
+- 机械纠偏预算 `mechanicalCorrections` 独立计数；次数/横移距离/时间/航向漂移/5cm 硬限全部保留，无 de-bounce。
+
+### 4. 诊断
+`chassisFeedback`：`vyRaw/vyMps/yawSource/localX/localY/localYaw/localYawStamp/localEpoch`；`command`：`qrSourceStamp/qrLastQualifiedAge/drDecision/drCrossM/drYawSourceOk/drVySourceOk/drAnchorValid/drAnchorRejectReason/drSteerActive/drSteerBiasM/drSteeringSource/drAutoLateral(false)`；`acceptedAnchor`（localization 与 node 各写一条，含真实 scope/后验/局部参照）。
+
+### 5. 运动语义修正（用户确认：禁止行驶中自动平移）
+- **撤销两处自动 crab 横移入口**：`dr_update` 的中途 DR 纠偏、到码/转向出口的自动对中（旧 `CENTER_ALIGN/CENTER_MOVE/CENTER_STOP` 不再从这两个路径进入）。
+- 4T4D 段保持 `mode='4t4d', vy=0`：横向偏差用既有 `Tracker.forward` 航向/横向闭环做**有界左右行进转向**（`yaw_rate = v·curv −1.8·heading −1.5·cross`，幅值/斜率限由 profile+node 夹取）；QR 失联时仅把 DR 预测 cross 作为**唯一横向反馈**注入（`cross_override`），不整体替换位姿、不与 fused cross 叠加。
+- 到码后：残余在 5cm 硬门内直接进入下一计划动作（原地规划 TURN、TURN_RECENTER 轮角回正、4T4D 行进转向）；超过硬门仍停车。不再为“继续前进”放宽 5cm，也不再停着无限要求 2cm 收敛。
+- **保留**：显式规划的 crab 路线段仍按计划执行；规划原地 TURN 与 TURN_RECENTER 保留；真实轮角/模式/定位/5cm 硬门、速度/阈值均未改。
+- 测试：新增 `test_v10_no_auto_lateral.py`（4）、`test_boundary_centering.py` 迁移为“到码不平移/硬门内进下一步/超硬门停/计划 crab 保留”（8）；`test_centering_v10`、`test_dead_reckoning`、`test_v10_chain` 的 DR 纠偏断言改为“4T4D 转向、vy=0、不进入 CENTER”。
+
+### 6. 生产接线修复（19:22 实跑暴露）
+首次实跑（7/7 FINISHED、非故障）中 `acceptedAnchor` 共 1148 条且 scope/同刻均正确，但 DR 始终 `no_anchor`/`qr_visible_rejected`、CENTER 0 次：根因是 `node.local_odom_cb` 只保存 stamp/yaw/wz，未保存 x/y，`propagate_anchor` 因此返回 `badLocalOdom:x`。已修：从真实 `nav_msgs/Odometry` 保存并校验 `x/y/yaw/stamp`（非有限坐标、错误 frame、非法四元数丢弃），并把 `localX/localY/localEpoch` 与 `drAnchorValid/drAnchorRejectReason/drCorrections/drMechanicalCorrections` 写入后台诊断，避免以后静默 no_anchor。新增 `tests/test_v10_integration.py`（5 例）：真实 Odometry 消息→实际 `local_odom_cb`→实际 `anchor_event_cb`→实际 `mission.tick`→`dr_try_rebase`，RED（x 缺失、anchor_valid=False）→GREEN（anchor_valid=True、stale 随真实 pose stamp 刷新继续增长、非有限/frame 错误不落库）。同时修复诊断 bag 启动脚本：`set -u` 会中断 `source /opt/ros/*/setup.bash`，改为 `set +u` 后跨 SSH 会话存活并可用 SIGINT 优雅收尾（`logs/diagnostics/v10-run-*/start_bag_detached.sh`）。
+
+### 7. 测试
+新增 `test_v10_chain.py`（18，含 SE2 非零 refYaw 全象限、posteriorStamp 同刻、时钟域、scope/版本、裸观测不重锚、重复 correctionId、可见拒绝、13s 无码有界纠偏、yaw 冻结/gap 不补积）、`test_dr_v10.py`（14）、`test_centering_v10.py`（3）；`test_dead_reckoning` 11/11 夹具迁移到新契约。回归：continuous_correction 9、boundary_centering 11、turn_recenter 6、start_gate 15、motion_interface 29、chassis_odometry 29、diag 16、vision 11、correction 5、static_localization 33 全绿；`test_segment_execution` 3、`test_existing_chassis_feedback` 3 为 b1bcf33 基线同名失败。
+
+### 8. 尚未验证
+- 已在该版本完成一次自动运行：2026-10-26 20:06:46 启动 → 20:08:38 FINISHED（7/7 段）；内部定位估计终点距目标约 11.5mm，但前段日志轮转缺失、仅 1Hz 内部估计，**不是外部实测**。
+- 4T4D 行进转向实车收敛效果、DR 转向与 QR 重锚在实车上的长期表现未验证；16:20 模式/轮角反馈 FAULT 根因仍未证实，保护未改。
+- 不声称所有超限都继续、也不声称全部 <10mm 或"已根治跑不完"。
 
 ## v9 改动（相对 `v8` / `7d96cac`）— 2026-10-26
 

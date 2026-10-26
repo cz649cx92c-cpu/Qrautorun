@@ -128,14 +128,16 @@ class Tracker:
         self.previous_speed = value
         return value
 
-    def forward(self, pose, points, target, dt, profile=None):
+    def forward(self, pose, points, target, dt, profile=None, cross_override=None):
         cross, tangent, remaining, end_distance, curvature = geometry(pose, points, include_curvature=True)
+        # 横向反馈只允许一个来源：QR 失联时由调用方给入 DR 预测 cross，避免 fused/DR 两套叠加。
+        cross_steer = cross if cross_override is None else cross_override
         heading_error = wrap(pose.yaw-tangent)
         trial=limits_for(profile)
         target,acceleration,braking=recorded_speed_plan(pose,points,target,trial,self.acceleration,self.braking)
         v = self.limit(target,remaining,dt,acceleration,braking)
         # 前进：航向与车体侧偏都用负反馈。
-        yaw_rate = v*curvature - 1.8*heading_error - 1.5*cross
+        yaw_rate = v*curvature - 1.8*heading_error - 1.5*cross_steer
         # Bound the actual body turn command before applying a slew limit.
         # A QR position correction must not become an instantaneous steering step.
         bound = min(trial['maxYawRate'],abs(v)*trial['maxCurvature']) if trial else min(.25,abs(v)*.6)

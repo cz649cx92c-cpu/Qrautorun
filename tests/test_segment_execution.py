@@ -292,28 +292,35 @@ class SegmentExecutionTests(unittest.TestCase):
         self.assertIn('未产生姿态变化', ' | '.join(m.events))
         self.assertEqual((command.vx,command.vy,command.yaw_rate),(0.,0.,0.))
 
-    def test_turn_exit_centering_converges_then_moves_forward(self):
-        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
-        self.enter_turn(m,pose)
-        pose.x=.07  # 转向出口相对目标直线偏差 7cm（超过5cm门限，未超对中上限）
-        self.assertEqual(m.segment_executor.phase,'TURN',str(m.events))
-        outputs,ok=self._spin_with_offset(m,pose,.07,converge=True)
-        self.assertTrue(ok,'横移对中必须收敛并进入前进：'+str(m.events))
-        self.assertTrue(m.segment_executor.exit_info.get('converged'),str(m.segment_executor.exit_info))
-        self.assertTrue(m.segment_executor.centering_info.get('done'),str(m.segment_executor.centering_info))
-        last=outputs[-1]
-        self.assertEqual(last.mode,'4t4d');self.assertGreater(last.vx,0.);self.assertEqual(last.vy,0.)
-        cross,_,_,_=geometry(pose,m.segment_executor.segment['points'])
-        self.assertLessEqual(abs(cross),m.config['max_cross_track_m']+.01)
 
-    def test_turn_exit_centering_divergence_faults(self):
+    def test_turn_exit_over_hard_gate_faults_without_lateral(self):
         m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
         self.enter_turn(m,pose)
-        pose.x=.07
-        outputs,ok=self._spin_with_offset(m,pose,.07,converge=False)
+        pose.x=.07   # 转向出口横向 7cm > 5cm 硬门
+        command=None
+        for _ in range(300):
+            command=self.tick(m,pose)
+            pose.yaw+=command.yaw_rate*.05
+            if m.state=='FAULT':break
         self.assertEqual(m.state,'FAULT')
-        self.assertIn('横移对中方向异常', ' | '.join(m.events))
-        self.assertEqual((outputs[-1].vx,outputs[-1].vy),(0.,0.))
+        self.assertIn('硬门', ' | '.join(m.events))
+        self.assertEqual((command.vx,command.vy),(0.,0.))
+        self.assertFalse(m.segment_executor.phase.startswith('CENTER'))
+
+
+    def test_turn_exit_within_hard_gate_never_auto_lateral(self):
+        m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
+        self.enter_turn(m,pose)
+        pose.x=.03   # 转向出口横向 3cm：合法，允许下一段 4T4D 转向纠偏
+        bad=False
+        for _ in range(300):
+            command=self.tick(m,pose)
+            if command.mode=='crab' or abs(command.vy)>1e-9:bad=True
+            if m.segment_executor.phase.startswith('CENTER'):bad=True
+            pose.yaw+=command.yaw_rate*.05
+            if m.state=='FAULT' or m.segment_executor.phase in ('TURN_RECENTER','MOVE','ALIGN'):break
+        self.assertFalse(bad,'转向出口不得自动横移：%s'%str(m.events[:4]))
+        self.assertNotEqual(m.state,'FAULT')
 
     def test_turn_exit_beyond_centering_limit_faults(self):
         m,pose=setup([self.turn_forward_segment()],start_yaw=0.)
@@ -494,7 +501,7 @@ class SegmentExecutionTests(unittest.TestCase):
     def jump_tick(self,m,pose,observations,vx=.05,vy=0.,mode='4t4d'):
         self.now+=.05;self.seq+=1
         crab=mode=='crab'
-        fb={'seq':self.seq,'aggregate_received':self.now,'speed':abs(vx),'vx':vx,'vy_raw':vy,
+        fb={'seq':self.seq,'aggregate_received':self.now,'speed':abs(vx),'vx':vx,'vy_mps':vy,'vy_raw':vy*10.,
             'body_gear':8 if crab else 6,'steering_gear':7 if crab else 5,'steering_angle':0.,
             'angle_source':'existing_chassis','angles':[0.]*4}
         return m.tick(pose,fb,observations,[],.05)

@@ -37,7 +37,7 @@ def heading_degrees(yaw):
 class GreenhouseNode(Node):
     def __init__(self):
         super().__init__('greenhouse_navigation')
-        defaults={'execution_enabled':False,'backend_url':'http://127.0.0.1:3080','bridge_key_file':'','feedback_topic':'/chassis_info_fb','imu_topic':'/qr/imu/raw','fused_pose_topic':'/qr/localization/pose','localization_preview_topic':'/qr/localization/provisional','observation_topic':'/qr/tags/observations','feedback_calibration_verified':False,'field_freshness_verified':False,'hardware_watchdog_verified':False,'manual_takeover_verified':False,'vehicle_dimensions_verified':False,'wheel_angle_signs':[0.,0.,0.,0.],'wheel_angle_offsets':[0.,0.,0.,0.],'feedback_timeout_s':.3,'localization_timeout_s':.25,'command_timeout_s':.25,'tag_timeout_s':25.,'mode_timeout_s':8.,'stopped_speed_mps':.015,'angle_tolerance_deg':3.,'stable_feedback_samples':5,'forward_speed_mps':.12,'reverse_speed_mps':.1,'lateral_speed_mps':.06,'max_cross_track_m':.05,'max_heading_rad':.15,'max_position_sigma_m':.03,'acceleration_mps2':.1,'braking_mps2':.2}
+        defaults={'execution_enabled':False,'backend_url':'http://127.0.0.1:3080','bridge_key_file':'','feedback_topic':'/chassis_info_fb','imu_topic':'/qr/imu/raw','fused_pose_topic':'/qr/localization/pose','localization_preview_topic':'/qr/localization/provisional','observation_topic':'/qr/tags/observations','local_odom_topic':'/qr/odometry/local','feedback_calibration_verified':False,'field_freshness_verified':False,'hardware_watchdog_verified':False,'manual_takeover_verified':False,'vehicle_dimensions_verified':False,'wheel_angle_signs':[0.,0.,0.,0.],'wheel_angle_offsets':[0.,0.,0.,0.],'feedback_timeout_s':.3,'localization_timeout_s':.25,'command_timeout_s':.25,'tag_timeout_s':25.,'mode_timeout_s':8.,'stopped_speed_mps':.015,'angle_tolerance_deg':3.,'stable_feedback_samples':5,'forward_speed_mps':.12,'reverse_speed_mps':.1,'lateral_speed_mps':.06,'max_cross_track_m':.05,'max_heading_rad':.15,'max_position_sigma_m':.03,'acceleration_mps2':.1,'braking_mps2':.2}
         defaults['maintenance_mode']=False
         defaults['imu_direction_verified']=False
         self.config={}
@@ -110,7 +110,7 @@ class GreenhouseNode(Node):
         if self.turn_calibration.get('applied'):
             self.config['turn_acceptance_deg']=float(self.turn_calibration['acceptanceDeg'])
             self.config['turn_correction_tolerance_deg']=float(self.turn_calibration['correctionToleranceDeg'])
-        self.execution_diagnostics=ExecutionDiagnostics();self.mission=Mission(self.config);self.feedback=None;self.received=0.;self.pose=None;self.pose_received=0.;self.imu_received=0.;self.observations=[];self.tag_received=0.;self.camera_received=0.;self.observation_received=0.;self.camera_frame_stamp=None;self.seq=0
+        self.execution_diagnostics=ExecutionDiagnostics();self.mission=Mission(self.config);self.feedback=None;self.received=0.;self.pose=None;self.pose_received=0.;self.imu_received=0.;self.observations=[];self.qr_meta=None;self.qr_anchor=None;self.local_odom=None;self.tag_received=0.;self.camera_received=0.;self.observation_received=0.;self.camera_frame_stamp=None;self.seq=0
         self.boot_id=str(uuid.uuid4());self.commands=queue.Queue();self.acks=queue.Queue();self.survey=queue.Queue(maxsize=500);self.motion_records=queue.Queue(maxsize=3000)
         # 融合标定：只被动收集带原始 ROS 时间戳的观测/IMU 样本；不参与任何运动决策。
         self.calibration_context=None;self.calibration_last_context=None;self.calibration_samples=queue.Queue(maxsize=4000)
@@ -122,11 +122,13 @@ class GreenhouseNode(Node):
         self.start_gate={};self.start_samples=[];self.start_gate_reason=''
         self.create_subscription(ChassisInfoFb,self.config['feedback_topic'],self.feedback_cb,10)
         self.create_subscription(Odometry,self.config['fused_pose_topic'],self.pose_cb,10)
+        self.create_subscription(Odometry,self.config['local_odom_topic'],self.local_odom_cb,qos_profile_sensor_data)
         self.create_subscription(Odometry,self.config['localization_preview_topic'],self.preview_pose_cb,10)
         self.create_subscription(Odometry,'/qr/localization/static_pose',self.static_pose_cb,10)
         self.create_subscription(String,'/qr/localization/status',self.localization_status_cb,10)
         self.create_subscription(String,self.config['observation_topic'],self.observation_cb,10)
         self.create_subscription(String,'/qr/fusion/status',self.fusion_cb,10)
+        self.create_subscription(String,'/qr/localization/accepted_anchor',self.anchor_event_cb,10)
         self.create_subscription(String,'/qr/detector/status',self.detector_cb,10)
         self.create_subscription(String,'/qr/draft/status',self.mapping_cb,10)
         self.create_subscription(String,'/qr/tags/draft_observations',self.draft_observation_cb,10)
@@ -175,15 +177,22 @@ class GreenhouseNode(Node):
             try:
                 from .diag_log import get as _diag_get
                 ctl=_diag_get('control')
+                loco=getattr(self,'local_odom',None) or {}
                 ctl.write({'type':'chassisFeedback','frame':self._fb_frame,'seq':self.seq,
                     'bodyGear':_bg,'steerGear':_sg,'steerAngle':steering_angle,
                     'anglesRaw':[float(v) for v in raw],'vx':float(msg.ctrl_fb.ctrl_fb_x_linear),
+                    'vyRaw':float(msg.ctrl_fb.ctrl_fb_y_linear),
+                    'vyMps':(float(msg.ctrl_fb.ctrl_fb_y_linear)*.1 if existing else None),
+                    'yawSource':'local_ekf' if loco else 'unavailable',
+                    'localX':loco.get('x'),'localY':loco.get('y'),
+                    'localYawStamp':loco.get('stamp'),'localYaw':loco.get('yaw'),
+                    'localEpoch':loco.get('epoch'),
                     'unlock':bool(msg.io_fb.io_fb_unlock),'estop':bool(msg.io_fb.io_fb_estop),
                     'remote':bool(msg.io_fb.io_fb_joypad_ctrl),
                     'headerStamp':stamp,'recv':round(time.time(),6)})
             except Exception:
                 pass
-        self.feedback={'seq':self.seq,'aggregate_received':self.received,'vx':float(msg.ctrl_fb.ctrl_fb_x_linear),'vy_raw':float(msg.ctrl_fb.ctrl_fb_y_linear),'yaw_deg':float(msg.ctrl_fb.ctrl_fb_z_angular),'speed':max(math.hypot(msg.ctrl_fb.ctrl_fb_x_linear,msg.ctrl_fb.ctrl_fb_y_linear*(.1 if existing else 1.)),abs(msg.steering_ctrl_fb.steering_ctrl_fb_velocity),*(abs(v) for v in wheels)),'angles_raw':raw,'angles':angles,'steering_angle':steering_angle,'angle_source':'existing_chassis' if existing else 'four_wheels','steering_seq':None,'steering_received':None,'steering_fresh':False,'steering_aligned_diagnostic':steering_aligned,'steering_gear':int(msg.steering_ctrl_fb.steering_ctrl_fb_gear),'body_gear':int(msg.ctrl_fb.ctrl_fb_gear),'estop':bool(msg.io_fb.io_fb_estop),'remote_control':bool(msg.io_fb.io_fb_joypad_ctrl),'charge_state':bool(msg.io_fb.io_fb_charge_state or msg.bms_flag_fb.bms_flag_fb_charge_flag),'unlock':bool(msg.io_fb.io_fb_unlock),'lateral_aligned':aligned,'field_freshness_verified':self.config['field_freshness_verified']}
+        self.feedback={'seq':self.seq,'aggregate_received':self.received,'vx':float(msg.ctrl_fb.ctrl_fb_x_linear),'vy_raw':float(msg.ctrl_fb.ctrl_fb_y_linear),'vy_mps':(float(msg.ctrl_fb.ctrl_fb_y_linear)*.1 if existing and math.isfinite(msg.ctrl_fb.ctrl_fb_y_linear) else None),'yaw_deg':float(msg.ctrl_fb.ctrl_fb_z_angular),'speed':max(math.hypot(msg.ctrl_fb.ctrl_fb_x_linear,msg.ctrl_fb.ctrl_fb_y_linear*(.1 if existing else 1.)),abs(msg.steering_ctrl_fb.steering_ctrl_fb_velocity),*(abs(v) for v in wheels)),'angles_raw':raw,'angles':angles,'steering_angle':steering_angle,'angle_source':'existing_chassis' if existing else 'four_wheels','steering_seq':None,'steering_received':None,'steering_fresh':False,'steering_aligned_diagnostic':steering_aligned,'steering_gear':int(msg.steering_ctrl_fb.steering_ctrl_fb_gear),'body_gear':int(msg.ctrl_fb.ctrl_fb_gear),'estop':bool(msg.io_fb.io_fb_estop),'remote_control':bool(msg.io_fb.io_fb_joypad_ctrl),'charge_state':bool(msg.io_fb.io_fb_charge_state or msg.bms_flag_fb.bms_flag_fb_charge_flag),'unlock':bool(msg.io_fb.io_fb_unlock),'lateral_aligned':aligned,'field_freshness_verified':self.config['field_freshness_verified']}
         if hasattr(self,'motion_records'):
             fusion=getattr(self,'fusion',None) or {}
             record=feedback_record(msg,self.seq,fusion.get('epoch',''),self.received,existing)
@@ -262,6 +271,44 @@ class GreenhouseNode(Node):
             if all(math.isfinite(sample[key]) for key in ('stamp','gx','gy','gz')):
                 try:self.calibration_samples.put_nowait(sample)
                 except queue.Full:pass
+
+    def anchor_event_cb(self,msg):
+        """localization 真正接受 QR 校正后的内用锚事件（唯一可信 DR 重锚来源）。"""
+        try:
+            event=json.loads(msg.data)
+        except Exception:
+            return
+        if not isinstance(event,dict):return
+        event['recvMonoLocal']=time.monotonic()
+        self.qr_anchor=event
+        try:
+            from .diag_log import get as _diag_get
+            _diag_get('control').write({'type':'acceptedAnchor','event':{k:event.get(k) for k in
+                ('kind','correctionId','sourceStamp','mapId','mapVersion','localEpoch','anchorPose','sigma',
+                 'posteriorStamp','localRef','scopeGeneration')},
+                'recv':round(time.time(),6)})
+        except Exception:
+            pass
+
+    def local_odom_cb(self,msg):
+        """局部 EKF 连续位姿（/qr/odometry/local = /qr/fusion/filtered 中继，不含全局 QR 校正）。
+
+        必须保存 x/y/yaw/stamp 供 accepted-QR 锚事件做同源局部里程传播；
+        非有限坐标、错误 frame、非法四元数一律丢弃（不得存成“有效”局部里程）。
+        """
+        stamp=msg.header.stamp.sec+msg.header.stamp.nanosec/1e9
+        if msg.header.frame_id!='odom' or msg.child_frame_id!='base_link' or not math.isfinite(stamp):return
+        p=msg.pose.pose.position; q=msg.pose.pose.orientation
+        if not (math.isfinite(p.x) and math.isfinite(p.y)):return
+        norm=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w
+        if not math.isfinite(norm) or abs(norm-1.)>.02:return
+        yaw=math.atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z))
+        if not math.isfinite(yaw):return
+        fusion=getattr(self,'fusion',None) or {}
+        self.local_odom={'x':float(p.x),'y':float(p.y),'stamp':float(stamp),'yaw':float(yaw),
+                         'wz':float(msg.twist.twist.angular.z) if math.isfinite(msg.twist.twist.angular.z) else None,
+                         'recvMono':time.monotonic(),
+                         'epoch':fusion.get('epoch') if isinstance(fusion,dict) else None}
 
     def pose_cb(self,msg):
         stamp=msg.header.stamp.sec+msg.header.stamp.nanosec/1e9
@@ -408,6 +455,11 @@ class GreenhouseNode(Node):
             else:tags=collapse_group_observations(tags,self.active_boards)
             if self.active_boards:tags=[t for t in tags if t.get('groupId')]
             self.observations=tags;self.observation_received=time.monotonic();self.camera_received=self.observation_received
+            fusion=getattr(self,'fusion',None) or {}
+            self.qr_meta={'sourceStamp':stamp,'recvMono':self.observation_received,
+                          'localEpoch':batch.get('localEpoch') or (fusion.get('epoch') if isinstance(fusion,dict) else None),
+                          'mapId':(self.mission.field or {}).get('id') if getattr(self.mission,'field',None) else None,
+                          'groups':sorted({t.get('groupId') for t in tags if t.get('groupId')})}
             if self.calibration_context is not None:
                 sample={'kind':'observation','stamp':stamp,'frame':'base_link','calibrated':True,'synchronized':True,
                         'representation':batch.get('representation'),'tags':tags,
@@ -656,7 +708,9 @@ class GreenhouseNode(Node):
         except Exception:
             # Display diagnostics must never interrupt mission decisions or command output.
             diagnostic_sample={'status':'unavailable','reason':'执行诊断数据暂不可用','sampledAt':diagnostic_time}
-        cmd=self.mission.tick(self.pose,self.feedback or {},observations,conditions,dt,localization=self.localization_status or {})
+        from .dr_anchor import build_localization_context
+        loc_context=build_localization_context(self.localization_status,self.local_odom,self.qr_meta,self.qr_anchor)
+        cmd=self.mission.tick(self.pose,self.feedback or {},observations,conditions,dt,localization=loc_context)
         self._cmd_frame=getattr(self,'_cmd_frame',0)+1
         try:
             from .diag_log import get as _diag_get
@@ -667,6 +721,22 @@ class GreenhouseNode(Node):
                 ctl.write({'type':'command','frame':self._cmd_frame,
                     'vx':getattr(cmd,'vx',None),'vy':getattr(cmd,'vy',None),'wz':getattr(cmd,'wz',None),
                     'mode':getattr(cmd,'mode',None),
+                    'qrSourceStamp':(getattr(self,'qr_meta',None) or {}).get('sourceStamp'),
+                    'qrLastQualifiedAge':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('qrLastQualifiedAgeS'),
+                    'drDecision':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('last_decision'),
+                    'drCrossM':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('crossM'),
+                    'drYawSourceOk':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('yawSourceOk'),
+                    'drYawSourceReason':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('yawSourceReason'),
+                    'drVySourceOk':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('vySourceOk'),
+                    'drAnchorValid':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('anchor_valid'),
+                    'drAnchorRejectReason':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('anchor_reject_reason'),
+                    'drSteerActive':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('steeringActive'),
+                    'drSteerBiasM':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('steerBiasM'),
+                    'drSteeringSource':(getattr(getattr(self.mission,'segment_executor',None),'exit_info',None) or {}).get('steeringSource'),
+                    'drAutoLateral':False,
+                    'drCorrections':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('corrections'),
+                    'drMechanicalCorrections':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('mechanicalCorrections'),
+                    'vySuggestedMps':getattr(cmd,'vy',None),
                     'fb':{'seq':fbk.get('seq'),'bodyGear':fbk.get('body_gear'),'steerGear':fbk.get('steering_gear'),
                           'vx':fbk.get('vx'),'anglesRaw':fbk.get('angles_raw'),'steerAngle':fbk.get('steering_angle'),
                           'unlock':fbk.get('unlock'),'estop':fbk.get('estop'),'remote':fbk.get('remote_control')},
