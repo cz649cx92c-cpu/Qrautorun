@@ -27,7 +27,7 @@
 - 诊断：`executionDiagnostics` 新增 `deadReckoning`（predictedPose/predictedCrossM/qrCorrectionResidual/correctionCount 等），`robot.ts` schema 同步；不新增用户按钮。
 - 地图实时车体图标改按真实外形 0.46 m × 0.36 m 世界米制尺寸随缩放绘制（新增 `vehicleFootprintM` 显示常量），无固定像素下限/膨胀，保持 base_link 锚点与航向、长轴沿前进方向；`map.vehicle` 仍是规划/安全包络，0.46 m 不是轮距/轴距，底盘运动学未改。
 - 测试：`npm test` 208/208；boundary-centering 11/11、dead-reckoning 11/11、timing calibration 10/10、office map reload 2/2；`tsc`/`vue-tsc` rc=0。`tests/test_segment_execution.py` 3 个既有失败（改动前基线同样失败）未修复。
-- 未实车验证：DR 提前纠偏、>2 cm 边界对中、QR rebase 现场残差。dist 为 20:32 构建产物，不含车体图标改动。
+- （v8 历史阶段注记，不代表 v9：当时未实车验证 DR 提前纠偏/>2 cm 边界对中/QR rebase 现场残差；当时 dist 为 20:32 构建产物、不含车体图标改动。v9 已补齐 0.46×0.36 m 车体图标 dist，并以实车 run-173600 复核末段；DR 三项缺陷仍在 v10 修复范围内。）
 
 ### v3 十组打印占号提示修复 — 2026-10-19
 
