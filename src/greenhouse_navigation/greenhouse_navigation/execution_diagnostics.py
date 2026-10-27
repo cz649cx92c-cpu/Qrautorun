@@ -126,6 +126,9 @@ class ExecutionDiagnostics:
         centering=getattr(executor,'centering_info',None)
         base['turn']=copy.deepcopy(turn) if isinstance(turn,dict) else {}
         base['turnExit']=copy.deepcopy(exit_info) if isinstance(exit_info,dict) else {}
+        # 末段动态制动闭环的同一制动度量（速度/制动距离/预测停车误差/零速样本）。
+        brake=getattr(executor,'endpoint_brake',None)
+        base['endpointBrake']=copy.deepcopy(brake) if isinstance(brake,dict) else {}
         base['centering']=copy.deepcopy(centering) if isinstance(centering,dict) else {}
         history=getattr(executor,'centering_history',None)
         base['centeringHistory']=copy.deepcopy(history) if isinstance(history,list) else []

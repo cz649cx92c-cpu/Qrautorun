@@ -1,5 +1,20 @@
 # 变更记录
 
+## v10 增补 — 2026-10-27 末段动态制动闭环（endpoint brake ramp / stable stop / diagnostics）
+
+只改末段停车判据与诊断可见性；不改 PID/I、不加横移/倒车补偿、不放宽 5cm 硬门/定位新鲜度/档位匹配/`stable_feedback_samples`，`same_straight` 过码直行语义保留，`4T4D` 保持 `vy=0`。
+
+- `control.py`：新增统一制动度量 `brake_stop_distance(v,b,d)=v^2/(2b)+v*d`、`max_speed_for_distance`、`endpoint_brake_speed`（上式反解）、`endpoint_brake_metrics`（`pureBrakeM/velocityDelayMarginM/predictedBrakeM/predictedStopErrorM`）。`recorded_speed_plan` 与 `Tracker.limit` 里硬编码的 25 mm 末端死区全部替换为同一度量；`limit/forward/reverse/lateral` 透传 `stop_delay`。**修复根因**：旧实现到 30 mm 就把 vx 切 0，而 v=0.08 的真实制动距离是 16 mm 纯制动 + 20 mm 指令时延 = 36 mm，在 30 mm 处停不住 → 这是实车残余 14–22 mm 的根因。
+- `segment_execution.py`：MOVE 不再在固定距离切零，改由 `Tracker.limit()` 按同一度量把 vx 连续降到接近 0；END_STOP 入口 `arrive=(remaining<=endpoint_stop_window_m) or (已停稳且<=BOUNDARY_POSITION_TOLERANCE_M)`；收尾要求 `stable_feedback_samples` 帧连续 fresh 零速 + 目标码欧氏可见（<=6 cm）+ 航向一致。新增末段制动看门狗（`mode_timeout_s` 内未停稳即 fault）、反馈失效即 fault 并输出零指令、`endpoint_brake` 诊断（含 `withinWindow/enterRemainingM/zeroSamples/requiredSamples/predictedStopErrorM`）。目标靠近确认用欧氏距离而非沿路径 remaining。
+- `node.py` / `execution_diagnostics.py` / `run_log.py`（run_log 首次入库）：`endpointBrake` 同步进遥测 `command` 诊断、`executionDiagnostics.endpointBrake` 与 motion 记录，供实跑后回读标定 `braking_mps2`。**已知日志缺陷（未在本轮修）**：`node.py` stop_record 传 `samples=[0]`，导致 `stops.jsonl` 的 `zeroSamples` 恒为 1，不代表真实零速计数；真实计数看 motion 记录的 `endpointBrake.zeroSamples`。
+- `config/navigation.yaml`：新增 `endpoint_stop_window_m: 0.010`。
+- 测试：新增 `tests/test_v10_endpoint_brake.py` 18 项全过（制动度量物理一致性、规划与 limit 共用度量、禁止瞬时切零、入窗判据、连续零速、低速尾段收敛、欧氏目标距离、反馈失效/末段超时 fault 且零指令、RED 复现 30mm+v0.08 旧实现立即停）；`test_v10_run_log.py` / `test_v10_node_run_log.py` / `test_v10_continuous_straight.py` 随 `run_log.py` 首次入库。
+- 回归：部署后实机全量 38 failed / 610 passed，与部署前基线逐条 diff 完全一致（`IDENTICAL_TO_BASELINE`，无新增失败）。既有失败为：test_segment_execution 2、test_existing_chassis_feedback 3、test_runtime_acceptance 1、test_v10_wrap_classify 3、test_serial_imu 2、以及 bridge/fusion/imu_workbook/qr_coasting/node_motion/office_map_reload/sensor_status 等环境相关项。
+- 实车（run-20261027T135941，14:01:29 FINISHED 7/7 段，无 FAULT）：`enterRemainingM` 8.3–9.5 mm 全部入窗。内部估计停稳距离 Q145 6.3 mm（5/5 零速）、Q193 8.3 / Q177 7.3 / Q161 6.5（状态机已凑满 5 帧零速后立即推进，第 5 帧不再以 END_STOP phase 写日志，故日志只见 4/5）、Q113 首个 5 帧零速时 12.4 mm（最近 11.3 mm），停稳后融合位姿以 4.3 mm/s 漂移到 18.9 mm（期间 QR 校正持续递增），漂移真值未定。**未声称实车 10 mm 已验证**：全部距离是内部融合定位估计，无外部真值。
+- 已知非本轮问题：`same_straight` 过码边界 `cmd.vx` 从 0.075 掉到 0.005 再按 0.1 m/s^2 重新爬升（实车 fb.vx 一度 -0.03 m/s），源于 `Mission.transition` 重置 Tracker，既有行为，与本轮制动改动无关。
+
+
+
 ## v10 — 2026-10-26（已推送 `refs/heads/v10`）
 
 三项 DR 预测源与其锚/时间链修复；不改 EKF/IMU/地图/相机/速度/安全阈值，无前端改动。

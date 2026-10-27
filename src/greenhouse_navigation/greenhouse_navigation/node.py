@@ -3,6 +3,7 @@ import copy
 import json
 import math
 from .recorded_trial import limits_for
+from .run_log import RunLog, build_motion_record, build_stop_record
 import os
 import queue
 import threading
@@ -99,6 +100,8 @@ class GreenhouseNode(Node):
         defaults['localization_jump_max_vy_mps']=.01
         defaults['localization_jump_low_quality_s']=1.5
         defaults['localization_jump_recover_samples']=2
+        # 末段动态制动闭环：目标停车窗口（预测停车点/实测剩余必须落在此窗口内）。
+        defaults['endpoint_stop_window_m']=.010
         for key,value in defaults.items():self.declare_parameter(key,value);self.config[key]=self.get_parameter(key).value
         if self.config['maintenance_mode'] and self.config['execution_enabled']:
             raise ValueError('IMU维护模式必须禁用实体执行')
@@ -529,6 +532,139 @@ class GreenhouseNode(Node):
             checks=[item for item in checks if item[0] not in waived]
         return [{'id':id,'label':label,'ready':bool(ok)} for id,label,ok in checks]
 
+    # ---- v10 运行取证（只记录，不影响控制） ----
+    def _run_log_ensure(self):
+        if getattr(self, '_run_log', None) is not None:
+            return self._run_log
+        try:
+            ex = getattr(self.mission, 'segment_executor', None)
+            task = getattr(self.mission, 'task', None) or {}
+            field = getattr(self.mission, 'field', None) or {}
+            targets = []
+            if ex is not None:
+                tags = {t['id']: t for t in field.get('tags', [])}
+                for i, seg in enumerate(ex.segments):
+                    tag = tags.get(seg.get('toId'))
+                    if tag:
+                        targets.append({'seg': i + 1, 'from': seg.get('fromId'),
+                                        'to': seg.get('toId'),
+                                        'x': tag['x'], 'y': tag['y']})
+            run_id = time.strftime('run-%Y%m%dT%H%M%S', time.localtime())
+            base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))))), 'logs', 'diagnostics', 'runs')
+            self._run_log_targets = targets
+            self._run_log = RunLog(base, run_id)
+            self._run_log.start(meta={'runId': run_id, 'taskId': task.get('id'),
+                                      'routeId': task.get('routeId'),
+                                      'mapId': field.get('id'),
+                                      'mapVersion': task.get('mapVersion'),
+                                      'returnToStart': task.get('returnToStart', False),
+                                      'targets': targets,
+                                      'startedAt': time.time()})
+            self._run_log_id = run_id
+        except Exception:
+            self._run_log = False
+            if os.environ.get('QR_RUNLOG_DEBUG'):
+                import traceback
+                traceback.print_exc()
+        return self._run_log
+
+    def _run_log_tick(self, cmd, loc_ctx, start, now):
+        try:
+            if not getattr(self.mission, 'running', False):
+                return
+            rl = self._run_log_ensure()
+            if not rl:
+                return
+            ex = getattr(self.mission, 'segment_executor', None)
+            if ex is None:
+                return
+            seg = ex.segment or {}
+            st = ex.dr_state or {}
+            ed = (getattr(self, 'execution_diagnostics', None) and None) or {}
+            pose = self.pose
+            targets = {}
+            for t in (getattr(self, '_run_log_targets', None) or []):
+                targets[t['seg']] = t
+            idx = int(getattr(ex, 'index', 0)) + 1
+            tgt = targets.get(idx) or {}
+            cross = st.get('crossM')
+            heading = None
+            if pose is not None and seg.get('points'):
+                from .control import geometry, wrap
+                try:
+                    c, tangent, remaining, _ = geometry(pose, seg['points'])
+                    cross = c
+                    heading = wrap(pose.yaw - tangent)
+                except Exception:
+                    pass
+            fb = self.feedback or {}
+            loco = (loc_ctx or {}).get('localOdom') or {}
+            rec = build_motion_record(
+                t=now, seg=idx, frm=seg.get('fromId'), to=seg.get('toId'),
+                phase=getattr(ex, 'phase', None), mode=getattr(cmd, 'mode', None),
+                cmd={'vx': getattr(cmd, 'vx', None), 'vy': getattr(cmd, 'vy', None),
+                     'wz': getattr(cmd, 'yaw_rate', None),
+                     'rawWz': st.get('lastCommandWz'),
+                     'clampedWz': getattr(cmd, 'yaw_rate', None),
+                     'wheelAngle': getattr(cmd, 'wheel_angle', None)},
+                pose={'x': pose.x, 'y': pose.y, 'yaw': pose.yaw,
+                      'stamp': getattr(pose, 'stamp', None)} if pose else {},
+                target={'x': tgt.get('x'), 'y': tgt.get('y')},
+                cross=cross, heading=heading,
+                remaining=st.get('remainingM'),
+                dr={'decision': st.get('last_decision'), 'refValid': st.get('steerRefValid'),
+                    'refM': st.get('steerRefM'), 'refReason': st.get('steerRefReason'),
+                    'refStamp': st.get('steerRefMono'), 'refSegment': st.get('steerRefSegment'),
+                    'episode': dict(st.get('steerEpisode') or {}),
+                    'predicted': dict(st.get('pred') or {}),
+                    'predictedCross': st.get('crossM'), 'staleS': st.get('staleS'),
+                    'yawSourceOk': st.get('yawSourceOk'),
+                    'yawSourceReason': st.get('yawSourceReason'),
+                    'anchorValid': st.get('anchor_valid'),
+                    'anchorRejectReason': st.get('anchor_reject_reason'),
+                    'corrections': st.get('corrections'),
+                    'mechanicalCorrections': st.get('mechanicalCorrections')},
+                endpoint_brake=dict(getattr(ex, 'endpoint_brake', None) or {}),
+                fb={'seq': fb.get('seq'), 'age': (time.monotonic() - fb.get('aggregate_received', time.monotonic())) if fb.get('aggregate_received') else None,
+                    'bodyGear': fb.get('body_gear'), 'steerGear': fb.get('steering_gear'),
+                    'angles': fb.get('angles'), 'anglesRaw': fb.get('angles_raw'),
+                    'steerAngle': fb.get('steering_angle'),
+                    'vx': fb.get('vx'), 'vyRaw': fb.get('vy_raw'), 'vyMps': fb.get('vy_mps'),
+                    'unlock': fb.get('unlock'), 'estop': fb.get('estop'),
+                    'localX': loco.get('x'), 'localY': loco.get('y'),
+                    'localYaw': loco.get('yaw'), 'localStamp': loco.get('stamp'),
+                    'localEpoch': loco.get('epoch')},
+                source_stamp=(getattr(self, 'qr_meta', None) or {}).get('sourceStamp'),
+                qr={'sourceStamp': (getattr(self, 'qr_meta', None) or {}).get('sourceStamp'),
+                    'correctionId': (getattr(self, 'qr_anchor', None) or {}).get('correctionId'),
+                    'rebaseResidualM': (st.get('last_residual') or {}).get('rebaseResidualM')},
+                send=getattr(self, '_last_send', None))
+            rl.write_motion(rec)
+            # 停稳证据：END_STOP/ROW_END 且反馈速度接近 0
+            if getattr(ex, 'phase', '') in ('END_STOP', 'CENTER_STOP') and fb:
+                sp = fb.get('vx', fb.get('speed'))
+                if isinstance(sp, (int, float)) and abs(sp) <= self.config.get('stopped_speed_mps', .015):
+                    rl.stop_record(build_stop_record(
+                        t=now, seg=idx, to=seg.get('toId'),
+                        pose={'x': pose.x, 'y': pose.y, 'yaw': pose.yaw} if pose else {},
+                        target={'x': tgt.get('x'), 'y': tgt.get('y')},
+                        speed=sp, state=getattr(self.mission, 'state', None),
+                        samples=[0], stamp=fb.get('header_stamp')))
+        except Exception:
+            if os.environ.get('QR_RUNLOG_DEBUG'):
+                import traceback
+                traceback.print_exc()
+
+    def _run_log_send(self, cmd, state, ok):
+        self._last_send = {'sent': bool(ok), 'state': state,
+                           'mode': getattr(cmd, 'mode', None),
+                           'vx': getattr(cmd, 'vx', None),
+                           'vy': getattr(cmd, 'vy', None),
+                           'wz': getattr(cmd, 'yaw_rate', None),
+                           'wheelAngle': getattr(cmd, 'wheel_angle', None),
+                           't': time.time()}
+
     def send(self,cmd):
         if self.engaged:
             # A failed runtime gate already recorded the cause. Stop the existing
@@ -544,7 +680,9 @@ class GreenhouseNode(Node):
                 return
             state=self.mission.state if self.mission.running and not self.mission.paused else 'HOLD'
             try:
-                if not self.motion.send(cmd,state):raise RuntimeError('成熟控制接口未接受指令')
+                ok_send=self.motion.send(cmd,state)
+                self._run_log_send(cmd,state,bool(ok_send))
+                if not ok_send:raise RuntimeError('成熟控制接口未接受指令')
             except Exception as error:
                 can_health=getattr(self,'can_health',None)
                 can=can_health.status() if can_health is not None else None
@@ -712,6 +850,7 @@ class GreenhouseNode(Node):
         loc_context=build_localization_context(self.localization_status,self.local_odom,self.qr_meta,self.qr_anchor)
         cmd=self.mission.tick(self.pose,self.feedback or {},observations,conditions,dt,localization=loc_context)
         self._cmd_frame=getattr(self,'_cmd_frame',0)+1
+        self._run_log_tick(cmd,loc_context,start,diagnostic_time)
         try:
             from .diag_log import get as _diag_get
             ctl=_diag_get('control')
@@ -733,9 +872,13 @@ class GreenhouseNode(Node):
                     'drSteerActive':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('steeringActive'),
                     'drSteerBiasM':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('steerBiasM'),
                     'drSteeringSource':(getattr(getattr(self.mission,'segment_executor',None),'exit_info',None) or {}).get('steeringSource'),
+                    'drSteerRefValid':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('steerRefValid'),
+                    'drSteerRefReason':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('steerRefReason'),
+                    'drSteerEpisode':dict((getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('steerEpisode') or {}),
                     'drAutoLateral':False,
                     'drCorrections':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('corrections'),
                     'drMechanicalCorrections':(getattr(getattr(self.mission,'segment_executor',None),'dr_state',None) or {}).get('mechanicalCorrections'),
+                    'endpointBrake':dict(getattr(getattr(self.mission,'segment_executor',None),'endpoint_brake',None) or {}),
                     'vySuggestedMps':getattr(cmd,'vy',None),
                     'fb':{'seq':fbk.get('seq'),'bodyGear':fbk.get('body_gear'),'steerGear':fbk.get('steering_gear'),
                           'vx':fbk.get('vx'),'anglesRaw':fbk.get('angles_raw'),'steerAngle':fbk.get('steering_angle'),

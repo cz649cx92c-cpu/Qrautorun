@@ -42,3 +42,5 @@ greenhouse_navigation:
     max_position_sigma_m: 0.03
     acceleration_mps2: 0.10
     braking_mps2: 0.20
+    # 末段动态制动闭环：预测停车点/实测剩余进入该窗口且连续零速样本足够才停稳完成。
+    endpoint_stop_window_m: 0.010

@@ -3,6 +3,9 @@ import copy
 import math
 import time
 from .control import Command, Pose, geometry, wrap
+from .control import brake_stop_distance
+from .control import endpoint_brake_metrics as brake_metrics_at
+from .control import endpoint_brake_speed
 from .dr_anchor import anchor_event_ok, mission_scope, propagate_anchor
 from .recorded_trial import limits_for
 from .start_gate import segment_start_check
@@ -139,6 +142,8 @@ def local_yaw_step(state, loco, now_mono, max_gap=YAW_LOCAL_MAX_GAP_S):
 class SegmentExecutor:
     # Approach and stopped QR confirmation use the same endpoint acceptance radius.
     BOUNDARY_POSITION_TOLERANCE_M = .06
+    # 末段停车目标窗口：预测停车点（已停稳时等于实测剩余）必须落在此窗口内才算停到位。
+    ENDPOINT_STOP_WINDOW_M = .010
 
     def __init__(self,mission,segments):
         validate_segments(segments)
@@ -166,12 +171,38 @@ class SegmentExecutor:
         # Last normal cross-track sample before any suspected localization jump.
         self.last_gate_pose=None;self.last_gate_cross=None
         self.localization_jump={};self.jump_state=None
+        # 末段动态制动闭环：进入 END_STOP 前先按制动度量减速，进入后靠实测零速确认。
+        self.endpoint_brake={};self._stop_samples=0;self._endpoint_wait_since=None
 
     @property
     def segment(self):return self.segments[self.index]
 
     @property
     def turning(self):return self.phase in ('TURN','TURN_STOP')
+
+    def next_action_kind(self):
+        """分类当前段到码后的动作：turn/lateral/reverse/final/same_straight。"""
+        nxt = self.index + 1
+        if nxt >= len(self.segments):
+            return 'final'
+        cur = self.segment
+        n = self.segments[nxt]
+        if n.get('mode') == 'crab' or n.get('direction') == 'lateral':
+            return 'lateral'
+        if n.get('direction') == 'reverse':
+            return 'reverse'
+        # 同向直行优先：两段都是 4t4d forward 且车头方向连续（含 ±180 环绕等价）。
+        # 不能因为 next 带 turn_forward 就判 turn——真实路线里同向段也可能带该 strategy。
+        if (cur.get('mode') == '4t4d' and n.get('mode') == '4t4d'
+                and cur.get('direction') == 'forward' and n.get('direction') == 'forward'):
+            cur_yaw = cur.get('bodyYaw')
+            nxt_yaw = n.get('bodyYaw')
+            if cur_yaw is not None and nxt_yaw is not None:
+                if abs(wrap(nxt_yaw - cur_yaw)) <= math.radians(20.):
+                    return 'same_straight'
+        if n.get('strategy') == TURN_STRATEGY:
+            return 'turn'
+        return 'turn'
 
     def turn_required(self):
         """Only an explicitly chosen turn_forward 4T4D interval rotates in place."""
@@ -227,6 +258,92 @@ class SegmentExecutor:
 
     def zero(self):return Command(mode=self.m.mode,wheel_angle=self.m.target_angle)
 
+    # ---- 末段动态制动闭环（速度规划/限幅/停车判据共用一个制动度量） ----
+    def endpoint_brake_delay(self):
+        """指令时延余量：保守取命令超时，避免把已发出的速度算成还没走。"""
+        return max(0., float(self.m.config.get('command_timeout_s', .25)))
+
+    def endpoint_brake_rate(self, fb):
+        """实际使用的制动减速度；配置缺省时退回 Tracker 的制动上限。"""
+        configured = float(self.m.config.get('braking_mps2', self.m.tracker.braking) or 0.)
+        return min(configured, float(self.m.tracker.braking)) if configured > 0. else float(self.m.tracker.braking)
+
+    def endpoint_speed(self, fb):
+        """用于制动度量的当前速度：只取新鲜反馈，缺失即按 0 处理（不伪造前进）。
+
+        横移区间的行进速度在 vy 上；用 vy 才能让末端收敛与 limit() 的
+        ``speed*sin(travel)`` 使用同一物理量。
+        """
+        if self.segment.get('mode') == 'crab':
+            lateral = feedback_lateral_velocity(fb)
+            if _finite(lateral):
+                return abs(float(lateral))
+        value = fb.get('vx')
+        if not _finite(value):
+            value = fb.get('speed')
+        return abs(float(value)) if _finite(value) else 0.
+
+    def endpoint_brake_metrics(self, fb, remaining):
+        """末段制动结构化度量，写入执行诊断与 run log，供跑后复算。"""
+        return brake_metrics_at(self.endpoint_speed(fb), remaining,
+                                self.endpoint_brake_rate(fb), self.endpoint_brake_delay())
+
+    def endpoint_stop_ready(self, fb, remaining):
+        """END_STOP 收尾判据：预测停车点落在目标窗口内且连续零速样本已足够。"""
+        metrics = self.endpoint_brake_metrics(fb, remaining)
+        window = self.endpoint_stop_window()
+        inside = abs(metrics['predictedStopErrorM']) <= window
+        zeros = self._stop_samples >= int(self.m.config['stable_feedback_samples'])
+        return inside and zeros, metrics, zeros
+
+    def _endpoint_tick(self, fb, remaining):
+        """累计连续零速样本；非零速立即清零，禁止用指令速度冒充实测零速。
+
+        只有进入末段制动看门狗范围后才开始累计——起步/换挡阶段的停车静止帧
+        不能被当作「已到终点并停稳」的证据。
+        """
+        speed = self.endpoint_speed(fb)
+        near = remaining <= self.endpoint_watch_range()
+        if near and speed <= float(self.m.config['stopped_speed_mps']):
+            self._stop_samples += 1
+        else:
+            self._stop_samples = 0
+        self.endpoint_brake = self.endpoint_brake_metrics(fb, remaining)
+        # 进入末段制动时的剩余距离/耗时是跨帧诊断锚点，不能被后续 tick 覆盖。
+        previous = getattr(self, '_endpoint_enter', None) or {}
+        self.endpoint_brake.update({k: v for k, v in previous.items() if k not in self.endpoint_brake})
+        self.endpoint_brake['zeroSamples'] = self._stop_samples
+        self.endpoint_brake['requiredSamples'] = int(self.m.config['stable_feedback_samples'])
+        self.endpoint_brake['watchRangeM'] = self.endpoint_watch_range()
+        return self.endpoint_brake
+
+    def enter_endpoint_brake(self, remaining):
+        """MOVE → END_STOP：记录进入时刻，用于「停不住就报故障」的超时判据。"""
+        self.phase='END_STOP';self._endpoint_wait_since=time.monotonic()
+        window=self.endpoint_stop_window()
+        self._endpoint_enter={'enterRemainingM':remaining,'windowM':window,
+                              'withinWindow':abs(remaining)<=window}
+        self.endpoint_brake=dict(self.endpoint_brake or {})
+        self.endpoint_brake.update(self._endpoint_enter)
+        self.m.transition('ROW_END')
+
+    def endpoint_stop_window(self):
+        return max(0., float(self.m.config.get('endpoint_stop_window_m', self.ENDPOINT_STOP_WINDOW_M)))
+
+    def endpoint_watch_range(self):
+        """末段制动看门狗起点：进入该剩余距离后必须在 mode_timeout_s 内停稳。"""
+        return max(.06, brake_stop_distance(self.endpoint_target_speed(),
+                                            self.endpoint_brake_rate(None),
+                                            self.endpoint_brake_delay())
+                   + 2. * self.endpoint_stop_window())
+
+    def endpoint_target_speed(self):
+        """本段计划的最高前进/倒车/横移速度，用于估计制动看门狗范围。"""
+        s = self.segment
+        if s['mode'] == 'crab':
+            return float(self.m.task.get('lateralSpeed', .05))
+        return float(self.m.task.get('reverseSpeed' if s['direction'] == 'reverse' else 'forwardSpeed', .08))
+
     def pause(self):
         self.m.stable=0;self.m.last_sample=None
         if self.phase in ('MOVE','ALIGN','TURN','TURN_STOP','TURN_RECENTER','CENTER_ALIGN','CENTER_MOVE','CENTER_STOP'):self.phase='RECOVER_STOP'
@@ -252,6 +369,8 @@ class SegmentExecutor:
         self.last_gate_pose=None;self.last_gate_cross=None;self.localization_jump={};self.jump_state=None
         # 每段进入 MOVE 时重新建立 dead-reckoning 锚点。
         self.dr_state=None
+        # 末段制动闭环状态按段重置：上一段的零速样本不得用于本段停稳确认。
+        self.endpoint_brake={};self._stop_samples=0;self._endpoint_wait_since=None
         self.turn_info={'status':'idle','targetDeg':None,'beforeYawDeg':None,'completionYawDeg':None,
                         'residualDeg':None,'acceptanceDeg':math.degrees(self.turn_acceptance()),
                         'correctionToleranceDeg':math.degrees(self.correction_tolerance()),
@@ -283,6 +402,15 @@ class SegmentExecutor:
             near=math.hypot(pose.x-target['x'],pose.y-target['y'])<=self.BOUNDARY_POSITION_TOLERANCE_M
             self.arrival_seen=near and any(o.get('id')==tag for o in observations)
             stopped=m.stable_feedback(fb)
+            if self.phase=='END_STOP':
+                # 末段制动度量只做记录与诊断；停稳完成仍由「连续 fresh 零速反馈 +
+                # 目标码在边界容差内」判定。窗口 gate 发生在 MOVE→END_STOP 入口，
+                # 这里不再二次收紧，否则实车残余会让区间永远收不了尾。
+                _,_,remaining_now,_=geometry(pose,s['points'])
+                metrics=self._endpoint_tick(fb,remaining_now)
+                metrics['withinWindow']=remaining_now<=self.endpoint_stop_window()
+                metrics['windowM']=self.endpoint_stop_window()
+                self.exit_info['endpointBrake']=dict(metrics)
             if stopped and self.phase=='RECOVER_STOP':return self.align()
             if stopped and self.arrival_seen:
                 expected_yaw=s['endYaw'] if self.phase=='END_STOP' else s['bodyYaw']
@@ -632,7 +760,12 @@ class SegmentExecutor:
                        'last_qr_recv_mono':None,'qr_skipped_reason':None,
                        'stamp_time':time.monotonic(),'corrections':0,'travel':0.,
                        'divergence_pending':0,'last_decision':'anchor','crossM':cross,
-                       'last_residual':None}
+                       'last_residual':None,
+                       'steerRefM':None,'steerRefValid':False,'steerRefReason':'init',
+                       'steerRefMono':None,'steerRefSegment':self.index,'steerRefStamp':None,
+                       'steerEpisode':{'active':False,'attempts':0,'completed':0,
+                                       'startedMono':None,'distance':0.,'reason':'init',
+                                       'lastCross':None,'convergedSamples':0,'blocked':False}}
 
     def dr_integrate(self,fb,dt,loco=None):
         """轮速 vx/vy(SI) + 局部 EKF 连续 yaw 增量积分；来源失效时不瞎积分。"""
@@ -659,6 +792,49 @@ class SegmentExecutor:
         state['pred']['x']+= (vx*math.cos(yaw)-lateral*math.sin(yaw))*dt
         state['pred']['y']+= (vx*math.sin(yaw)+lateral*math.cos(yaw))*dt
         state['pred']['yaw']=wrap(yaw+dyaw)
+
+    def steer_episode_begin(self,state,cross,reason='start'):
+        """开始一次 4T4D 纠偏 episode：attempt 在 episode 开始计一次，距离按沿行进累计。"""
+        ep=state['steerEpisode']
+        if ep.get('active'):
+            return
+        ep.update({'active':True,'startedMono':time.monotonic(),'distance':0.,
+                   'reason':reason,'lastCross':cross,'convergedSamples':0,'blocked':False})
+        ep['attempts']=int(ep.get('attempts',0))+1
+        state['mechanicalCorrections']=ep['attempts']
+
+    def steer_episode_end(self,state,reason,clear_ref=True):
+        ep=state.get('steerEpisode') or {}
+        if ep.get('active'):
+            ep['active']=False;ep['reason']=reason
+        if clear_ref:
+            state['steerRefValid']=False
+            state['steerRefReason']=reason
+
+    def steer_ref_invalidate(self,state,reason):
+        state['steerRefValid']=False
+        state['steerRefReason']=reason
+        self.steer_episode_end(state,reason,clear_ref=False)
+
+    def steer_ref_update(self,state,cross):
+        """每个有效 DR 积分周期用最新预测 cross 刷新 steer 参考。"""
+        state['steerRefM']=round(float(cross),4)
+        state['steerRefValid']=True
+        state['steerRefReason']='ok'
+        state['steerRefMono']=time.monotonic()
+        state['steerRefSegment']=self.index
+        ep=state.get('steerEpisode') or {}
+        if ep.get('active'):
+            prev=ep.get('lastCross')
+            done=self.dr_target()
+            if abs(cross)<=done:
+                ep['convergedSamples']=int(ep.get('convergedSamples',0))+1
+                if ep['convergedSamples']>=3:
+                    ep['completed']=int(ep.get('completed',0))+1
+                    self.steer_episode_end(state,'completed')
+            else:
+                ep['convergedSamples']=0
+            ep['lastCross']=cross
 
     def dr_try_rebase(self,pose,fb,observations,pose_cross,remaining,anchor=None,loco=None):
         """只用 localization 真正接受 QR 校正的事件锚；事件须同 scope/版本/epoch/新鲜/未重复，
@@ -693,6 +869,7 @@ class SegmentExecutor:
             state['crossM']=pose_cross;state['needs_anchor']=False;state['divergence_pending']=0
             state['last_correction_id']=anchor.get('correctionId')
             state['qr_qualified_mono']=float(anchor['recvMono'])
+            self.steer_episode_end(state,'reanchor')
             state['last_decision']='anchored'
             entry['decision']='anchored'
             self.dr_history.append(entry);self.dr_history=self.dr_history[-8:]
@@ -712,6 +889,7 @@ class SegmentExecutor:
         state['anchor_pose']=tuple(pose_now);state['anchor_stamp']=float(anchor['sourceStamp'])
         state['anchor_cross']=pose_cross;state['crossM']=pose_cross
         state['corrections']+=1;state['divergence_pending']=0;state['last_decision']='qr_track'
+        self.steer_episode_end(state,'reanchor')
         state['last_correction_id']=anchor.get('correctionId')
         state['qr_qualified_mono']=float(anchor['recvMono'])
         state['last_rebase_source']=float(anchor['sourceStamp'])
@@ -756,39 +934,66 @@ class SegmentExecutor:
         raw_fresh=isinstance(raw,dict) and _finite(raw.get('recvMono')) and 0<=now-float(raw['recvMono'])<=.4
         accepted_recent=_finite(state.get('qr_qualified_mono')) and now-float(state['qr_qualified_mono'])<=.4
         state['qrRawFresh']=bool(raw_fresh)
+        # 每个有效 DR 积分周期都用最新预测 cross 刷新 steer 参考（不是只在触发时写一次）
+        ep0=state.get('steerEpisode') or {}
+        if (state.get('yawSourceOk',True) and state.get('anchor_valid')
+                and not state.get('needs_anchor') and not rebased
+                and not ep0.get('blocked')):
+            self.steer_ref_update(state,dr_cross)
         if raw_fresh and not accepted_recent:
             # 板可见但观测未被接受（低质/scope 等原因）：不得当作真实无码去主动纠偏
+            self.steer_ref_invalidate(state,'qr_visible_rejected')
             state['last_decision']='qr_visible_rejected'
             return pose_cross,None
         if not state.get('anchor_valid'):
+            self.steer_ref_invalidate(state,'no_anchor')
             state['last_decision']='no_anchor'
             return pose_cross,None
         if state.get('needs_anchor'):
+            self.steer_ref_invalidate(state,'needs_anchor')
             state['last_decision']='needs_anchor'
             return pose_cross,None
-        if m.state=='FAULT':return pose_cross,'zero'
+        if m.state=='FAULT':
+            self.steer_ref_invalidate(state,'fault')
+            return pose_cross,'zero'
         if self.centering is not None:
+            self.steer_ref_invalidate(state,'centering')
             state['last_decision']='correcting'
             return pose_cross,None
         if not state.get('yawSourceOk',True):
+            self.steer_ref_invalidate(state,'yaw_source_invalid')
             state['last_decision']='yaw_source_invalid'
             return pose_cross,None
         # try_rebase 已给出明确决策（skip_low_quality/rebased/diverged...）时保留之
         if not rebased:
             state['last_decision']='predict' if stale_s>self.dr_min_stale_s() else 'qr_track'
         trigger=self.dr_trigger();hard=float(m.config['max_cross_track_m'])
-        budget=(int(state.get('mechanicalCorrections',0))<self.dr_correction_limit()
-                and state['travel']<self.dr_correction_travel())
         s=self.segment
+        ep=state['steerEpisode']
+        # 4T4D 纠偏 episode 距离按沿行进距离累计（abs(vx)*dt），不复用旧 crab 0.05m 横移预算
+        if ep.get('active') and s.get('mode')=='4t4d':
+            ep['distance']=float(ep.get('distance',0.))+abs(_finite(fb.get('vx')) and float(fb.get('vx')) or 0.)*dt
+        if abs(dr_cross)>hard:
+            self.steer_ref_invalidate(state,'hard_limit')
+            m.fault(f"DR 预测横向偏差 {dr_cross*100:+.1f} cm 超过硬上限 {hard*100:.1f} cm（二维码间丢失校正），停车")
+            return pose_cross,'zero'
+        if ep.get('active'):
+            limit=float(m.config.get('dr_steer_distance_m',self.dr_correction_travel()))
+            timeout=float(m.config.get('dr_steer_timeout_s',6.0))
+            if ep['distance']>limit:
+                ep['blocked']=True
+                self.steer_episode_end(state,'distance')
+            elif time.monotonic()-float(ep.get('startedMono') or time.monotonic())>timeout:
+                ep['blocked']=True
+                self.steer_episode_end(state,'timeout')
+        budget=(int(ep.get('attempts',0))<self.dr_correction_limit()
+                and not ep.get('blocked')
+                and (not ep.get('active') or ep.get('reason')=='init'))
         if (s.get('mode')=='4t4d' and s.get('direction')=='forward'
                 and abs(dr_cross)>=trigger and budget and remaining>=self.dr_min_remaining()
-                and stale_s>=self.dr_min_stale_s()):
-            if abs(dr_cross)>hard:
-                m.fault(f"DR 预测横向偏差 {dr_cross*100:+.1f} cm 超过硬上限 {hard*100:.1f} cm（二维码间丢失校正），停车")
-                return pose_cross,'zero'
-            # 新运动语义：行驶中只允许 4T4D 左右行进转向，不切 crab、不平移、不原地转、不倒退。
-            # 转向由下方 Tracker 的既有航向/横向负反馈闭环消费（预测 cross 作为唯一码间参考）。
-            state['mechanicalCorrections']=int(state.get('mechanicalCorrections',0))+1
+                and stale_s>=self.dr_min_stale_s() and not state.get('needs_anchor')
+                and state.get('yawSourceOk',True)):
+            self.steer_episode_begin(state,dr_cross)
             state['last_decision']='steer_4t4d'
             state['steerBiasM']=round(dr_cross,4)
             state['steeringActive']=True
@@ -818,15 +1023,64 @@ class SegmentExecutor:
         cross,dr_action=self.dr_update(pose,fb,observations,dt,cross,remaining)
         if dr_action=='zero':return zero
         a,b=points[-2:];length=math.hypot(b['x']-a['x'],b['y']-a['y']);past=((pose.x-b['x'])*(b['x']-a['x'])+(pose.y-b['y'])*(b['y']-a['y']))/length
-        if remaining<=.03:
-            if end>self.BOUNDARY_POSITION_TOLERANCE_M:
-                target_visible=any(o.get('id')==s['toId'] for o in observations)
-                yaw_error=wrap(pose.yaw-s['endYaw'])
-                m.fault(f"已到区间末端但未靠近目标二维码：目标=Q{s['toId']:03}，距离={end*100:.1f}厘米（容差{self.BOUNDARY_POSITION_TOLERANCE_M*100:.1f}厘米），剩余={remaining*100:.1f}厘米，侧偏={cross*100:.1f}厘米，航向差={math.degrees(yaw_error):.1f}°，目标码可见={target_visible}")
+        kind=self.next_action_kind()
+        if kind=='same_straight' and remaining<=.03:
+            # 连续同向直行：过码不停车，直接推进到下一段并保持 4T4D forward。
+            # 不重置 DR/steer episode、不重复起点门禁、不发零指令。
+            self.pass_log=getattr(self,'pass_log',[])
+            self.pass_log.append({'t':round(time.time(),3),'seg':self.index+1,
+                                  'from':s.get('fromId'),'to':s.get('toId'),
+                                  'kind':'passThrough','action':'same_straight',
+                                  'crossM':round(cross,4),
+                                  'remainingM':round(remaining,4),
+                                  'vx':round(float(fb.get('vx') or 0.),4)})
+            self.exit_info['passThrough']={'seg':self.index+1,'to':s.get('toId'),
+                                           'action':'same_straight',
+                                           'crossM':round(cross,4)}
+            self.m.log(f"过码连续直行（不停车）：Q{s.get('toId'):03}，横向 {cross*100:+.1f} cm")
+            self.index+=1;self.arrival_seen=False
+            self.phase='MOVE';self.m.transition('FORWARD')
+            return self.move_command(pose,fb,observations,dt)
+        # 末段动态制动闭环：停车类动作不再在 30mm 处直接把 vx 切零，而是由 Tracker
+        # 用与规划完全相同的制动度量（含指令时延）把 vx 连续降到接近 0；进入
+        # END_STOP 的距离由同一度量决定，残余误差如实记录，不伪造 10mm 精度。
+        if kind!='same_straight':
+            metrics=self._endpoint_tick(fb,remaining)
+            window=self.endpoint_stop_window()
+            if self._endpoint_wait_since is None and remaining<=self.endpoint_watch_range():
+                self._endpoint_wait_since=time.monotonic()
+            stopped_now=metrics['vx']<=float(m.config['stopped_speed_mps'])
+            # 进入 END_STOP 的两种情形：
+            # 1) 正常逼近：剩余距离进入目标窗口（此时 vx 已按同一制动度量降下来）；
+            # 2) 已实测停住且还在边界容差内：再制动也无意义，按实测残余收尾，
+            #    但窗口外会如实标记 withinWindow=false，绝不声明 10mm 精度。
+            arrive=(remaining<=window) or (stopped_now and remaining<=self.BOUNDARY_POSITION_TOLERANCE_M)
+            if arrive:
+                if end>self.BOUNDARY_POSITION_TOLERANCE_M:
+                    target_visible=any(o.get('id')==s['toId'] for o in observations)
+                    yaw_error=wrap(pose.yaw-s['endYaw'])
+                    m.fault(f"已到区间末端但未靠近目标二维码：目标=Q{s['toId']:03}，距离={end*100:.1f}厘米（容差{self.BOUNDARY_POSITION_TOLERANCE_M*100:.1f}厘米），剩余={remaining*100:.1f}厘米，侧偏={cross*100:.1f}厘米，航向差={math.degrees(yaw_error):.1f}°，目标码可见={target_visible}")
+                    return zero
+                metrics['withinWindow']=abs(metrics['predictedStopErrorM'])<=window
+                metrics['windowM']=window
+                self.arrival_seen=any(o.get('id')==s['toId'] for o in observations)
+                self.exit_info['endCrossM']=cross;self.exit_info['status']='completed'
+                self.exit_info['endpointBrake']=dict(metrics)
+                if metrics['withinWindow']:
+                    self.m.log(f"末段制动进入目标窗口：剩余 {remaining*1000:.1f} mm（窗口 ±{window*1000:.0f} mm），"
+                               f"实测 vx={metrics['vx']:.3f} m/s，预测停车误差 "
+                               f"{metrics['predictedStopErrorM']*1000:+.1f} mm，等待连续零速确认")
+                else:
+                    self.m.log(f"末段制动未进入目标窗口（如实记录）：剩余 {remaining*1000:.1f} mm，"
+                               f"窗口 ±{window*1000:.0f} mm，实测 vx={metrics['vx']:.3f} m/s")
+                self.enter_endpoint_brake(remaining)
                 return zero
-            self.phase='END_STOP';self.arrival_seen=any(o.get('id')==s['toId'] for o in observations);m.transition('ROW_END')
-            self.exit_info['endCrossM']=cross;self.exit_info['status']='completed'
-            return zero
+            if (self._endpoint_wait_since is not None
+                    and time.monotonic()-self._endpoint_wait_since>float(m.config['mode_timeout_s'])):
+                m.fault(f"末段制动闭环超时：剩余 {remaining*1000:.1f} mm（目标窗口 ±{window*1000:.0f} mm），"
+                        f"实测 vx={metrics['vx']:.3f} m/s，预测制动距离 {metrics['predictedBrakeM']*1000:.1f} mm，"
+                        f"连续零速 {int(metrics['zeroSamples'])}/{int(m.config['stable_feedback_samples'])} 帧；未在目标窗口内停稳")
+                return zero
         if past>.045 and remaining<.1:m.fault('越过区间终点');return zero
         body_target=s['bodyYaw'] if s['mode']=='crab' else wrap(tangent+(math.pi if s['direction']=='reverse' else 0))
         angle=wrap(pose.yaw-body_target)
@@ -861,25 +1115,36 @@ class SegmentExecutor:
         if s['mode']=='crab':
             target=m.task['lateralSpeed']*(.5 if abs(cross)>.025 else 1.)
             trial=limits_for(s.get('executionProfile'))
-            speed=m.tracker.limit(min(target,trial['maxSpeed']) if trial else target,remaining,dt,trial['acceleration'] if trial else None,trial['braking'] if trial else None)
+            speed=m.tracker.limit(min(target,trial['maxSpeed']) if trial else target,remaining,dt,
+                                  trial['acceleration'] if trial else None,trial['braking'] if trial else None,
+                                  stop_delay=self.endpoint_brake_delay())
             travel=math.atan2(points[-1]['y']-points[0]['y'],points[-1]['x']-points[0]['x'])-s['bodyYaw']
             return Command(mode='crab',vx=speed*math.cos(travel),vy=speed*math.sin(travel),wheel_angle=m.target_angle)
         target=m.task['reverseSpeed'] if s['direction']=='reverse' else m.task['forwardSpeed']
         scale=max(1.,abs(cross)/.025,abs(angle)/heading_limit);target*=max(.25,1./scale)
         st=self.dr_state
         cross_override=None
+        ep=(st or {}).get('steerEpisode') or {}
         if (s['direction']=='forward' and st is not None and st.get('anchor_valid')
-                and float(st.get('staleS',0.))>=self.dr_min_stale_s() and _finite(st.get('steerBiasM'))):
+                and st.get('steerRefValid') and not st.get('needs_anchor')
+                and st.get('yawSourceOk',True) and ep.get('active')
+                and st.get('steerRefSegment')==self.index
+                and _finite(st.get('steerRefM'))
+                and float(st.get('staleS',0.))>=self.dr_min_stale_s()
+                and time.monotonic()-float(st.get('steerRefMono') or 0.)<=.5):
+            st['steerBiasM']=float(st['steerRefM'])
             # QR 失联期间：DR 预测 cross 是唯一横向反馈来源；位姿/剩余距离仍用实测融合位姿。
-            cross_override=float(st['steerBiasM'])
+            cross_override=float(st['steerRefM'])
             self.exit_info['steeringSource']='predicted_cross_4t4d'
             self.exit_info['steerCrossM']=round(cross_override,4)
         else:
             self.exit_info['steeringSource']='fused_4t4d'
-        command=(m.tracker.reverse(pose,points,target,dt,profile=s.get('executionProfile'))[0]
+        command=(m.tracker.reverse(pose,points,target,dt,profile=s.get('executionProfile'),
+                                   stop_delay=self.endpoint_brake_delay())[0]
                  if s['direction']=='reverse' else
                  m.tracker.forward(pose,points,target,dt,profile=s.get('executionProfile'),
-                                   cross_override=cross_override)[0])
+                                   cross_override=cross_override,
+                                   stop_delay=self.endpoint_brake_delay())[0])
         # A 4T4D interval only ever translates along the body x axis. Forcing the
         # mode/vy here means a lateral body velocity can never be passed off as
         # forward progress, whatever the tracker returns.

@@ -114,7 +114,7 @@ class RealCallbackChain(unittest.TestCase):
                 break
         # 事件必须新鲜（生产上 localization 在观察时立即发），同刻 posterior/localRef
         self.feed_odom(x=0., y=0., yaw=0., stamp=100.0)
-        self.feed_anchor(pose=(-.76, -.18, math.radians(179)), local=(0., 0., 0., 100.0),
+        self.feed_anchor(pose=(0., 0., 0.), local=(0., 0., 0., 100.0),
                          posterior_stamp=100.0, recv_mono=self.now)
         self.now += .05
         m.tick(pose, self.fb(.08, .08), [{'id': m.segment_executor.segment['fromId']}], [], .05,
@@ -142,7 +142,7 @@ class RealCallbackChain(unittest.TestCase):
         self.assertIsNone(self.node.local_odom, '错误 frame 不得接受')
     def test_stale_grows_after_real_anchor_and_pose_stamp_refresh(self):
         self.feed_odom(x=0., y=0., yaw=0., stamp=100.0)
-        self.feed_anchor(pose=(-.76, -.18, math.radians(179)), local=(0., 0., 0., 100.0),
+        self.feed_anchor(pose=(0., 0., 0.), local=(0., 0., 0., 100.0),
                          posterior_stamp=100.0, recv_mono=self.now)
         m, pose = setup()
         pose.sigma = .007; pose.stamp = 1.0
@@ -159,7 +159,7 @@ class RealCallbackChain(unittest.TestCase):
             if m.segment_executor.phase == 'MOVE':
                 break
         self.feed_odom(x=0., y=0., yaw=0., stamp=100.0)
-        self.feed_anchor(pose=(-.76, -.18, math.radians(179)), local=(0., 0., 0., 100.0),
+        self.feed_anchor(pose=(0., 0., 0.), local=(0., 0., 0., 100.0),
                          posterior_stamp=100.0, recv_mono=self.now)
         self.now += .05
         m.tick(pose, self.fb(.08, .08), [{'id': m.segment_executor.segment['fromId']}], [], .05,
