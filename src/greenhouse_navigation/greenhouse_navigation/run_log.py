@@ -43,19 +43,32 @@ def build_motion_record(t, seg, frm, to, phase, mode, cmd, pose, target, cross, 
             'endpointBrake': brake}
 
 
-def build_stop_record(t, seg, to, pose, target, speed, state, samples, stamp):
+def build_stop_record(t, seg, to, pose, target, speed, state, samples, stamp,
+                      distance_m=None, distance_raw_first_m=None,
+                      distance_raw_last_m=None, stop_reason=None,
+                      pose_stability=None):
+    """一条停稳证据。v11 起 samples 必须是真实连续零速帧数（不再传 [0]），
+    保留稳定窗口中位数代表值与 raw first/last；旧调用方式保持兼容。"""
     px, py = _f(pose.get('x')), _f(pose.get('y'))
     tx, ty = _f(target.get('x')), _f(target.get('y'))
     dist = None
     if None not in (px, py, tx, ty):
         dist = round(1000. * math.hypot(px - tx, py - ty), 1)
+    if _f(distance_m) is not None:
+        dist = round(1000. * float(distance_m), 1)
+    zeros = len(samples) if isinstance(samples, (list, tuple)) else int(samples or 0)
+    raw_first = None if _f(distance_raw_first_m) is None else round(1000. * float(distance_raw_first_m), 1)
+    raw_last = None if _f(distance_raw_last_m) is None else round(1000. * float(distance_raw_last_m), 1)
     return {'t': round(float(t), 6), 'seg': seg, 'to': to,
             'pose': {'x': px, 'y': py, 'yaw': _f(pose.get('yaw'))},
             'target': {'x': tx, 'y': ty}, 'distance_mm': dist,
             'speed': _f(speed), 'state': state,
-            'zeroSamples': len(samples) if isinstance(samples, (list, tuple)) else int(samples or 0),
+            'zeroSamples': zeros,
+            'stableZeroSamples': zeros,
+            'distanceRawFirstMm': raw_first, 'distanceRawLastMm': raw_last,
+            'stopReason': stop_reason,
+            'poseStability': dict(pose_stability) if isinstance(pose_stability, dict) else {},
             'stamp': _f(stamp)}
-
 
 class RunLog:
     """独立 run 目录 + 分片 JSONL；后台线程写，队列有界，阻塞时计数丢弃。"""

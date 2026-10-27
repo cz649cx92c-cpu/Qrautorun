@@ -39,6 +39,12 @@ class GreenhouseNode(Node):
     def __init__(self):
         super().__init__('greenhouse_navigation')
         defaults={'execution_enabled':False,'backend_url':'http://127.0.0.1:3080','bridge_key_file':'','feedback_topic':'/chassis_info_fb','imu_topic':'/qr/imu/raw','fused_pose_topic':'/qr/localization/pose','localization_preview_topic':'/qr/localization/provisional','observation_topic':'/qr/tags/observations','local_odom_topic':'/qr/odometry/local','feedback_calibration_verified':False,'field_freshness_verified':False,'hardware_watchdog_verified':False,'manual_takeover_verified':False,'vehicle_dimensions_verified':False,'wheel_angle_signs':[0.,0.,0.,0.],'wheel_angle_offsets':[0.,0.,0.,0.],'feedback_timeout_s':.3,'localization_timeout_s':.25,'command_timeout_s':.25,'tag_timeout_s':25.,'mode_timeout_s':8.,'stopped_speed_mps':.015,'angle_tolerance_deg':3.,'stable_feedback_samples':5,'forward_speed_mps':.12,'reverse_speed_mps':.1,'lateral_speed_mps':.06,'max_cross_track_m':.05,'max_heading_rad':.15,'max_position_sigma_m':.03,'acceleration_mps2':.1,'braking_mps2':.2}
+        # v11 停稳证据：连续零速后还要等 N 个新鲜定位样本且位姿散布/漂移速率
+        # 在阈值内才算 stopConfirmed；定位过期或位姿仍漂移不确认（超时走既有保护）。
+        defaults['endpoint_stop_window_m']=.010
+        defaults['pose_stability_samples']=5
+        defaults['pose_stability_tolerance_m']=.004
+        defaults['pose_stability_rate_mps']=.0025
         defaults['maintenance_mode']=False
         defaults['imu_direction_verified']=False
         self.config={}
@@ -641,16 +647,28 @@ class GreenhouseNode(Node):
                     'rebaseResidualM': (st.get('last_residual') or {}).get('rebaseResidualM')},
                 send=getattr(self, '_last_send', None))
             rl.write_motion(rec)
-            # 停稳证据：END_STOP/ROW_END 且反馈速度接近 0
-            if getattr(ex, 'phase', '') in ('END_STOP', 'CENTER_STOP') and fb:
+            # 停稳证据（v11）：只在 executor 确认停稳（连续零速 + 目标码可见 +
+            # 位姿稳定窗口满足）的那一次写一条真实记录；不再按帧刷 stops、
+            # 也不再传 samples=[0] 把 zeroSamples 写成恒 1。
+            fs = (getattr(ex, 'exit_info', None) or {}).get('finalStop') or {}
+            fseq = fs.get('seq')
+            if fseq is not None and fseq != getattr(self, '_last_stop_seq', None):
+                self._last_stop_seq = fseq
+                fb = self.feedback or {}
                 sp = fb.get('vx', fb.get('speed'))
-                if isinstance(sp, (int, float)) and abs(sp) <= self.config.get('stopped_speed_mps', .015):
-                    rl.stop_record(build_stop_record(
-                        t=now, seg=idx, to=seg.get('toId'),
-                        pose={'x': pose.x, 'y': pose.y, 'yaw': pose.yaw} if pose else {},
-                        target={'x': tgt.get('x'), 'y': tgt.get('y')},
-                        speed=sp, state=getattr(self.mission, 'state', None),
-                        samples=[0], stamp=fb.get('header_stamp')))
+                rl.stop_record(build_stop_record(
+                    t=fs.get('t', now), seg=idx, to=seg.get('toId'),
+                    pose=fs.get('pose') or ({'x': pose.x, 'y': pose.y, 'yaw': pose.yaw} if pose else {}),
+                    target={'x': tgt.get('x'), 'y': tgt.get('y')},
+                    speed=sp if isinstance(sp, (int, float)) else 0.,
+                    state=getattr(self.mission, 'state', None),
+                    samples=fs.get('stableZeroSamples'),
+                    stamp=(fb.get('header_stamp') if isinstance(fb, dict) else None),
+                    distance_m=fs.get('distanceM'),
+                    distance_raw_first_m=fs.get('distanceRawFirstM'),
+                    distance_raw_last_m=fs.get('distanceRawLastM'),
+                    stop_reason=fs.get('stopReason'),
+                    pose_stability=fs.get('poseStability')))
         except Exception:
             if os.environ.get('QR_RUNLOG_DEBUG'):
                 import traceback

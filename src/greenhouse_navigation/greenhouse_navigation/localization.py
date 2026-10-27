@@ -18,6 +18,7 @@ from tf2_ros import TransformBroadcaster
 from yhs_can_interfaces.msg import ChassisInfoFb
 from .control import wrap
 from .dr_anchor import build_anchor_event
+from .qr_quality import QrQualityHysteresis, observation_quality
 try:
     from .diag_log import get as _diag_get
     _diag = _diag_get('localization')
@@ -248,7 +249,10 @@ class StationaryAnchor:
 class GlobalLocalization(Node):
     def __init__(self):
         super().__init__('qr_global_localization')
-        for key,value in [('map_file',''),('local_odom_topic','/qr/odometry/local'),('process_noise_m_sqrt_s',.01),('process_noise_rad_sqrt_s',.02),('covariance_calibrated',False),('synchronized_navigation_confirmed',False),('qr_interval_navigation',False),('max_observation_age_s',.25),('max_innovation_m',.2),('max_position_sigma_m',.03),('enable_stationary_anchor',True),('publish_tf',False)]:self.declare_parameter(key,value)
+        for key,value in [('map_file',''),('local_odom_topic','/qr/odometry/local'),('process_noise_m_sqrt_s',.01),('process_noise_rad_sqrt_s',.02),('covariance_calibrated',False),('synchronized_navigation_confirmed',False),('qr_interval_navigation',False),('max_observation_age_s',.25),('max_innovation_m',.2),('max_position_sigma_m',.03),('enable_stationary_anchor',True),('publish_tf',False),
+            # v11 观测质量迟滞 + 有界保持（保守默认，见 qr_quality.DEFAULT_PARAMS）
+            ('qr_quality_degrade_ratio',1.5),('qr_quality_hold_frames',6),
+            ('qr_quality_max_hold_s',1.5),('qr_quality_hard_innovation_m',.10)]:self.declare_parameter(key,value)
         path=self.get_parameter('map_file').value
         if not path:raise ValueError('需要已保存的正式地图JSON；不自动使用示例地图定位')
         self.map_path=Path(path);self.map_content=self.map_path.read_text()
@@ -260,6 +264,15 @@ class GlobalLocalization(Node):
         if not self.coordinate_reviewed:self.get_logger().info('定位地图坐标为扫描结果（未做人工验收）：'+str(self.field.get('id')))
         self.boards=validate_boards(self.field.get('groups',[]))
         self.tags={t['id']:t for t in self.field['tags']};self.history=deque(maxlen=300);self.estimate=None;self.covariance=np.eye(3);self.last=None;self.last_tag=0.
+        # v11：观测质量迟滞（有界保持）。只决定是否把观测交给 EKF，不改观测值、不冻结位姿。
+        self.qr_quality=QrQualityHysteresis({
+            'qr_quality_degrade_ratio':float(self.get_parameter('qr_quality_degrade_ratio').value),
+            'qr_quality_hold_frames':int(self.get_parameter('qr_quality_hold_frames').value),
+            'qr_quality_max_hold_s':float(self.get_parameter('qr_quality_max_hold_s').value),
+            'qr_quality_hard_innovation_m':float(self.get_parameter('qr_quality_hard_innovation_m').value)})
+        self.qr_quality_state={'qualityState':'idle','decision':'','holdFrames':0,'holdAge':0.,
+                               'holdReason':'','candidateQuality':{},'heldQuality':{},
+                               'innovation':0.,'sourceStamp':None}
         self.formal_origin=False;self.formal_published_at=None;self.formal_preview_at=None
         self.enable_stationary_anchor=self.get_parameter('enable_stationary_anchor').value
         self.anchor=StationaryAnchor(self.field,timeout=self.get_parameter('max_observation_age_s').value,
@@ -386,6 +399,36 @@ class GlobalLocalization(Node):
                     if _diag is not None:_diag.write({'type':'innovation','source':'synchronized_qr','stamp':stamp,
                         'recv':round(time.time(),6),'mapId':self.field.get('id'),'mapVersion':self.map_version,
                         'epoch':getattr(getattr(self,'anchor',None),'epoch',''),'audit':audit})
+                    continue
+                # v11 质量迟滞：先按观测质量与创新决定「是否允许这次校正」。
+                # 质量下降时保留上一高质量观测（继续用正常里程计预测），
+                # 连续下降超帧数/超时长/超硬创新门才失效并回到正常拒绝/重锚。
+                _q=observation_quality({'sigma':sigma,'angleSigma':angle_sigma,
+                                        'memberIds':[1]})
+                _scope={'mapId':self.field.get('id') if isinstance(self.field,dict) else None,
+                        'mapVersion':self.map_version,
+                        'localEpoch':getattr(getattr(self,'anchor',None),'epoch','')}
+                _dec=self.qr_quality.update(_q,[float(observed[0]),float(observed[1]),float(observed[2])],
+                                            _scope,stamp,time.monotonic(),
+                                            predicted=[float(self.estimate[0]),float(self.estimate[1]),float(self.estimate[2])])
+                self.qr_quality_state={'qualityState':_dec['qualityState'],'decision':_dec['decision'],
+                                       'holdFrames':_dec['holdFrames'],'holdAge':_dec['holdAge'],
+                                       'holdReason':_dec['holdReason'],
+                                       'candidateQuality':_dec['candidateQuality'],
+                                       'heldQuality':_dec['heldQuality'],
+                                       'innovation':_dec['innovation'],'sourceStamp':stamp}
+                if _diag is not None:
+                    _diag.write({'type':'qrQuality','stamp':stamp,'recv':round(time.time(),6),
+                                 'decision':_dec['decision'],'qualityState':_dec['qualityState'],
+                                 'candidateQuality':_dec['candidateQuality'],
+                                 'heldQuality':_dec['heldQuality'],
+                                 'holdFrames':_dec['holdFrames'],'holdAge':_dec['holdAge'],
+                                 'holdReason':_dec['holdReason'],'innovation':_dec['innovation'],
+                                 'posePrediction':_dec['posePrediction'],
+                                 'mapId':_scope['mapId'],'mapVersion':_scope['mapVersion'],
+                                 'epoch':_scope['localEpoch']})
+                if not _dec['accept']:
+                    # 不把该观测交给 EKF：位姿由正常里程计预测继续推进（不冻结、不伪造零速）。
                     continue
                 update=correction_update(self.estimate,self.covariance,observed,
                     np.diag([sigma**2,sigma**2,angle_sigma**2]),self.get_parameter('max_innovation_m').value,audit=audit)
@@ -534,6 +577,8 @@ class GlobalLocalization(Node):
                  'covarianceCalibrated':calibrated,'approvalBasis':'measurement' if calibrated else 'user_confirmation' if confirmed else None,
                  'mapId':self.field['id'],**({'mapVersion':self.map_version} if getattr(self,'map_version',None) is not None else {}),'localEpoch':self.anchor.epoch,
                  'positionSigmaM':position_sigma,'positionLimitM':position_limit,
+                 # v11 观测质量迟滞状态（区分 held_observation 与 accepted_anchor）
+                 'qrQuality':dict(getattr(self,'qr_quality_state',None) or {}),
                  'qrIntervalNavigation':interval_navigation,'positionWithinDiagnosticLimit':within_limit,
                  'reason':reason}
         self.status_pub.publish(String(data=json.dumps(payload,ensure_ascii=False)))

@@ -225,7 +225,10 @@ class StaticNodeTests(unittest.TestCase):
 
     def test_constructor_tf_default_false_and_only_diagnostic_publishers(self):
         config={'map_file':'offline.json','local_odom_topic':'/qr/odometry/local','enable_stationary_anchor':True,
-                'publish_tf':False,'max_observation_age_s':.25,'max_innovation_m':.2}
+                'publish_tf':False,'max_observation_age_s':.25,'max_innovation_m':.2,
+                # v11 观测质量迟滞参数（生产默认值）
+                'qr_quality_degrade_ratio':1.5,'qr_quality_hold_frames':6,
+                'qr_quality_max_hold_s':1.5,'qr_quality_hard_innovation_m':.10}
         with patch.object(Node,'__init__',return_value=None),patch.object(GlobalLocalization,'declare_parameter') as declarations,\
              patch.object(GlobalLocalization,'get_parameter',side_effect=lambda key:SimpleNamespace(value=config[key])),\
              patch('greenhouse_navigation.localization.Path.read_text',return_value=json.dumps(field())),\

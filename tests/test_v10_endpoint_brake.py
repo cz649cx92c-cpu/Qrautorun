@@ -266,6 +266,8 @@ class EndpointBrakeClosedLoop(unittest.TestCase):
             pose.x += cmd.vx * .05
         self.assertEqual(ex.phase, 'END_STOP', str(m.events[:3]))
         samples = int(m.config['stable_feedback_samples'])
+        # v11：连续零速之后还要等位姿稳定窗口（pose_stability_samples 帧样本）
+        # 才确认，所以确认前必须仍在 ROW_END，确认后给足 tick 数让它完成。
         for i in range(samples - 2):
             self.tick(m, pose, cmd_speed=0., obs=[{'id': 1}])
             self.assertEqual(m.state, 'ROW_END',
@@ -273,8 +275,10 @@ class EndpointBrakeClosedLoop(unittest.TestCase):
         # 中间插一帧非零速：连续计数必须清零
         self.tick(m, pose, cmd_speed=.05, obs=[{'id': 1}])
         self.assertEqual(m.state, 'ROW_END', '非零速帧必须打断连续零速计数')
-        for _ in range(samples):
+        for _ in range(samples + int(m.config.get('pose_stability_samples', 5)) + 8):
             self.tick(m, pose, cmd_speed=0., obs=[{'id': 1}])
+            if m.state == 'FINISHED':
+                break
         self.assertEqual(m.state, 'FINISHED', '凑满连续零速样本后必须完成：%s' % str(m.events[:3]))
 
     # ---- GREEN：终点靠近用欧氏距离 ----

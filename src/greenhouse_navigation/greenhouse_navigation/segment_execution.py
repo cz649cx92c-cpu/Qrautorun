@@ -1,6 +1,7 @@
 """QR-to-QR execution. Mode changes happen only after measured standstill."""
 import copy
 import math
+import statistics
 import time
 from .control import Command, Pose, geometry, wrap
 from .control import brake_stop_distance
@@ -172,7 +173,7 @@ class SegmentExecutor:
         self.last_gate_pose=None;self.last_gate_cross=None
         self.localization_jump={};self.jump_state=None
         # 末段动态制动闭环：进入 END_STOP 前先按制动度量减速，进入后靠实测零速确认。
-        self.endpoint_brake={};self._stop_samples=0;self._endpoint_wait_since=None
+        self.endpoint_brake={};self._stop_samples=0;self._endpoint_wait_since=None;self._stability=None
 
     @property
     def segment(self):return self.segments[self.index]
@@ -319,13 +320,105 @@ class SegmentExecutor:
 
     def enter_endpoint_brake(self, remaining):
         """MOVE → END_STOP：记录进入时刻，用于「停不住就报故障」的超时判据。"""
-        self.phase='END_STOP';self._endpoint_wait_since=time.monotonic()
+        self.phase='END_STOP';self._endpoint_wait_since=time.monotonic();self._stability=None
         window=self.endpoint_stop_window()
         self._endpoint_enter={'enterRemainingM':remaining,'windowM':window,
                               'withinWindow':abs(remaining)<=window}
         self.endpoint_brake=dict(self.endpoint_brake or {})
         self.endpoint_brake.update(self._endpoint_enter)
         self.m.transition('ROW_END')
+
+    def pose_stability_window(self, pose, dt):
+        """停稳证据的位姿稳定窗口（v11 问题 A）。
+
+        车辆已连续 fresh 零速后，还要等 N 个**新鲜定位帧**（stamp/recv/epoch
+        真正前进），且窗口内位姿散布与漂移速率都在阈值内，才允许把这次停车
+        记为 stopConfirmed。定位停止更新、或位姿仍在漂移时**不确认、只安全
+        等待**；一直不满足由既有的 mode_timeout_s 超时保护接管，不伪造 10mm、
+        不锁位姿。只影响最终停稳证据的口径，不改任何运动输出。
+        """
+        cfg = self.m.config
+        need = max(1, int(cfg.get('pose_stability_samples', 5)))
+        tol = float(cfg.get('pose_stability_tolerance_m', .004))
+        rate_max = float(cfg.get('pose_stability_rate_mps', .0025))
+        loc = self.m.localization if isinstance(self.m.localization, dict) else None
+        # 只有定位上下文真的带可用时间源（stamp/recvMono）才做新鲜度判定；
+        # 否则退回「控制位姿」口径并如实标注，不伪造定位新鲜度。
+        usable = False
+        if loc:
+            for k in ('stamp', 'recvMono'):
+                v = loc.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+                    usable = True
+                    break
+        key = (loc.get('stamp'), loc.get('recvMono'), loc.get('localEpoch')) if usable else None
+        st = self._stability
+        if st is None:
+            st = self._stability = {'poses': [], 'last_key': None, 'stale': 0,
+                                    'last_change': time.monotonic(), 'since': time.monotonic()}
+        now = time.monotonic()
+        new_frame = (not usable) or (key != st['last_key'])
+        fresh = True
+        if new_frame:
+            st['poses'].append((pose.x, pose.y))
+            st['last_key'] = key
+            st['last_change'] = now
+            st['stale'] = 0
+        else:
+            st['stale'] += 1
+            if (now - st['last_change']) >= float(cfg.get('localization_timeout_s', .25)):
+                fresh = False
+        poses = st['poses']
+        scatter = 0.
+        rate = 0.
+        reason = '' if fresh else 'localizationStale'
+        if len(poses) >= 2:
+            x0, y0 = poses[0]
+            xl, yl = poses[-1]
+            scatter = max(math.hypot(x - x0, y - y0) for x, y in poses[1:])
+            rate = math.hypot(xl - x0, yl - y0) / max((len(poses) - 1) * dt, 1e-6)
+        if fresh and len(poses) >= 2 and (scatter > tol or rate > rate_max):
+            # 位姿仍在漂移：旧样本不能作为停稳证据，只保留最新样本重建窗口。
+            reason = 'poseDrift'
+            self._stability = {'poses': [poses[-1]], 'last_key': key, 'stale': 0,
+                              'last_change': now, 'since': now}
+            poses = self._stability['poses']
+            scatter = 0.
+            rate = 0.
+        return {'ready': (not reason) and len(poses) >= need,
+                'samples': len(poses), 'requiredSamples': need,
+                'scatterM': round(scatter, 5), 'scatterToleranceM': tol,
+                'driftRateMps': round(rate, 4), 'driftRateLimitMps': rate_max,
+                'reason': reason,
+                'source': 'localization' if usable else 'controlPoseOnly',
+                'windowAgeS': round(now - st['since'], 3)}
+
+    def record_final_stop(self, pose, stability):
+        """写一次性的最终停稳证据（v11 问题 C）：中位数距离 + raw first/last。
+
+        必须在「连续零速 + 目标码可见 + 稳定窗口满足」同时成立的同一 tick 写入，
+        即使该 tick 随后切到 ALIGN / FINISHED 也已落盘；同一停稳只写一次。
+        """
+        idx = getattr(self, '_final_stop_for', None)
+        if idx == self.index:
+            return
+        self._final_stop_for = self.index
+        m = self.m
+        tgt = self.segment['points'][-1]
+        poses = ((self._stability or {}).get('poses') if self._stability else None) or [(pose.x, pose.y)]
+        dists = [math.hypot(x - tgt['x'], y - tgt['y']) for x, y in poses]
+        med = statistics.median(dists)
+        self.stop_confirmed_seq = getattr(self, 'stop_confirmed_seq', 0) + 1
+        self.exit_info['finalStop'] = {
+            'seq': self.stop_confirmed_seq, 't': round(time.time(), 3),
+            'stopReason': 'poseStable', 'stableZeroSamples': int(m.stable),
+            'pose': {'x': round(pose.x, 5), 'y': round(pose.y, 5), 'yaw': round(pose.yaw, 5)},
+            'window': [{'x': round(x, 5), 'y': round(y, 5)} for x, y in poses],
+            'windowSamples': len(dists),
+            'distanceM': round(med, 5),
+            'distanceRawFirstM': round(dists[0], 5),
+            'distanceRawLastM': round(dists[-1], 5),
+            'poseStability': dict(stability) if stability else {}}
 
     def endpoint_stop_window(self):
         return max(0., float(self.m.config.get('endpoint_stop_window_m', self.ENDPOINT_STOP_WINDOW_M)))
@@ -370,7 +463,7 @@ class SegmentExecutor:
         # 每段进入 MOVE 时重新建立 dead-reckoning 锚点。
         self.dr_state=None
         # 末段制动闭环状态按段重置：上一段的零速样本不得用于本段停稳确认。
-        self.endpoint_brake={};self._stop_samples=0;self._endpoint_wait_since=None
+        self.endpoint_brake={};self._stop_samples=0;self._endpoint_wait_since=None;self._stability=None
         self.turn_info={'status':'idle','targetDeg':None,'beforeYawDeg':None,'completionYawDeg':None,
                         'residualDeg':None,'acceptanceDeg':math.degrees(self.turn_acceptance()),
                         'correctionToleranceDeg':math.degrees(self.correction_tolerance()),
@@ -402,6 +495,7 @@ class SegmentExecutor:
             near=math.hypot(pose.x-target['x'],pose.y-target['y'])<=self.BOUNDARY_POSITION_TOLERANCE_M
             self.arrival_seen=near and any(o.get('id')==tag for o in observations)
             stopped=m.stable_feedback(fb)
+            stability=None
             if self.phase=='END_STOP':
                 # 末段制动度量只做记录与诊断；停稳完成仍由「连续 fresh 零速反馈 +
                 # 目标码在边界容差内」判定。窗口 gate 发生在 MOVE→END_STOP 入口，
@@ -410,9 +504,21 @@ class SegmentExecutor:
                 metrics=self._endpoint_tick(fb,remaining_now)
                 metrics['withinWindow']=remaining_now<=self.endpoint_stop_window()
                 metrics['windowM']=self.endpoint_stop_window()
+                if stopped:
+                    # v11 问题 A：零速只是停稳的一半证据，还要等定位稳定窗口。
+                    stability=self.pose_stability_window(pose,dt)
+                    metrics['poseStability']={k:stability[k] for k in
+                                              ('ready','samples','requiredSamples','reason',
+                                               'scatterM','driftRateMps','source')}
+                    self.exit_info['poseStability']=dict(stability)
                 self.exit_info['endpointBrake']=dict(metrics)
-            if stopped and self.phase=='RECOVER_STOP':return self.align()
-            if stopped and self.arrival_seen:
+            stopped_ready=stopped and (stability is None or stability.get('ready'))
+            if stopped_ready and self.phase=='RECOVER_STOP':return self.align()
+            if stopped_ready and self.arrival_seen:
+                if self.phase=='END_STOP':
+                    # v11 问题 C：停稳证据必须在确认的同一 tick 落盘，
+                    # 否则随后切到 ALIGN/FINISHED 就再也看不到第 5 个零速帧。
+                    self.record_final_stop(pose, stability)
                 expected_yaw=s['endYaw'] if self.phase=='END_STOP' else s['bodyYaw']
                 # A turn interval has not rotated yet at its own start boundary;
                 # when the NEXT interval is a turn interval it rotates at this QR
@@ -1039,7 +1145,13 @@ class SegmentExecutor:
                                            'crossM':round(cross,4)}
             self.m.log(f"过码连续直行（不停车）：Q{s.get('toId'):03}，横向 {cross*100:+.1f} cm")
             self.index+=1;self.arrival_seen=False
+            # v11 问题 B：过码直行不停车，Tracker 速度必须连续。
+            # Mission.transition 会 reset() 把 previous_speed 清 0，导致 cmd.vx
+            # 从 0.075 掉到 0.005、实车 fb.vx 一度 -0.03 m/s；这里把过码前的
+            # 实际指令速度带过边界，其余安全门（5cm 硬门/模式匹配/DR）不变。
+            carry_speed=float(getattr(self.m.tracker,'previous_speed',0.) or 0.)
             self.phase='MOVE';self.m.transition('FORWARD')
+            self.m.tracker.previous_speed=carry_speed
             return self.move_command(pose,fb,observations,dt)
         # 末段动态制动闭环：停车类动作不再在 30mm 处直接把 vx 切零，而是由 Tracker
         # 用与规划完全相同的制动度量（含指令时延）把 vx 连续降到接近 0；进入

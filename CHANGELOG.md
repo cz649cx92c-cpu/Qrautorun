@@ -1,5 +1,21 @@
 # 变更记录
 
+## v11 — 2026-10-27（已推送 `refs/heads/v11`）
+
+三项末段/记录缺陷修复 + 二维码观测质量迟滞。不改 PID/I、不加横移/倒车补偿、不放宽 5cm 硬门/定位新鲜度/档位匹配/`stable_feedback_samples`，`same_straight` 过码直行语义保留，`4T4D` 保持 `vy=0`。
+
+- **A 位姿稳定窗口**（`segment_execution.py`）：连续零速只是停稳的一半证据。新增 `pose_stability_window()`，还要等 `pose_stability_samples=5` 个**新鲜定位帧**（stamp/recvMono/localEpoch 真正前进），且窗口内位姿散布 ≤ `pose_stability_tolerance_m=0.004`、漂移速率 ≤ `pose_stability_rate_mps=0.0025` 才 `stopConfirmed`。定位停止更新 → `reason=localizationStale`，位姿仍漂移 → `reason=poseDrift`，两者都**不确认、只安全等待**，最终由既有 `mode_timeout_s` 超时保护接管。无可用定位时间源时退回 `source=controlPoseOnly` 并如实标注。**不锁位姿、不过滤坐标、不改观测值**。
+- **B 过码速度连续**（`segment_execution.py`）：`same_straight` 过码分支在 `Mission.transition('FORWARD')`（内部 `tracker.reset()`）之后回填过码前实际指令速度，消除 run-20261027T135941 实测的 `cmd.vx` 0.075→0.005 凹陷与 `fb.vx` 一度 -0.03 m/s 的倒退。仍 4T4D / vy=0，硬门未动。
+- **C final stop 真实记录**（`segment_execution.py` + `run_log.py` + `node.py`）：新增 `record_final_stop()`，在「连续零速 + 目标码可见 + 稳定窗口满足」**同一 tick** 落盘，随后才切 ALIGN/FINISHED，并用 `_final_stop_for == index` 去重（ROW_END/FINISHED 不重复）。内容含 `stableZeroSamples`（真实 `m.stable`）、`pose`、`window`（原始样本）、`distanceM`（**中位数**）、`distanceRawFirstM/LastM`、`stopReason`、`poseStability`。`build_stop_record` 新增可选参数并输出 `stableZeroSamples / distanceRawFirstMm / distanceRawLastMm / stopReason / poseStability`，**旧调用方式保持兼容**；`node.py` 删除 `samples=[0]` 硬编码，改由 `exit_info['finalStop'].seq` 驱动写一条真实记录（修复 `stops.jsonl` 的 `zeroSamples` 恒 1）。
+- **D 二维码质量迟滞 + 有界保持**（新增 `qr_quality.py` + `localization.py` 接线）：质量可能先低后高、再下降；下降时不能立刻用较差新观测覆盖已确认的高质量观测，也不能永久锁存。`observation_quality()` **只从观测读质量**（sigma / angleSigma / 成员数），不看预测位姿、不改观测数值；`QrQualityHysteresis` 在 `observe()` 的 `correction_update` **之前**决策，`accept=False` 则 `continue`（不把观测交给 EKF，位姿由正常里程计预测继续推进，**不冻结、不伪造零速**）。规则：无锁定时任意合格观测 `firstLock`；已锁定高质量后质量下降 → `hold`（保留上一高质量观测）；三条失效条件任一满足即失效——连续下降 > `qr_quality_hold_frames=6`、保持 > `qr_quality_max_hold_s=1.5s`（自最后一次确认高质量起算）、创新 > `qr_quality_hard_innovation_m=0.10`（比既有 `max_innovation_m=0.2` 更严）；超硬创新 → `rejectInnovation`，既不沿用旧观测也不放行低质量观测；质量恢复 → `qualityOk` 重新接受。`epoch / mapVersion / sourceStamp / 重复帧` 校验在迟滞**之前**，不被绕过。日志/状态含 `qualityState / candidateQuality / heldQuality / holdFrames / holdAge / holdReason / innovation / decision / posePrediction`，区分 `held_observation` 与 `accepted_anchor`。`localization.status` 透出 `qrQuality`。
+- **配置**（`config/navigation.yaml`）：新增 `endpoint_stop_window_m: 0.010`、`pose_stability_samples: 5`、`pose_stability_tolerance_m: 0.004`、`pose_stability_rate_mps: 0.0025`；`localization.py` 声明 `qr_quality_degrade_ratio / qr_quality_hold_frames / qr_quality_max_hold_s / qr_quality_hard_innovation_m`。
+- **测试**：`test_v11_qr_quality.py` 19 项、`test_v11_stability_continuity.py` 10 项、`test_v10_endpoint_brake.py` 18 项全过；`test_v10_run_log / test_v10_node_run_log / test_v10_continuous_straight` 16 项、`test_static_localization` 33 项全过。
+- **回归**：全量 38 failed / 657 passed，与部署前基线逐条 diff 完全一致（`IDENTICAL_TO_BASELINE`，无新增失败）。既有失败单列：test_segment_execution 2、test_existing_chassis_feedback 3、test_runtime_acceptance 1、test_v10_wrap_classify 3、test_serial_imu 1，以及 bridge/fusion/imu_workbook/qr_coasting/node_motion/office_map_reload/office_route/sensor_status/navigation 等环境相关项。
+- **部署**：v11 三项（A/B/C）部署于 robot PID 293811；质量迟滞（D）部署于 localization PID 329870（重启 localization 加载）。两者 traceback=0，机器人保持 IDLE/FINISHED、speed=0、未发车。
+- **未验证**：全部距离为内部融合定位估计，无外部真值；**未实车验证 10mm 精度**，也未验证质量迟滞在真实相机观测序列下的行为。三个新阈值（5 帧 / 4mm / 2.5mm/s）与四个质量参数均为按现有配置推导的保守先验，需实跑后用 `poseStability` / `qrQuality` 字段标定。
+
+
+
 ## v10 增补 — 2026-10-27 末段动态制动闭环（endpoint brake ramp / stable stop / diagnostics）
 
 只改末段停车判据与诊断可见性；不改 PID/I、不加横移/倒车补偿、不放宽 5cm 硬门/定位新鲜度/档位匹配/`stable_feedback_samples`，`same_straight` 过码直行语义保留，`4T4D` 保持 `vy=0`。

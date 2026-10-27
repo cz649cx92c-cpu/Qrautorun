@@ -454,7 +454,11 @@ class SegmentExecutionTests(unittest.TestCase):
         pose.x=.5
         for _ in range(6):self.tick(m,pose,observations=[{'id':1}])
         self.assertEqual(m.segment_executor.index,0)
-        pose.x=.3;self.tick(m,pose,observations=[{'id':1}])
+        # v11: stop confirmation also waits for the pose-stability window
+        # (pose_stability_samples fresh samples); give it enough frames.
+        # Assertions unchanged.
+        pose.x=.3
+        for _ in range(int(m.config.get('pose_stability_samples',5))+6):self.tick(m,pose,observations=[{'id':1}])
         self.assertEqual(m.segment_executor.index,1);self.assertEqual(m.mode,'crab')
 
     def test_stale_negative_speed_and_heading_drift_fault_with_zero_output(self):
