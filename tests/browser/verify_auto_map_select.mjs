@@ -12,11 +12,8 @@ const page = await browser.newPage({viewport: {width: 1440, height: 960}});
 await page.goto(BASE, {waitUntil: 'domcontentloaded'});
 await page.waitForSelector('nav[aria-label="主导航"]', {timeout: 20000});
 await page.click('nav[aria-label="主导航"] button[title="开始导航"]');
-await page.waitForSelector('[data-testid="coordinate-status"]', {timeout: 20000});
 await page.waitForTimeout(2500);
 
-const badge = (await page.textContent('[data-testid="current-map"]')).trim();
-const source = (await page.textContent('[data-testid="coordinate-source"]')).trim();
 const enableButton = await page.$('[data-testid="enable-map"]');
 const bodyHtml = await page.content();
 const hasEnableText = bodyHtml.includes('启用此地图') || bodyHtml.includes('确认启用地图');
@@ -39,18 +36,14 @@ await page.route('**/api/localization/map', async route => {
 const target = options.find(option => option.value && option.value !== CURRENT);
 await page.selectOption('[data-testid="map-select"]', target.value);
 await page.waitForTimeout(3000);
-const badgeAfter = (await page.textContent('[data-testid="current-map"]')).trim();
-const sourceAfter = (await page.textContent('[data-testid="coordinate-source"]')).trim();
 const blockReason = String(await page.textContent('[data-testid="navigation-block-reason"]').catch(() => '(无)')).trim();
 await page.screenshot({path: '/tmp/auto-map-select.png'});
 
 console.log(JSON.stringify({
-  badge, source,
   enableButtonPresent: !!enableButton,
   enableTextPresent: hasEnableText,
   options,
   switchedTo: target,
-  badgeAfter, sourceAfter,
   switchCalls,
   blockReason
 }, null, 2));

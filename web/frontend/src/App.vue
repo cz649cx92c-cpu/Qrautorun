@@ -52,7 +52,7 @@ const faultReason=computed(()=>{
  return current.find(event=>!/^(?:\d{2}:\d{2}:\d{2}\s+)?(?:.*·\s*)?[A-Z][A-Z0-9_]*$/.test(event.trim()))??'尚未收到具体故障原因';
 });
 // 组中心坐标只读展示扫描结果，不再提供手工实测输入。
-const coordinateLabel=computed(()=>field.value?field.value.coordinateStatus==='reviewed'?'已验收坐标':'扫描坐标':'未选择地图');
+
 let socket:WebSocket|undefined,poll:ReturnType<typeof setInterval>|undefined,posePoll:ReturnType<typeof setInterval>|undefined,reconnect:ReturnType<typeof setTimeout>|undefined,closed=false,polling=false;
 const poseClock=ref(performance.now()),robotReceivedClock=ref(performance.now());
 let sessionEpoch=0;
@@ -809,7 +809,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
      </div>
      
     </section>
-    <section v-else-if="page==='navigate'&&!editingRoute" class="left-panel navigation-panel"><div class="navigation-settings"><div class="panel-title"><Navigation :size="18"/>导航控制</div><label>导航地图<select v-model="selectedMapId" :disabled="busy||robot.running||editingRoute" data-testid="map-select" @change="chooseMap"><option value="">选择扫描地图</option><option v-for="mapOption in availableMaps" :key="mapOption.id" :value="mapOption.id">{{mapOption.name}}</option></select></label><div v-if="field" class="coord-status" data-testid="coordinate-status"><span class="status-badge success" data-testid="current-map"><i/>当前地图 · {{field.name}} v{{version}}</span><span class="status-badge" data-testid="coordinate-source"><i/>{{coordinateLabel}}</span></div><label>执行路径<select v-model="selectedRouteId" :disabled="busy||robot.running||editingRoute" data-testid="route-select" @change="chooseRoute"><option value="">选择路径</option><option v-for="route in availableRoutes" :key="route.routeId" :value="route.routeId">{{route.name}}</option></select></label>
+    <section v-else-if="page==='navigate'&&!editingRoute" class="left-panel navigation-panel"><div class="navigation-settings"><div class="panel-title"><Navigation :size="18"/>导航控制</div><label>导航地图<select v-model="selectedMapId" :disabled="busy||robot.running||editingRoute" data-testid="map-select" @change="chooseMap"><option value="">选择扫描地图</option><option v-for="mapOption in availableMaps" :key="mapOption.id" :value="mapOption.id">{{mapOption.name}}</option></select></label><label>执行路径<select v-model="selectedRouteId" :disabled="busy||robot.running||editingRoute" data-testid="route-select" @change="chooseRoute"><option value="">选择路径</option><option v-for="route in availableRoutes" :key="route.routeId" :value="route.routeId">{{route.name}}</option></select></label>
      <div class="map-delete-actions" data-testid="navigation-map-delete"><Button class="w-full" variant="outline" size="sm" data-testid="delete-selected-map" :disabled="busy||robot.running||!selectedMapId" @click="askDeleteMap(selectedMapId,field?.name??'')"><Trash2 :size="16"/>删除当前地图</Button><small>先列出将一并删除的版本、路径与任务绑定，再确认。</small></div>
      <MapDeleteConfirm :info="mapDeletion" :busy="busy" @confirm="confirmDeleteMap" @cancel="mapDeletion=null"/>
      <div v-if="availableRoutes.length" class="route-manage-list" data-testid="route-manage-list">
@@ -930,7 +930,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
 .auto-name{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 4px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:12px;color:var(--muted)}
 .auto-name b{font-weight:500;color:var(--ink);overflow-wrap:anywhere}
 .auto-name small{margin-left:auto;font-size:11px;color:#94a3b8}
-.coord-status{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+
 .route-name-auto{display:inline-flex;align-items:center;gap:6px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--background);font-size:12px;color:var(--muted)}
 .route-name-auto small{font-size:10px;color:#94a3b8}
 .capture-trail-toggle{display:flex;align-items:center;gap:5px;font-size:12px;margin:0}.capture-trail-toggle input{width:14px;height:14px}.capture-diagnostics{margin-top:8px;font-size:12px}.capture-diagnostics summary{cursor:pointer}.state-card [data-testid="capture-count"]{font-size:15px;line-height:1.5}.tag-reprint-popover{position:absolute;right:8px;top:60px;bottom:32px;width:260px;max-width:calc(100% - 16px);overflow:auto;background:white;border:1px solid var(--line);border-radius:8px;box-shadow:var(--dialog-shadow);padding:12px;z-index:25}.tag-reprint-shortcut{position:absolute;right:12px;top:12px;z-index:5}

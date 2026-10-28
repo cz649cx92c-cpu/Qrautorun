@@ -89,10 +89,6 @@ test('界面不再有「启用此地图」按钮，只显示「当前地图」',
  assert.equal(scriptCode.includes('confirmCoordinates'),false,'脚本不应再有手动确认坐标');
  assert.equal(scriptCode.includes("api('/maps/confirm'"),false,'前端不应再调用 /maps/confirm');
  assert.equal(scriptCode.includes("api('/maps/accept'"),false,'前端不应再提交手工实测坐标');
- assert.match(templateCode,/data-testid="coordinate-status"/,'必须有简洁坐标状态区');
- assert.match(templateCode,/data-testid="current-map"/,'必须显示「当前地图」');
- assert.match(templateCode,/当前地图 · \{\{field\.name\}\} v\{\{version\}\}/,'当前地图必须绑定所选地图名与版本');
- assert.match(templateCode,/data-testid="coordinate-source"/,'坐标来源仍需可见（扫描/已验收）');
 });
 
 // ------------------------------------------------- A/B 共用同一批二维码不串图

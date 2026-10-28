@@ -64,14 +64,10 @@ test('UI 无商业确认按钮、无阶段流程图/作业概览/使用指南大
  assert.equal(scriptCode.includes("'guide'"),false,'页面枚举不应再有 guide');
  assert.equal(templateCode.includes("page='guide'"),false,'不应再有使用指南入口');
  assert.equal(appSource.includes('UserGuide'),false,'App.vue 不应再引用 UserGuide 组件');
- // 坐标改为简洁状态：只显示「当前地图」，不再有任何"启用此地图"按钮
- assert.match(templateCode,/data-testid="coordinate-status"/,'应有简洁坐标状态');
+ // 坐标状态区已整体下线（2026-10-28）：导航面板只留地图/路径选择与操作按钮，不再有任何"启用此地图"按钮
  for(const gone of ['data-testid="enable-map"','启用此地图','确认启用地图','confirm-coordinates','confirm-map']){
   assert.equal(templateCode.includes(gone),false,`模板不应再出现「${gone}」`);
  }
- assert.match(templateCode,/data-testid="current-map"/,'必须显示「当前地图」');
- assert.match(templateCode,/当前地图 · \{\{field\.name\}\} v\{\{version\}\}/,'当前地图必须跟随所选地图与版本');
- assert.match(templateCode,/data-testid="coordinate-source"/,'坐标来源应自动读取');
  // 前端不再要求手动启用；旧接口保留兼容，但前端不再调用
  assert.equal(scriptCode.includes("api('/maps/confirm'"),false,'前端不应再调用 /maps/confirm');
  assert.equal(scriptCode.includes('confirmCoordinates'),false,'不应再有手动确认坐标函数');
