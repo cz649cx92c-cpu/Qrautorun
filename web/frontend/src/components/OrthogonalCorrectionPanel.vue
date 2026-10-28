@@ -3,11 +3,11 @@ import {computed,ref,watch} from 'vue';
 import type {FieldMap} from '../../../shared/model';
 import {previewOrthogonalCorrection,type OrthogonalCorrectionPreview} from '../../../shared/map-orthogonal-correction';
 import Button from './ui/Button.vue';
-import {Grid2X2,AlertTriangle,CheckCircle2,RotateCcw} from 'lucide-vue-next';
+import {AlertTriangle,CheckCircle2,RotateCcw} from 'lucide-vue-next';
 
 const props=defineProps<{map:FieldMap;version:number;disabled?:boolean}>();
 const emit=defineEmits<{previewMap:[map:FieldMap|null];applied:[result:any]}>();
-const preview=ref<OrthogonalCorrectionPreview|null>(null),busy=ref(false),error=ref(''),message=ref(''),baseVersion=ref<number|null>(null),open=ref(false);
+const preview=ref<OrthogonalCorrectionPreview|null>(null),busy=ref(false),error=ref(''),message=ref(''),baseVersion=ref<number|null>(null);
 const formatM=(value:number)=>`${(value*100).toFixed(1)} cm`;
 function reset(){preview.value=null;baseVersion.value=null;error.value='';message.value='';emit('previewMap',null);}
 function makePreview(){
@@ -36,10 +36,8 @@ watch([()=>props.map.id,()=>props.version],reset);
 </script>
 
 <template>
- <details v-if="map.routeMode==='map-only'" class="orthogonal-correction" data-testid="orthogonal-correction" :open="open" @toggle="open=($event.target as HTMLDetailsElement).open">
-  <summary><Grid2X2 :size="17"/>二维码点位正交校正</summary>
+ <div v-if="map.routeMode==='map-only'" class="orthogonal-correction" data-testid="orthogonal-correction">
   <div class="orthogonal-body">
-   <p class="orthogonal-note">先把整张图旋转到行列与坐标轴平行（刚性旋转，不改变任何码间距离），再把落在同一排/同一列的码吸附到同一条水平/垂直线上（逐点移动，受容差限制）。行与行、列与列之间的真实间距保留，不假设等间距。</p>
    <div class="orthogonal-actions"><Button size="sm" variant="outline" :disabled="disabled||busy" data-testid="orthogonal-preview" @click.prevent="makePreview"><RotateCcw :size="15"/>预览校正</Button><Button v-if="preview" size="sm" variant="ghost" :disabled="busy" @click.prevent="reset">撤销预览</Button></div>
    <div v-if="error" class="orthogonal-alert error" role="alert"><AlertTriangle :size="16"/>{{error}}</div>
    <div v-if="message" class="orthogonal-alert success" role="status"><CheckCircle2 :size="16"/>{{message}}</div>
@@ -55,7 +53,7 @@ watch([()=>props.map.id,()=>props.version],reset);
     <small class="orthogonal-version-note">应用时按 v{{baseVersion}} 做版本保护；若返回 409，当前草稿会保留。</small>
    </div>
   </div>
- </details>
+ </div>
 </template>
 
 <style scoped>
