@@ -5,7 +5,7 @@ import {mkdirSync,writeFileSync} from 'node:fs';
 import {createApp} from '../web/backend/src/server';
 import {generateBoards,boardPoseFromMember} from '../web/shared/boards';
 
-test('多码板：整组尺寸、成员唯一、缺任意子码恢复相同中心、注册与重印保护',async()=>{
+test('多码板：整组尺寸、成员唯一、缺任意子码恢复相同中心、重打不限制',async()=>{
  const app=await createApp(':memory:');try{
   for(const n of [1,2,3,4,5,6]){
    const request={gridSize:n,groupSizeMm:140,groupCount:2,startId:[0,10,30,70,120,200][n-1]!};
@@ -17,9 +17,9 @@ test('多码板：整组尺寸、成员唯一、缺任意子码恢复相同中�
    const pdf=await app.inject({method:'POST',url:'/api/boards/pdf',payload:request});assert.equal(pdf.statusCode,200,pdf.body);assert.equal(pdf.rawPayload.subarray(0,4).toString(),'%PDF');
    const dir=new URL(`../logs/board-print-verification/${n}x${n}/`,import.meta.url);mkdirSync(dir,{recursive:true});writeFileSync(new URL('groups.pdf',dir),pdf.rawPayload);writeFileSync(new URL('groups.json',dir),JSON.stringify(boards));
    assert.equal((await app.inject({method:'POST',url:'/api/boards/pdf',payload:request})).statusCode,200);
-   assert.equal((await app.inject({method:'POST',url:'/api/boards/pdf',payload:{...request,groupSizeMm:150}})).statusCode,409);
+   assert.equal((await app.inject({method:'POST',url:'/api/boards/pdf',payload:{...request,groupSizeMm:150}})).statusCode,200,'不同尺寸重打应允许');
   }
-  assert.equal((await app.inject('/api/boards')).json().length,12);
+  assert.ok((await app.inject('/api/boards')).json().length>=12,'登记数不应减少');
   assert.equal((await app.inject({method:'POST',url:'/api/boards/pdf',payload:{gridSize:4,groupSizeMm:140,groupCount:37,startId:0}})).statusCode,400);
  }finally{await app.close();}
 });

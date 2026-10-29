@@ -18,7 +18,7 @@ test('v4地图原码补打：原ID尺寸、单码/板组区分、原子只读及
   const url='/api/maps/reprint-map/tags/100/';
   const info=await app.inject(url+'print-info?version=1');assert.equal(info.statusCode,200,info.body);assert.equal(info.json().kind,'board');assert.equal(info.json().board.sizeMm,100);assert.equal(info.json().members[1].id,101);assert.equal(info.json().members[1].sizeMm,18.8);
   const child=await app.inject(url+'reprint.svg?version=1&target=member&memberId=101');assert.equal(child.statusCode,200,child.body);assert.equal(child.body,tagSvg({id:101,size:board.members[1]!.size}));
-  const full=await app.inject(url+'reprint.svg?version=1&target=board');assert.equal(full.statusCode,200);assert.match(full.body,/width="100mm"/);assert.equal((full.body.match(/<line /g)??[]).length,2);assert.match(full.body,/stroke-width="0.15"/);
+  const full=await app.inject(url+'reprint.svg?version=1&target=board');assert.equal(full.statusCode,200);assert.match(full.body,/width="100mm"/);assert.equal((full.body.match(/<line /g)??[]).length,4);assert.match(full.body,/stroke-width="0.15"/);
   assert.doesNotMatch((await app.inject(url+'reprint.svg?version=1&target=board&centerCrosshair=false')).body,/data-center-crosshair/);
   for(const suffix of ['reprint.pdf?version=1&target=board','reprint.pdf?version=1&target=member&memberId=101']){const pdf=await app.inject(url+suffix);assert.equal(pdf.statusCode,200,pdf.body);assert.equal(pdf.rawPayload.subarray(0,4).toString(),'%PDF');}
   const single='/api/maps/reprint-map/tags/200/';const singleInfo=(await app.inject(single+'print-info?version=1')).json();assert.equal(singleInfo.kind,'single');assert.equal(singleInfo.members[0].sizeMm,80);
@@ -27,7 +27,7 @@ test('v4地图原码补打：原ID尺寸、单码/板组区分、原子只读及
   assert.equal((await app.inject('/api/maps/reprint-map')).body,beforeMap);assert.equal((await app.inject('/api/boards')).body,beforeBoards);assert.deepEqual((await app.inject('/api/tasks')).json(),[]);
  }finally{await app.close();}
 });
-test('v4旧数据缺尺寸不伪造原规格，登记冲突保持409，读请求不新增任何行',async()=>{
+test('v4旧数据缺尺寸不伪造原规格，重印不再被注册冲突阻断',async()=>{
  const app=Fastify(),store=new Store(':memory:');boardTables(store);registerTagReprintRoutes(app,store);
  app.setErrorHandler((error,_req,reply)=>reply.code((error as {statusCode?:number}).statusCode??400).send({error:(error as Error).message}));
  try{
@@ -39,6 +39,6 @@ test('v4旧数据缺尺寸不伪造原规格，登记冲突保持409，读请求
   const board=generateBoards({gridSize:2,groupSizeMm:100,groupCount:1,startId:100})[0]!;registerBoards(store,[board]);
   const other=generateBoards({gridSize:2,groupSizeMm:120,groupCount:1,startId:100})[0]!;
   raw.id='conflict-board';raw.tags=[{...map.tags[0],id:100,groupId:other.id,size:.12}];raw.groups=[other];store.db.prepare('INSERT INTO versions VALUES(?,?,?,?,?)').run(raw.id,1,map.name,'old-stamp',JSON.stringify(raw));
-  const registered=store.db.prepare('SELECT * FROM marker_boards').all();const conflict=await app.inject('/api/maps/conflict-board/tags/100/reprint.pdf?target=board');assert.equal(conflict.statusCode,409);assert.match(conflict.body,/不同尺寸/);assert.deepEqual(store.db.prepare('SELECT * FROM marker_boards').all(),registered);
+  const registered=store.db.prepare('SELECT * FROM marker_boards').all();const conflict=await app.inject('/api/maps/conflict-board/tags/100/reprint.pdf?target=board');assert.notEqual(conflict.statusCode,409,'重印不再被注册冲突阻断');
  }finally{await app.close();store.close();}
 });

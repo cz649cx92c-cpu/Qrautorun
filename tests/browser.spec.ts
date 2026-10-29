@@ -115,7 +115,7 @@ test('定位标定：采集入口、安装参数、实测确认与移动端弹�
 });
 import {spawn} from 'node:child_process';
 import {writeFileSync} from 'node:fs';
-test('真实HBVCAM：扫描同步预览、帧率、照片、低速客户端和释放设备',async({page})=>{
+test.skip('真实HBVCAM：扫描同步预览、帧率、照片、低速客户端和释放设备（前端已移除摄像头预览入口，仅保留后端采集）',async({page})=>{
  test.skip(process.env.QR_CAMERA_TEST!=='1','仅在已接入 HBVCAM 的设备上显式运行');
  const server=spawn(process.execPath,['--import','tsx','tests/fixtures/camera-server.ts'],{stdio:['ignore','pipe','pipe']});const done=new Promise<void>(resolve=>server.once('exit',()=>resolve()));
  try{

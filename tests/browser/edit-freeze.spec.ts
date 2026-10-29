@@ -22,7 +22,8 @@ const scanSession={id:'scan-telemetry-freeze',name:'扫描遥测回归',state:'s
 
 type Harness={sendFrame:(index:number)=>void,errors:string[]};
 type CanvasState={scale:number,x:number,y:number,staticBuilds:number,overlayUpdates:number,vehicle:string,trailPoints:number};
-const anchors=(page:Page)=>page.locator('.route-waypoints button');
+// 路点列表已并入底部「路径指令列表」，一行一个路点
+const anchors=(page:Page)=>page.locator('.route-commands-table tbody tr');
 
 async function canvasState(page:Page):Promise<CanvasState>{
  return page.evaluate(()=>{
@@ -88,7 +89,7 @@ test('导航监控显示真实车位；进入路径编辑后连续遥测不显�
  await expect(page.getByTestId('edit-route')).toBeEnabled();
  await page.evaluate(()=>document.fonts.ready);
  await expectVehicle(page,h,'1');
- await expect(page.getByTestId('map-pose-status')).toContainText('静止二维码定位');
+ await expect(page.getByTestId('map-pose-status')).toHaveCount(0);
  await sendBurst(page,h,1,22,15);
  h.sendFrame(999);await page.waitForTimeout(60);
  const navigateBefore=await canvasState(page);
@@ -100,7 +101,7 @@ test('导航监控显示真实车位；进入路径编辑后连续遥测不显�
  expect(navigateAfter.scale).toBeCloseTo(navigateBefore.scale,6);
  expect(navigateAfter.x).toBeCloseTo(navigateBefore.x,3);
  expect(navigateAfter.y).toBeCloseTo(navigateBefore.y,3);
- await expect(page.getByTestId('map-pose-status')).toContainText('静止二维码定位');
+ await expect(page.getByTestId('map-pose-status')).toHaveCount(0);
 
  await page.getByTestId('edit-route').click();
  await expect(page.getByTestId('route-editor')).toBeVisible();

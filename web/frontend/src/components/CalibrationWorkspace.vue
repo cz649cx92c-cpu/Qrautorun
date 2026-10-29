@@ -9,7 +9,7 @@
  * 4. 应用参数按钮带二次确认；后端本轮只做 dry-run，页面必须显示“未应用”和 proposed/current 差异。
  */
 import {computed,nextTick,onActivated,onBeforeUnmount,onDeactivated,ref,watch} from 'vue';
-import {Activity,AlertTriangle,CheckCircle2,Download,FlaskConical,MapPin,RefreshCw,Save,Square,SlidersHorizontal,Trash2,XCircle} from 'lucide-vue-next';
+import {Activity,AlertTriangle,CheckCircle2,Download,FlaskConical,MapPin,Save,Square,SlidersHorizontal,Trash2,XCircle} from 'lucide-vue-next';
 import Button from './ui/Button.vue';
 import type {CalibrationSession,CalibrationTrial,SessionAnalysis,Stats,TrialAnalysis,TrialStatus,TrialType} from '../../../shared/calibration';
 
@@ -41,6 +41,11 @@ const typeLabel:Record<TrialType,string>={forward:'前进',reverse:'后退',left
 const senseLabel:Record<'left'|'right',string>={left:'逆时针',right:'顺时针'};
 const statusLabel:Record<TrialStatus,string>={recording:'录制中',saved:'已保存',aborted:'已中止',interrupted:'中断'};
 const mapTags=computed<CalibrationMapTag[]>(()=>mapDetail.value?.map.tags??[]);
+const recorderCapability=computed(()=>capabilities.value?.nodeRecorder??null);
+// 采集能力：以 nodeRecorder.supported 为准（节点未上报时按不可用处理）
+const recorderSupportedOk=computed(()=>{const node=recorderCapability.value;return !!node&&node.supported;});
+const recorderRecording=computed(()=>recorderCapability.value?.recording===true);
+const recorderSupportedLabel=computed(()=>{const supported=capabilities.value?.nodeRecorder?.supported;return capabilities.value?(supported?'采集就绪':'采集不可用'):capabilitiesUnknown.value?'状态未知':'不可用';});
 const isTurn=computed(()=>trialForm.value.type==='left'||trialForm.value.type==='right');
 const trialAngle=computed<number|null>(()=>{
  if(!isTurn.value)return null;
@@ -405,20 +410,13 @@ onBeforeUnmount(stopPolling);
 
 <template>
  <div class="calibration-page" data-testid="calibration-page">
-  <div class="cw-page-head">
-   <div>
-    <span class="eyebrow">被动采集 · 不发送运动指令</span>
-    <h2>融合标定</h2>
-    <p>选择地图与两块二维码，记录现场手动驾驶的试验，分析视觉、轮速与 IMU 的一致性。所有采样由 ROS 桥接节点提供，页面只读展示。</p>
-   </div>
-   <Button size="sm" variant="outline" :disabled="busy" data-testid="calibration-refresh" @click="refreshAll"><RefreshCw :size="15"/>刷新状态</Button>
-  </div>
-
   <div class="cw-capabilities" data-testid="calibration-capabilities" role="status">
-   <span :class="['cw-pill',capabilities?.nodeRecorder.supported?'is-ok':'is-warn']">采集节点 · {{capabilities?capabilities.nodeRecorder.supported?'已加载':'未加载':capabilitiesUnknown?'状态未知':'不可用'}}</span>
-   <span :class="['cw-pill',capabilities?.nodeRecorder.recording?'is-rec':'is-idle']">录制 · {{capabilities?capabilities.nodeRecorder.recording?'录制中':'未录制':'状态未知'}}</span>
-   <span class="cw-pill">最后样本 · {{capabilities?.nodeRecorder.lastSampleAt??'—'}}<template v-if="capabilities?.nodeRecorder.lastSampleKind">（{{capabilities?.nodeRecorder.lastSampleKind}}）</template></span>
-   <span class="cw-pill">应用开关 · {{capabilities?.applyEnabled?'已开启':'关闭'}}<template v-if="capabilities?.applyReason">（{{capabilities?.applyReason}}）</template></span>
+   <span :class="['cw-pill',recorderRecording?'is-rec':'is-idle']">{{recorderRecording?'录制中':'未录制'}}</span>
+   <span :class="['cw-pill',recorderSupportedOk?'is-ok':'is-warn']">{{recorderSupportedLabel}}</span>
+   <details class="cw-more"><summary>详情</summary>
+    <span class="cw-pill">最后样本 · {{capabilities?.nodeRecorder?.lastSampleAt??'—'}}<template v-if="capabilities?.nodeRecorder?.lastSampleKind">（{{capabilities?.nodeRecorder?.lastSampleKind}}）</template></span>
+    <span class="cw-pill">应用开关 · {{capabilities?.applyEnabled?'已开启':'关闭'}}<template v-if="capabilities?.applyReason">（{{capabilities?.applyReason}}）</template></span>
+   </details>
   </div>
   <div v-if="recorderWarning" class="cw-alert is-warning" role="alert" data-testid="recorder-warning"><AlertTriangle :size="16"/><span>{{recorderWarning}}</span></div>
   <div v-if="error" class="cw-alert is-error" role="alert"><AlertTriangle :size="16"/><span>{{error}}</span></div>
@@ -426,22 +424,21 @@ onBeforeUnmount(stopPolling);
 
   <div class="cw-grid">
    <section class="cw-card" data-testid="calibration-config">
-    <div class="cw-card-title"><MapPin :size="18"/>配置<span class="cw-step">01</span></div>
+    <div class="cw-card-title"><MapPin :size="18"/>配置</div>
     <label>地图<select v-model="selectedMapId" :disabled="busy" data-testid="calibration-map-select"><option value="">选择地图</option><option v-for="map in maps" :key="map.id" :value="map.id">{{map.name}} · v{{map.version}}</option></select></label>
     <p class="cw-hint" v-if="selectedMapId">
-     <template v-if="mapDetail">当前最新版本 v{{mapDetail.version}} · {{mapDetail.map.tags.length}} 个二维码</template>
+     <template v-if="mapDetail">v{{mapDetail.version}} · {{mapDetail.map.tags.length}} 码</template>
      <template v-else-if="mapError">{{mapError}}</template>
-     <template v-else>正在读取地图二维码…</template>
+     <template v-else>读取中…</template>
     </p>
-    <p class="cw-hint" v-else-if="!maps.length">暂无地图；请先在「扫描建图」中保存定位码地图。</p>
+    <p class="cw-hint" v-else-if="!maps.length">暂无地图</p>
     <div class="cw-two">
      <label>二维码 A<input v-model.number="form.tagA" type="number" min="0" max="586" step="1" list="calibration-tags" placeholder="0–586" data-testid="calibration-tag-a"/></label>
      <label>二维码 B<input v-model.number="form.tagB" type="number" min="0" max="586" step="1" list="calibration-tags" placeholder="0–586" data-testid="calibration-tag-b"/></label>
     </div>
     <datalist id="calibration-tags"><option v-for="tag in mapTags" :key="tag.id" :value="tag.id">{{tagLabel(tag)}}</option></datalist>
     <label>两码真实中心距离 / m<input v-model.number="form.baselineM" type="number" min="0.05" max="20" step="0.001" placeholder="0.05–20" data-testid="calibration-baseline"/></label>
-    <p class="cw-note">外部基线，用于比例校核；不当作车辆实际行程。</p>
-    <label>备注（可选）<input v-model="form.note" maxlength="500" placeholder="例如：A 板放在通道口，B 板放在第三排" data-testid="calibration-note"/></label>
+    <details class="cw-more"><summary>备注</summary><label>备注（可选）<input v-model="form.note" maxlength="500" placeholder="可选" data-testid="calibration-note"/></label></details>
     <Button class="w-full" :disabled="busy||!selectedMapId||!mapDetail" data-testid="create-session" @click="createSession">创建标定会话</Button>
     <details class="cw-sessions" :open="!current">
      <summary>已有会话 · {{sessions.length}}</summary>
@@ -454,15 +451,8 @@ onBeforeUnmount(stopPolling);
    </section>
 
    <section class="cw-card" data-testid="calibration-trials">
-    <div class="cw-card-title"><SlidersHorizontal :size="18"/>试验<span class="cw-step">02</span><span v-if="trials.length" class="cw-title-actions"><Button size="sm" variant="destructive" :disabled="busy||!!recordingTrial" data-testid="clear-trials" @click="askClear"><Trash2 :size="14"/>清空当前会话试验</Button></span></div>
-    <div v-if="current" class="cw-current" data-testid="calibration-current-session">
-     <div><span>当前会话</span><b>{{current.session.mapName??current.session.mapId}} · v{{current.session.mapVersion}}</b></div>
-     <div><span>二维码</span><b>{{tagText(current.session.tagA)}} → {{tagText(current.session.tagB)}}</b></div>
-     <div><span>外部基线</span><b>{{current.session.baselineM.toFixed(3)}} m</b></div>
-     <div><span>采样</span><b>观测 {{current.sampleCounts.observation}} · 反馈 {{current.sampleCounts.feedback}} · IMU {{current.sampleCounts.imu}} · 融合 {{current.sampleCounts.fusion}}</b></div>
-     <small v-if="current.session.note">{{current.session.note}}</small>
-    </div>
-    <div v-else class="cw-empty">先创建或打开一个标定会话，再开始记录试验。</div>
+    <div class="cw-card-title"><SlidersHorizontal :size="18"/>试验<span v-if="trials.length" class="cw-title-actions"><Button size="sm" variant="destructive" :disabled="busy||!!recordingTrial" data-testid="clear-trials" @click="askClear"><Trash2 :size="14"/>清空当前会话试验</Button></span></div>
+    <div v-if="!current" class="cw-empty">先创建或打开标定会话，再开始记录试验。</div>
     <div v-if="recordingTrial" class="cw-recording" role="status" data-testid="recording-banner">
      <span class="cw-dot"/>
      <span class="cw-recording-text">正在录制：{{isTurnType(recordingTrial.type)?rotationPhrase(recordingTrial):typeLabel[recordingTrial.type]}}（第 {{recordingTrial.repetition}} 次）</span>
@@ -472,7 +462,6 @@ onBeforeUnmount(stopPolling);
      </span>
     </div>
     <fieldset class="cw-trial-form" :disabled="!current||busy||!!recordingTrial">
-     <legend>新增试验 · 开始记录</legend>
      <div class="cw-two">
       <label>类型<select v-model="trialForm.type" data-testid="trial-type"><option value="forward">前进</option><option value="reverse">后退</option><option value="left">左转</option><option value="right">右转</option></select></label>
       <label v-if="isTurn">角度 / °<input v-model.number="trialForm.customAngle" type="number" min="5" max="180" step="1" :disabled="trialForm.preset!=='custom'" placeholder="填大小 5–180" data-testid="trial-angle-custom"/></label>
@@ -482,16 +471,17 @@ onBeforeUnmount(stopPolling);
       <button type="button" :class="{active:trialForm.preset==='90'}" data-testid="trial-angle-90" @click="setAnglePreset('90')">90°</button>
       <button type="button" :class="{active:trialForm.preset==='180'}" data-testid="trial-angle-180" @click="setAnglePreset('180')">180°</button>
       <button type="button" :class="{active:trialForm.preset==='custom'}" data-testid="trial-angle-custom-button" @click="setAnglePreset('custom')">自定义</button>
-      <span class="cw-hint">左转 = 逆时针（内部为正）、右转 = 顺时针（内部为负）；当前记录 {{trialAngleText}}。</span>
+      <span class="cw-hint">当前 {{trialAngleText}}</span>
      </div>
      <label v-if="isTurn">旋转处二维码（取自当前地图）<select v-model.number="trialForm.rotationTagId" data-testid="trial-rotation-tag"><option value="">选择二维码</option><option v-for="tag in mapTags" :key="tag.id" :value="tag.id">{{tagLabel(tag)}}</option></select></label>
-     <p v-if="isTurn" class="cw-hint" data-testid="trial-rotation-hint">本次将记录为「{{trialForm.rotationTagId===''?'未选择二维码':`在 ${tagText(Number(trialForm.rotationTagId))} 处${trialAngleText}`}}」。分析时两端都取该二维码；会话绑定的地图版本若无此码会标 rotation_tag_not_in_map。</p>
-     <label>备注（可选）<input v-model="trialForm.note" maxlength="500" placeholder="例如：手动开 90°，已停稳" data-testid="trial-note"/></label>
+     <p v-if="isTurn&&trialForm.rotationTagId!==''" class="cw-hint" data-testid="trial-rotation-hint">{{tagText(Number(trialForm.rotationTagId))}}</p>
+     <details class="cw-more"><summary>备注</summary><label>备注（可选）<input v-model="trialForm.note" maxlength="500" placeholder="例如：手动开 90°，已停稳" data-testid="trial-note"/></label></details>
      <Button class="w-full" :disabled="!current||busy||!!recordingTrial" data-testid="start-trial" @click="startTrial">{{recordingTrial?'已有试验在录制…':'开始记录'}}</Button>
-     <p class="cw-hint">开始/结束只调用标定 API；车辆由现场人员手动驾驶，页面绝不发送运动指令。</p>
-    </fieldset>
+     </fieldset>
+    <details class="cw-fold" data-testid="trial-list-fold">
+     <summary>试验记录 · {{trials.length}}</summary>
     <div ref="trialListRef" class="cw-trial-list" data-testid="calibration-trial-list">
-     <div v-if="!trials.length" class="cw-empty">还没有试验记录。</div>
+     <div v-if="!trials.length&&current" class="cw-empty">还没有试验记录</div>
      <article v-for="trial in trials" :key="trial.id" :class="['cw-trial-row','is-'+trial.status]" :data-testid="'trial-row-'+trial.id">
       <div class="cw-trial-line">
        <span class="cw-rep">第 {{trial.repetition}} 次</span>
@@ -508,15 +498,16 @@ onBeforeUnmount(stopPolling);
       </div>
      </article>
     </div>
+    </details>
     <div v-if="clearConfirm" class="cw-confirm is-danger" role="alertdialog" data-testid="clear-trials-confirm">
      <p><b>确认清空当前会话的全部试验？</b></p>
-     <p>将删除本会话全部试验和样本，不删除地图、不删除其他会话，不能撤销。</p>
+     <p>删除本会话试验与样本，不可撤销。</p>
      <div><Button size="sm" variant="ghost" data-testid="clear-trials-cancel" @click="clearConfirm=false">取消</Button><Button size="sm" variant="destructive" data-testid="clear-trials-confirm-yes" :disabled="busy" @click="clearTrials">确认清空</Button></div>
     </div>
    </section>
 
    <section class="cw-card cw-results" data-testid="calibration-results">
-    <div class="cw-card-title"><Activity :size="18"/>结果<span class="cw-step">03</span></div>
+    <div class="cw-card-title"><Activity :size="18"/>结果</div>
     <div class="cw-toolbar">
      <Button size="sm" :disabled="!current||busy" data-testid="analyze" @click="analyze"><FlaskConical :size="16"/>分析</Button>
      <Button size="sm" variant="outline" :disabled="!current||busy" data-testid="save-analysis" @click="saveAnalysis"><Save :size="15"/>仅保存分析结果</Button>
@@ -529,7 +520,7 @@ onBeforeUnmount(stopPolling);
      </div>
     </div>
     <div v-if="applyConfirm" class="cw-confirm" role="alertdialog" data-testid="apply-confirm">
-     <p>确认尝试把候选参数应用到运行参数？后端当前只做 dry-run（不会写入导航/IMU 配置），返回后页面会显示 proposed/current 差异。</p>
+     <p>确认应用候选参数？后端仅 dry-run，不写入导航/IMU 配置。</p>
      <div><Button size="sm" variant="ghost" @click="applyConfirm=false">取消</Button><Button size="sm" data-testid="apply-confirm-yes" :disabled="busy" @click="applyParameters">确认</Button></div>
     </div>
     <div v-if="applyResult" class="cw-apply-result" data-testid="apply-result">
@@ -539,6 +530,8 @@ onBeforeUnmount(stopPolling);
      <small v-if="applyResult.analysisSaved">分析结果已随本次请求保存。</small>
     </div>
     <div v-if="analysis" class="cw-analysis">
+     <details class="cw-fold" data-testid="analysis-detail-fold">
+      <summary>分析详情 · 汇总 / 逐次 / 限制</summary>
      <div v-if="legacyAnalysisHint" class="cw-alert is-warning" role="status" data-testid="analysis-legacy"><AlertTriangle :size="16"/><span>{{legacyAnalysisHint}}</span></div>
      <div class="cw-aggregate" data-testid="analysis-aggregate">
       <div class="cw-aggregate-title">多次汇总 <span>均值 / σ / 离群</span></div>
@@ -601,8 +594,9 @@ onBeforeUnmount(stopPolling);
       <details class="cw-mini-list"><summary>公式</summary><p v-for="item in analysis.formulas" :key="item">{{item}}</p></details>
       <small>分析时间 {{timeLabel(analysis.analyzedAt)}} · 仅计算/建议，不自动写运行配置。</small>
      </div>
+     </details>
     </div>
-    <div v-else class="cw-empty">点击「分析」只计算不保存；分析完成后再决定是否保存或应用。</div>
+    <div v-else class="cw-empty">点击「分析」只计算不保存，完成后再决定是否保存或应用</div>
    </section>
   </div>
  </div>
@@ -666,6 +660,14 @@ onBeforeUnmount(stopPolling);
 .cw-apply-head{display:flex;align-items:flex-start;gap:8px;line-height:1.6}.cw-apply-head strong{flex-shrink:0;padding:1px 8px;border-radius:999px;font-size:11px}.cw-apply-head .is-off{background:#fef2f2;color:#b91c1c}.cw-apply-head .is-ok{background:#f0fdf4;color:#15803d}
 .cw-apply-result small{display:block;margin-top:6px;color:var(--muted)}
 .cw-analysis{margin-top:12px;display:flex;flex-direction:column;gap:10px}
+.cw-fold{margin-top:8px;border:1px solid var(--line);border-radius:8px;background:white}
+.cw-fold>summary{display:flex;align-items:center;gap:6px;padding:8px 12px;cursor:pointer;list-style:none;font-size:12px;color:#475569}
+.cw-fold>summary::-webkit-details-marker{display:none}
+.cw-fold>summary::after{content:'▸';margin-left:auto;color:#94a3b8;font-size:11px}
+.cw-fold[open]>summary::after{content:'▾'}
+.cw-fold[open]>summary{border-bottom:1px solid #eef2f7}
+.cw-fold>*:not(summary){padding:0 12px}
+.cw-fold[open]{padding-bottom:10px}
 .cw-aggregate{padding:12px;border:1px solid #dbeafe;border-radius:8px;background:#f8fbff}
 .cw-aggregate-title{display:flex;align-items:baseline;gap:8px;font-size:13px;font-weight:600;color:#1e293b;margin-bottom:8px}.cw-aggregate-title span{font-weight:400;color:var(--muted);font-size:11px}
 .cw-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin:0}
@@ -685,4 +687,36 @@ onBeforeUnmount(stopPolling);
 .cw-current-params{display:flex;flex-wrap:wrap;gap:4px 16px;margin:8px 0 0;font-size:11px;color:var(--muted)}.cw-current-params div{display:flex;gap:6px}.cw-current-params dt{margin:0}.cw-current-params dd{margin:0;font-family:var(--mono);color:#334155}
 @media(max-width:1100px){.cw-grid{grid-template-columns:minmax(0,1fr)}.cw-results{grid-column:auto}}
 @media(max-width:760px){.cw-page-head{flex-direction:column}.cw-two,.cw-current,.cw-metrics,.cw-groups{grid-template-columns:minmax(0,1fr)}.cw-group.is-fault{grid-column:auto}}
+
+/* ---------- 融合标定：紧凑单一操作流 ---------- */
+.calibration-page{display:flex;flex-direction:column;gap:10px;padding:clamp(10px,1vw,16px)}
+.cw-capabilities{align-items:center;gap:6px;font-size:12px}
+.cw-capabilities .cw-pill{padding:3px 8px;font-size:11.5px}
+.cw-more{display:inline-block;vertical-align:middle}
+.cw-more[open]{display:block;width:100%;margin-top:6px}
+.cw-more[open]>summary{display:inline-block;margin-bottom:6px}
+.cw-more:not([open])>*:not(summary){display:none}
+.cw-more[open] .cw-pill{display:inline-flex;width:auto;max-width:100%;min-height:24px;margin:0 6px 6px 0;white-space:normal}
+.cw-more>label{margin-top:6px}
+.cw-more>summary{cursor:pointer;list-style:none;font-size:11.5px;color:#64748b;padding:3px 8px;border:1px solid var(--line);border-radius:999px}
+.cw-more>summary::-webkit-details-marker{display:none}
+.cw-more[open]>summary{color:var(--accent);border-color:#bfdbfe}
+.cw-grid{gap:clamp(10px,1vw,14px)}
+.cw-card{padding:clamp(12px,1.1vw,16px);border-radius:10px}
+.cw-card-title{font-size:13px;margin-bottom:8px}
+.cw-two{gap:8px}
+.cw-card label{font-size:12px;margin-top:8px}
+.cw-hint{font-size:11.5px;line-height:1.5}
+.cw-note{display:none}
+/* 结果卡片：详情默认折叠 */
+.cw-results details:not([open]){margin-top:6px}
+@media(min-width:1600px){
+ .calibration-page{padding:18px}
+ .cw-card{padding:18px}
+ .cw-hint{font-size:12px}
+}
+@media(max-width:760px){
+ .calibration-page{padding:10px}
+ .cw-card{padding:12px}
+}
 </style>

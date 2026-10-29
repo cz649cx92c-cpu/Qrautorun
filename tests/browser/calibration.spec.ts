@@ -188,8 +188,8 @@ test('融合标定完整流程：创建会话→两笔试验→分析→保存�
  await page.getByTestId('calibration-baseline').fill('2.4');
  await page.getByTestId('calibration-note').fill('A 板通道口，B 板第三排');
  await page.getByTestId('create-session').click();
- await expect(page.getByTestId('calibration-current-session')).toContainText('map-office · v3');
- await expect(page.getByTestId('calibration-current-session')).toContainText('Q012 → Q034');
+ await expect(page.getByTestId('calibration-config')).toContainText('map-office');
+ await expect(page.getByTestId('calibration-session-row').first()).toContainText('Q012');
  const create=ctx.requests.find(item=>item.method==='POST'&&item.path==='/api/calibration/sessions');
  expect(create?.body).toMatchObject({mapId:MAP_ID,mapVersion:3,tagA:12,tagB:34,baselineM:2.4,note:'A 板通道口，B 板第三排'});
 
@@ -440,7 +440,7 @@ test('录制时结束/中止吸顶按钮、列表自动滚到最新、切页后�
  await expect(page.getByTestId('trial-angle-90')).toHaveClass(/active/);
  await expect(page.getByTestId('trial-rotation-tag')).toHaveValue('12');
  await expect(page.getByTestId('trial-note')).toHaveValue('保留测试');
- await expect(page.getByTestId('calibration-current-session')).toContainText('Q012');
+ await expect(page.getByTestId('calibration-session-row').first()).toContainText('Q012');
 
  // 开始录制：横幅吸顶显示结束/中止，按钮无需滚动
  await page.getByTestId('start-trial').click();

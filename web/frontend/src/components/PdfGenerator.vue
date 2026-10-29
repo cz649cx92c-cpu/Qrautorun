@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {computed,onMounted,onBeforeUnmount,ref,watch} from 'vue';
-import {Download,FileText,AlertTriangle,CheckCircle2} from 'lucide-vue-next';
+import {Download,FileText,AlertTriangle,CheckCircle2,Printer} from 'lucide-vue-next';
 import Button from './ui/Button.vue';
 
 type BoardMember={id:number;x:number;y:number;angle:number;size:number};
@@ -9,6 +9,25 @@ type Plan={groupCount:number;memberCount:number;pages:number;childSizeMm:number;
 type GridOption={gridSize:number;minGroupSizeMm:number;maxGroupSizeMm:number;minChildSizeMm:number};
 const emit=defineEmits<{generated:[result:Plan]}>();
 const gridOptions=ref<GridOption[]>([]),gridSize=ref(2),groupSizeMm=ref(140),groupCount=ref(3),startId=ref(0),centerCrosshair=ref(true);
+
+// 记住上次改过的生成设置（本页专用，切页/刷新后仍保留）
+const SETTINGS_KEY='qr-pdf-settings-v1';
+function restoreSettings(){
+ try{
+  const raw=localStorage.getItem(SETTINGS_KEY);if(!raw)return;
+  const saved=JSON.parse(raw) as Record<string,unknown>;
+  if(Number.isFinite(saved.gridSize as number))gridSize.value=saved.gridSize as number;
+  if(Number.isFinite(saved.groupSizeMm as number))groupSizeMm.value=saved.groupSizeMm as number;
+  if(Number.isFinite(saved.groupCount as number))groupCount.value=saved.groupCount as number;
+  if(Number.isFinite(saved.startId as number))startId.value=saved.startId as number;
+  if(typeof saved.centerCrosshair==='boolean')centerCrosshair.value=saved.centerCrosshair;
+ }catch{/* 隐私模式或损坏数据时静默忽略 */}
+}
+function persistSettings(){
+ try{localStorage.setItem(SETTINGS_KEY,JSON.stringify({gridSize:gridSize.value,groupSizeMm:groupSizeMm.value,groupCount:groupCount.value,startId:startId.value,centerCrosshair:centerCrosshair.value}));}catch{/* 忽略 */}
+}
+onMounted(restoreSettings);
+watch([gridSize,groupSizeMm,groupCount,startId,centerCrosshair],persistSettings);
 const busy=ref(false),planning=ref(false),loadingOptions=ref(false),error=ref(''),message=ref(''),plan=ref<Plan|null>(null);
 const gridOption=computed(()=>gridOptions.value.find(g=>g.gridSize===gridSize.value));
 const minSizeMm=computed(()=>gridOption.value?.minGroupSizeMm??20);
@@ -30,8 +49,7 @@ const previewUrl=computed(()=>'/api/boards/preview.svg?'+new URLSearchParams({gr
 const firstBoard=computed(()=>plan.value?.boards[0]);
 const centerCrosshairNote=computed(()=>!centerCrosshair.value?'已关闭中心十字，定位板尺寸和静区不变':plan.value?.centerCrosshairNote??(gridSize.value%2===0?'整组中心十字全长 8 mm、线宽 0.15 mm，沿中央白缝绘制':gridSize.value+'×'+gridSize.value+' 正中心是子码，没有安全白缝，无法画中心十字；请选择 2×2、4×4 或 6×6'));
 const boardLabel=computed(()=>firstBoard.value?.id??'B'+String(startId.value).padStart(3,'0'));
-const registrationConflict=computed(()=>plan.value?.registration?.available===false?plan.value.registration.message??'当前批次编号已被其他定位板占用':'');
-function useAvailableStart(){const suggested=plan.value?.registration?.suggestedStartId;if(suggested!==undefined)startId.value=suggested;}
+
 let timer:ReturnType<typeof setTimeout>|undefined,sequence=0,closed=false;
 async function responseError(response:Response){try{return (await response.json()).error??'请求失败';}catch{return '请求失败';}}
 async function requestPlan(){
@@ -59,6 +77,8 @@ async function loadOptions(){
  }catch(e){if(!closed)error.value=e instanceof Error?e.message:String(e);}
  finally{if(!closed)loadingOptions.value=false;}
 }
+// 浏览器打印与下载 PDF 共用同一个干净打印面：只输出二维码板主体。
+function printBoard(){window.print();}
 async function download(){
  if(busy.value||localError.value||!gridOption.value)return;
  busy.value=true;error.value='';message.value='';
@@ -95,16 +115,15 @@ onBeforeUnmount(()=>{closed=true;clearTimeout(timer);sequence++;});
    <label class="crosshair-option"><input v-model="centerCrosshair" type="checkbox"/>整组中心十字对位线</label><small class="crosshair-note" :class="{'crosshair-unavailable':centerCrosshair&&gridSize%2!==0}" data-testid="crosshair-note" role="status">{{centerCrosshairNote}}</small>
    </fieldset>
    <div class="pdf-summary"><div><span>子码总数</span><strong>{{plan?.memberCount??memberCount}} 个</strong></div><div><span>A4 页数</span><strong>{{plan?.pages??groupCount}} 页</strong></div><div v-if="plan"><span>子码黑边尺寸</span><strong>{{plan.childSizeMm.toFixed(2)}} mm</strong></div><div><span>子码编号</span><strong>{{label(startId)}} – {{label(endId)}}</strong></div></div>
-   <div v-if="localError||error||registrationConflict" class="pdf-error" role="alert"><AlertTriangle :size="20"/>{{localError||error||registrationConflict}}</div>
-   <Button v-if="registrationConflict&&plan?.registration?.suggestedStartId!==undefined" variant="outline" class="download-button" :disabled="busy||planning" @click="useAvailableStart">使用可用编号 {{label(plan?.registration?.suggestedStartId??0)}}</Button>
-   <small v-if="registrationConflict" class="crosshair-note">已有定位板保持原编号和尺寸。新批次请确认使用空闲编号；重打请填写原起始编号、规格及尺寸。</small>
-   <div v-if="message" class="pdf-success" role="status"><CheckCircle2 :size="20"/>{{message}}</div>
+   <div v-if="localError||error" class="pdf-error" role="alert"><AlertTriangle :size="20"/>{{localError||error}}</div>
+         <div v-if="message" class="pdf-success" role="status"><CheckCircle2 :size="20"/>{{message}}</div>
    <Button v-if="!gridOption&&!loadingOptions" class="download-button" variant="outline" @click="loadOptions">重新加载规格</Button>
-   <Button class="download-button" :disabled="busy||planning||!!localError||!!registrationConflict||!plan" @click="download"><Download :size="20"/>{{busy?'正在生成…':'生成并下载 PDF'}}</Button>
+   <Button class="download-button" :disabled="busy||planning||!!localError||!plan" @click="download"><Download :size="20"/>{{busy?'正在生成…':'生成并下载 PDF'}}</Button>
+   <Button class="download-button" variant="outline" :disabled="!!localError||!gridOption" data-testid="print-board" @click="printBoard"><Printer :size="18"/>打印二维码板</Button>
   </div>
   <div class="pdf-preview">
    <div class="preview-toolbar"><strong>定位组预览 · {{boardLabel}}</strong><span>{{gridSize}} × {{gridSize}} · {{groupSizeMm}} mm</span></div>
-   <div class="board-area"><div class="board-preview"><img v-if="!localError&&gridOption" :src="previewUrl" :alt="boardLabel+' 完整定位组'"/></div></div>
+   <div class="board-area"><div class="board-preview print-surface"><img v-if="!localError&&gridOption" :src="previewUrl" :alt="boardLabel+' 完整定位组'"/></div></div>
    <div v-if="plan" class="board-list"><div class="board-list-title">组编号与子码</div><div v-for="board in plan.boards" :key="board.id" class="board-row"><strong>{{board.id}}</strong><span>{{board.members.map(member=>label(member.id)).join(' · ')}}</span></div></div>
    <div class="preview-status">tag36h11 · A4 · 每页 1 组</div>
   </div>
@@ -114,8 +133,8 @@ onBeforeUnmount(()=>{closed=true;clearTimeout(timer);sequence++;});
 .crosshair-note.crosshair-unavailable{color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:7px 9px}
 .crosshair-option{display:flex;flex-direction:row;align-items:center;gap:8px}.crosshair-note{display:block;margin-top:7px;color:var(--muted);font-size:11px;line-height:1.6}.crosshair-option input{width:16px;height:16px;padding:0;accent-color:var(--accent)}
 
-.pdf-workspace{display:flex;flex:1;min-height:0;overflow:hidden}
-.pdf-controls{width:350px;flex-shrink:0;padding:14px;overflow-y:auto;background:var(--background);border-right:1px solid var(--panel)}
+.pdf-workspace{display:grid;grid-template-columns:clamp(340px,26vw,520px) minmax(0,1fr);flex:1;min-height:0;overflow:hidden;align-items:stretch}
+.pdf-controls{width:auto;min-width:0;padding:clamp(14px,1.2vw,22px);overflow-y:auto;background:var(--background);border-right:1px solid var(--panel)}
 h2{display:flex;align-items:center;gap:10px;margin:0 0 20px;font-size:18px;font-weight:600;color:var(--ink)}
 fieldset{margin:0;padding:0;border:0;min-width:0}
 .pdf-controls label{margin-top:16px}
@@ -129,19 +148,56 @@ legend{font-size:14px;color:var(--muted);margin-bottom:12px}
 .pdf-summary>div{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px;line-height:1.5}
 .pdf-summary span{color:var(--muted)}
 .pdf-summary strong{font-weight:500;color:var(--accent);white-space:nowrap}
+.pdf-controls input,.pdf-controls select{width:100%;min-width:0;max-width:100%;box-sizing:border-box}
+.pdf-controls label{min-width:0;overflow-wrap:anywhere}
+.pdf-error,.pdf-success{display:flex;align-items:flex-start;gap:10px;line-height:1.6;font-size:14px;padding:14px 0;min-width:0;overflow-wrap:anywhere}
+.pdf-summary>div{min-width:0}
 .pdf-error,.pdf-success{display:flex;align-items:flex-start;gap:10px;line-height:1.6;font-size:14px;padding:14px 0}
 .pdf-error{color:var(--accent)}.pdf-success{color:var(--ink)}.pdf-error svg,.pdf-success svg{flex-shrink:0;margin-top:3px}
 .download-button{width:100%;margin-top:10px}
-.pdf-preview{display:flex;flex-direction:column;min-width:0;min-height:0;flex:1;background:var(--background);overflow-y:auto}
+.pdf-preview{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--background);overflow-y:auto}
 .preview-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:var(--background);border-bottom:1px solid var(--panel);font-size:14px;flex-wrap:wrap}
 .preview-toolbar strong{font-weight:500;color:var(--ink)}.preview-toolbar span{color:var(--muted)}
-.board-area{padding:30px;display:flex;justify-content:center;align-items:center;min-height:340px;flex:1}
-.board-preview{width:min(100%,460px);aspect-ratio:1;background:var(--background);box-shadow:none;flex-shrink:0}
-.board-preview img{display:block;width:100%;height:100%;object-fit:contain}
+.board-area{padding:clamp(16px,1.6vw,34px);display:flex;justify-content:center;align-items:center;min-height:clamp(240px,30vh,360px);flex:1;min-width:0}
+.board-preview{width:min(100%,clamp(320px,42vh,560px));aspect-ratio:1;background:var(--background);box-shadow:none;flex-shrink:0;min-width:0}
+.board-preview img{display:block;width:100%;height:auto;max-width:100%;object-fit:contain}
 .board-list{margin:0 26px 22px;background:var(--background);border:1px solid var(--panel);border-radius:8px;padding:10px 12px;max-height:240px;overflow-y:auto;flex-shrink:0}
 .board-list-title{font-size:14px;font-weight:600;color:var(--ink);margin-bottom:10px}
 .board-row{display:flex;align-items:flex-start;gap:14px;font-size:14px;line-height:1.7;padding:10px 0;border-top:1px solid var(--panel);color:var(--muted)}.board-row strong{color:var(--accent);font-weight:500;flex-shrink:0}.board-row span{overflow-wrap:anywhere}
 .preview-status{border-top:1px solid var(--panel);background:var(--background);padding:16px 26px;font-size:14px;color:var(--muted);flex-shrink:0}
-@media(max-width:1200px){.pdf-controls{width:320px;padding:14px}.board-area{padding:14px}}
-@media(max-width:760px){.pdf-workspace{flex-direction:column;overflow:visible}.pdf-controls{width:100%;overflow:visible;border-right:0;border-bottom:1px solid var(--panel)}.pdf-preview{overflow:visible}.board-area{min-height:300px}.preview-toolbar{padding:18px 22px}.board-list{margin:0 22px 22px}}
+@media(max-width:1400px){.pdf-workspace{grid-template-columns:clamp(300px,30vw,400px) minmax(0,1fr)}}
+@media(max-width:1200px){.pdf-workspace{grid-template-columns:clamp(280px,32vw,360px) minmax(0,1fr)}.board-area{padding:16px}}
+/* 窄屏：单列堆叠，配置在上、预览在下 */
+@media(max-width:900px){
+ .pdf-workspace{grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto;overflow:visible;align-content:start}
+ .pdf-controls{width:100%;overflow:visible;border-right:0;border-bottom:1px solid var(--panel)}
+ .pdf-preview{overflow:visible}
+ .board-area{min-height:clamp(240px,40vh,340px)}
+ .board-preview{width:min(100%,420px)}
+}
+@media(max-width:760px){
+ .pdf-workspace{grid-template-columns:minmax(0,1fr)}
+ .pdf-controls{padding:14px}
+ .preview-toolbar{padding:12px 14px}
+ .board-list{margin:0 14px 14px}
+ .board-area{padding:14px;min-height:clamp(220px,36vh,300px)}
+ .board-preview{width:min(100%,340px)}
+ .grid-options{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .download-button{min-height:44px}
+}
+
+/* ---------- 打印：只输出二维码板主体 ---------- */
+@media print{
+  /* 隐藏所有 UI 容器 */
+  .pdf-controls,.preview-toolbar,.board-list,.preview-status,
+  .sidebar,.topbar,.canvas-section,.editor-body,.global-status,
+  .route-commands-panel,.route-tools-panel{display:none!important}
+  /* 只保留打印面 */
+  .pdf-workspace{display:block!important;position:static!important;overflow:visible!important}
+  .pdf-preview{display:block!important;padding:0!important;margin:0!important;background:#fff!important;border:0!important}
+  .board-area{display:block!important;padding:0!important;margin:0!important;overflow:visible!important;background:#fff!important}
+  .board-preview{display:block!important;box-shadow:none!important;border:0!important;padding:0!important;margin:0!important;background:#fff!important}
+  .board-preview img{width:auto!important;max-width:100%!important;height:auto!important;display:block!important;margin:0 auto!important}
+  @page{size:A4;margin:0}
+}
 </style>

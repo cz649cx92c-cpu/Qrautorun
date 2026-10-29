@@ -30,7 +30,6 @@ async function setup(page:Page,intermediate=false,offAxis=false,shifted=false){
  });
  await page.goto('/');await page.locator('.sidebar').getByRole('button',{name:'开始导航',exact:true}).click();
  await expect(page.getByTestId('edit-route')).toBeEnabled();await page.getByTestId('edit-route').click();await expect(page.getByTestId('route-editor')).toBeVisible();
- await expect(page.locator('.route-details-scroll')).toBeHidden();await page.getByTestId('route-properties-toggle').click();await expect(page.locator('.route-details-scroll')).toBeVisible();
  return {errors,requests,reject:(value:boolean)=>{reject=value;}};
 }
 async function location(page:Page,p:Point){
@@ -40,11 +39,12 @@ async function location(page:Page,p:Point){
 }
 
 async function clickPoint(page:Page,p:Point){const at=await location(page,p);await page.mouse.click(at.x,at.y);}
-const anchors=(page:Page)=>page.locator('.route-waypoints button');
+// 路点列表已并入底部「路径指令列表」，一行一个路点
+const anchors=(page:Page)=>page.locator('.route-commands-table tbody tr');
 
 test('路径编辑：点击吸附、自动正交、拖动、删除、撤销、清空、取消',async({page})=>{
- const h=await setup(page);await page.getByTestId('route-more').locator('summary').click();await page.getByRole('button',{name:'清空',exact:true}).click();await expect(anchors(page)).toHaveCount(0);
- await clickPoint(page,{x:.013,y:.012});await clickPoint(page,{x:1.024,y:.012});await clickPoint(page,{x:1,y:1});await expect(anchors(page)).toHaveCount(3);const actualPoints=await anchors(page).allTextContents();expect(actualPoints).toEqual(['1 · 0.00, 0.00','2 · 1.00, 0.00','3 · 1.00, 1.00']);
+ const h=await setup(page);await page.getByRole('button',{name:'清空',exact:true}).click();await expect(anchors(page)).toHaveCount(0);
+ await clickPoint(page,{x:.013,y:.012});await clickPoint(page,{x:1.024,y:.012});await clickPoint(page,{x:1,y:1});await expect(anchors(page)).toHaveCount(3);const coords=await page.locator('.route-commands-table tbody tr td:nth-child(5)').allTextContents();expect(coords).toEqual(['0.00, 0.00','1.00, 0.00','1.00, 1.00']);
  await expect(anchors(page).nth(0)).toContainText('0.00, 0.00');await expect(anchors(page).nth(1)).toContainText('1.00, 0.00');
  const from=await location(page,{x:1,y:1}),to=await location(page,{x:.72,y:.38});await page.mouse.move(from.x,from.y);await page.mouse.down();await page.mouse.move(to.x,to.y,{steps:8});await page.mouse.up();
  await expect(anchors(page).nth(2)).toContainText('0.70, 0.40');
@@ -108,4 +108,79 @@ test('自动串码：端点吸附后偏离码超过10cm仍保留橙色提示，�
  await expect(page.getByTestId('map-canvas')).toHaveAttribute('data-skipped-route-group-ids','6');
  await page.getByRole('button',{name:'保存路径',exact:true}).click();await expect(page.getByTestId('route-editor')).toHaveCount(0);
  await expect(page.getByRole('status').filter({hasText:'路径已保存'})).toContainText('跳过 1 个偏离码');expect(h.errors).toEqual([]);
+});
+
+test('路径步骤浮窗：拖动标题移动、手柄缩小后尺寸保持不回弹、再缩可继续、拖动不改宽高',async({page})=>{
+ const h=await setup(page);
+ await page.getByTestId('route-steps-trigger').click();
+ const pop=page.getByTestId('route-steps-popover');
+ await expect(pop).toBeVisible();
+ const box=async()=>{const b=await pop.boundingBox();return b!;};
+ const vp=page.viewportSize()!;
+ const inView=(r:{x:number;y:number;width:number;height:number})=>r.x>=0&&r.y>=0&&r.x+r.width<=vp.width+1&&r.y+r.height<=vp.height+1;
+
+ const r0=await box();
+ expect(Math.round(r0.width)).toBe(760);
+ expect(Math.round(r0.height)).toBe(520);
+
+ // 只剩一个浮窗实例，且不使用原生 resize 机制
+ const info=await page.evaluate(()=>{const p=document.querySelector('[data-testid=route-steps-popover]')!;const cs=getComputedStyle(p);
+  return {count:document.querySelectorAll('[data-testid=route-steps-popover]').length,resize:cs.resize,boxSizing:cs.boxSizing};});
+ expect(info.count).toBe(1);
+ expect(info.resize).toBe('none');
+ expect(info.boxSizing).toBe('border-box');
+
+ // 缩小 -180/-220
+ const hb=await page.getByTestId('route-steps-resize-handle').boundingBox();
+ await page.mouse.move(hb!.x+hb!.width/2,hb!.y+hb!.height/2);
+ await page.mouse.down();
+ await page.mouse.move(hb!.x+hb!.width/2-180,hb!.y+hb!.height/2-220,{steps:20});
+ await page.mouse.up();
+ const r1=await box();
+ expect(Math.round(r1.width)).toBe(580);
+ expect(Math.round(r1.height)).toBe(300);
+ expect(inView(r1)).toBe(true);
+
+ // 一秒后不得回弹
+ await page.waitForTimeout(1000);
+ const r2=await box();
+ expect(Math.abs(r2.width-r1.width)).toBeLessThanOrEqual(1);
+ expect(Math.abs(r2.height-r1.height)).toBeLessThanOrEqual(1);
+
+ // 再次向内仍可继续缩小
+ const hb2=await page.getByTestId('route-steps-resize-handle').boundingBox();
+ await page.mouse.move(hb2!.x+hb2!.width/2,hb2!.y+hb2!.height/2);
+ await page.mouse.down();
+ await page.mouse.move(hb2!.x+hb2!.width/2-80,hb2!.y+hb2!.height/2-60,{steps:12});
+ await page.mouse.up();
+ await page.waitForTimeout(1000);
+ const r3=await box();
+ expect(Math.round(r3.width)).toBe(500);
+ expect(Math.round(r3.height)).toBe(240);
+
+ // 拖动标题只改位置，不改宽高
+ const db=await page.getByTestId('route-steps-drag-handle').boundingBox();
+ await page.mouse.move(db!.x+db!.width/2,db!.y+db!.height/2);
+ await page.mouse.down();
+ await page.mouse.move(db!.x+db!.width/2-100,db!.y+db!.height/2-80,{steps:14});
+ await page.mouse.up();
+ await page.waitForTimeout(800);
+ const r4=await box();
+ expect(Math.round(r4.x-r3.x)).toBe(-100);
+ expect(Math.round(r4.y-r3.y)).toBe(-80);
+ expect(Math.round(r4.width)).toBe(Math.round(r3.width));
+ expect(Math.round(r4.height)).toBe(Math.round(r3.height));
+ expect(inView(r4)).toBe(true);
+
+ // 关闭重开保留本次尺寸；Escape 可关闭
+ await page.getByRole('button',{name:'关闭路径步骤'}).click();
+ await expect(pop).toBeHidden();
+ await page.getByTestId('route-steps-trigger').click();
+ await expect(pop).toBeVisible();
+ const r5=await box();
+ expect(Math.abs(r5.width-r4.width)).toBeLessThanOrEqual(1);
+ expect(Math.abs(r5.height-r4.height)).toBeLessThanOrEqual(1);
+ await page.keyboard.press('Escape');
+ await expect(pop).toBeHidden();
+ expect(h.errors).toEqual([]);
 });

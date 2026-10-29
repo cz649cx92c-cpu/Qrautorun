@@ -30,16 +30,17 @@ test('地图验收区域已删除测量人员，且确认/统一朝向不再强�
  assert.equal(app.includes("api('/maps/accept'"),false,'自用版 UI 不应再提交手工实测坐标');
 });
 
-test('导航新增“融合标定”入口并保留 scan/navigate/print/camera 页面',()=>{
- assert.match(app,/type ConsolePage='scan'\|'navigate'\|'print'\|'camera'\|'calibration'/);
+test('导航新增“融合标定”入口，摄像头预览入口已移除',()=>{
+ assert.match(app,/type ConsolePage='scan'\|'navigate'\|'print'\|'calibration'/);
  assert.match(app,/nav-calibration/);
  assert.match(app,/融合标定/);
  assert.match(app,/calibration:\{title:'融合标定'/);
  // KeepAlive 必须常驻在 v-if/v-else-if 链之外：写进链里会让切页把 KeepAlive 自己卸载，缓存失效。
  assert.match(app,/<KeepAlive>\s*<CalibrationWorkspace v-if="page==='calibration'" :maps="maps"\/>\s*<\/KeepAlive>/,'融合标定应使用常驻 KeepAlive 保留页面状态');
  assert.equal(/<KeepAlive v-else-if=/.test(app),false,'KeepAlive 不得再写成 v-else-if 分支');
- assert.ok(app.includes('v-else-if="page!==\'calibration\'"'),'原 v-else 控制台分支应改为 page!==calibration，避免与 KeepAlive 抢渲染');
- for(const page of ['scan','navigate','print','camera'])assert.ok(app.includes(`page==='${page}'`),`原有页面 ${page} 入口不应被破坏`);
+ assert.ok(app.includes("v-else-if=\"page!=='calibration'\""),'控制台分支应排除 calibration');
+ for(const page of ['scan','navigate','print'])assert.ok(app.includes(`page==='${page}'`),`原有页面 ${page} 入口不应被破坏`);
+ assert.equal(app.includes("page==='camera'"),false,'摄像头预览前端入口应已移除');
 });
 
 test('融合标定工作区只读调用标定 API，不出现任何运动/导航指令',()=>{
@@ -92,7 +93,7 @@ test('旧版（schemaVersion 1/2）已存分析缺字段时不得让整页崩溃
 });
 
 test('页面明确区分可计算/依赖假设/缺数据，并显示 dry-run 未应用与采集能力',()=>{
- for(const text of ['可计算','依赖假设','缺数据','外部基线，用于比例校核；不当作车辆实际行程','未应用','应用到运行参数','请检查桥接服务是否已加载被动录音支持']){
+ for(const text of ['可计算','依赖假设','缺数据','两码真实中心距离','未应用','应用到运行参数','请检查桥接服务是否已加载被动录音支持']){
   assert.ok(workspace.includes(text),`缺少关键文案：${text}`);
  }
  assert.match(workspace,/applied\?'已应用':'未应用'/,'应用结果必须区分已应用/未应用');
@@ -111,7 +112,7 @@ test('清空当前会话试验：按钮只在有试验时出现，二次确认�
  assert.ok(workspace.includes(':disabled="busy||!!recordingTrial" data-testid="clear-trials"'),'录制中必须禁用清空按钮');
  // 二次确认：文案必须写清“删什么、不删什么、不能撤销”
  assert.ok(workspace.includes('data-testid="clear-trials-confirm"'),'缺少二次确认框');
- assert.ok(workspace.includes('将删除本会话全部试验和样本，不删除地图、不删除其他会话，不能撤销'),'确认文案必须写清后果');
+ assert.ok(workspace.includes('删除本会话试验与样本，不可撤销'),'确认文案必须写清后果');
  assert.ok(workspace.includes('data-testid="clear-trials-cancel"'),'缺少取消按钮');
  assert.ok(workspace.includes('data-testid="clear-trials-confirm-yes"'),'缺少确认按钮');
  // 取消只关弹层，不发请求

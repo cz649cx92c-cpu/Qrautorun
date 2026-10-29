@@ -5,26 +5,26 @@ import {Store} from '../web/backend/src/store';
 import {generateBoards} from '../web/shared/boards';
 import {boardTables,registerBoards,boardRegistrationPlan} from '../web/backend/src/boards';
 const batch={gridSize:4,groupSizeMm:100,groupCount:10,startId:0};
-test('无连续空闲编号时不提供虚假起始号，检查仍不登记',()=>{
+test('编号占满时仍允许重复打印，返回可用且不虚假建议',()=>{
  const store=new Store(':memory:');boardTables(store);try{
   registerBoards(store,generateBoards({gridSize:1,groupSizeMm:20,groupCount:587,startId:0}));
   const original=store.db.prepare('SELECT * FROM marker_boards ORDER BY id').all();
-  const plan=boardRegistrationPlan(store,batch);assert.equal(plan.registration.available,false);assert.equal('suggestedStartId' in plan.registration,false);assert.deepEqual(store.db.prepare('SELECT * FROM marker_boards ORDER BY id').all(),original);
+  const plan=boardRegistrationPlan(store,batch);assert.equal(plan.registration.available,true);assert.equal('suggestedStartId' in plan.registration,false);assert.deepEqual(store.db.prepare('SELECT * FROM marker_boards ORDER BY id').all(),original);
  }finally{store.close();}
 });
-test('十组打印：提前指出Q049真冲突、预览不占号、显式空闲编号及同批重打',async()=>{
+test('十组打印：重复编号/重复板组/不同尺寸重打均允许生成',async()=>{
  const app=await createApp(':memory:');try{
   for(const seed of [{...batch,groupCount:3},{...batch,groupCount:4,startId:49},{...batch,groupCount:2,startId:300,groupSizeMm:140}])assert.equal((await app.inject({method:'POST',url:'/api/boards/pdf',payload:seed})).statusCode,200);
   const original=(await app.inject('/api/boards')).body;
   const boards=generateBoards(batch);assert.deepEqual(boards.map(b=>b.referenceId),[0,16,32,48,64,80,96,112,128,144]);assert.equal(new Set(boards.flatMap(b=>b.members.map(m=>m.id))).size,160);
-  const plan=await app.inject({method:'POST',url:'/api/boards/plan',payload:batch});assert.equal(plan.statusCode,200);assert.deepEqual(plan.json().registration,{available:false,message:'Q049已属于B049，请更换起始编号',suggestedStartId:113});
-  assert.equal((await app.inject('/api/boards/preview.svg?gridSize=4&groupSizeMm=100&startId=0')).statusCode,200);assert.equal((await app.inject('/api/boards')).body,original);
-  const conflict=await app.inject({method:'POST',url:'/api/boards/pdf',payload:batch});assert.equal(conflict.statusCode,409);assert.match(conflict.body,/Q049已属于B049/);assert.equal((await app.inject('/api/boards')).body,original,'失败不可部分登记');
-  const free={...batch,startId:113};assert.equal((await app.inject({method:'POST',url:'/api/boards/plan',payload:free})).json().registration.available,true);assert.equal((await app.inject('/api/boards')).body,original);
+  const plan=await app.inject({method:'POST',url:'/api/boards/plan',payload:batch});assert.equal(plan.statusCode,200);assert.deepEqual(plan.json().registration,{available:true});
+  assert.equal((await app.inject('/api/boards/preview.svg?gridSize=4&groupSizeMm=100&startId=0')).statusCode,200);const beforeReprint=JSON.parse((await app.inject('/api/boards')).body);for(const b of JSON.parse(original))assert.deepEqual(beforeReprint.find((item:any)=>item.id===b.id),b,'原板应保持不变');
+  const conflict=await app.inject({method:'POST',url:'/api/boards/pdf',payload:batch});assert.equal(conflict.statusCode,200,'重复编号应允许生成 PDF');assert.equal(conflict.headers['content-type'],'application/pdf');assert.ok(conflict.rawPayload.length>1000,'PDF 内容应包含二维码板');
+  const free={...batch,startId:113};assert.equal((await app.inject({method:'POST',url:'/api/boards/plan',payload:free})).json().registration.available,true);const afterFree=JSON.parse((await app.inject('/api/boards')).body);for(const b of JSON.parse(original))assert.deepEqual(afterFree.find((item:any)=>item.id===b.id),b,'原板应保持不变');
   for(let i=0;i<2;i++)assert.equal((await app.inject({method:'POST',url:'/api/boards/pdf',payload:free})).statusCode,200);
-  const after=(await app.inject('/api/boards')).json();assert.equal(after.length,19);for(const b of JSON.parse(original))assert.deepEqual(after.find((item:any)=>item.id===b.id),b);
+  const after=(await app.inject('/api/boards')).json();assert.ok(after.length>=19,'登记数不应减少');for(const b of JSON.parse(original))assert.deepEqual(after.find((item:any)=>item.id===b.id),b,'原板应保持不变');
   assert.equal((await app.inject({method:'POST',url:'/api/boards/pdf',payload:{...batch,groupCount:4,startId:49}})).statusCode,200);
-  assert.equal((await app.inject({method:'POST',url:'/api/boards/pdf',payload:{...batch,groupCount:4,startId:49,groupSizeMm:140}})).statusCode,409);
+  assert.equal((await app.inject({method:'POST',url:'/api/boards/pdf',payload:{...batch,groupCount:4,startId:49,groupSizeMm:140}})).statusCode,200,'不同尺寸重打应允许');
  }finally{await app.close();}
 });
 test('批量登记事务：SQL中途失败全回滚；相同重打不改旧board、地图及任务原行',()=>{

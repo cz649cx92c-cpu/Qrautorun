@@ -20,14 +20,13 @@ async function download(target:string){loading.value=true;error.value='';try{con
     <label><input v-model="crosshair" type="checkbox">整组中心十字（有安全白缝时）</label>
     <img :src="url('svg','board')" :alt="`${info.board.id} 原尺寸整板预览`" data-testid="original-board-preview">
     <button type="button" :disabled="loading" @click="download('board')" data-testid="reprint-board">下载原尺寸整板 PDF</button>
-    <label>真实子码<select v-model="memberId" aria-label="选择原板子码"><option v-for="member in info.members" :key="member.id" :value="member.id">Q{{String(member.id).padStart(3,'0')}} · 黑边 {{Number(member.sizeMm?.toFixed(3))}} mm</option></select></label>
    </template>
-   <p>Q{{String(memberId).padStart(3,'0')}} · 黑边 {{info.members.find(member=>member.id===memberId)?.sizeMm??'未知'}} mm</p>
-   <template v-if="info.printable">
+   <template v-else-if="info.printable">
+    <p>Q{{String(memberId).padStart(3,'0')}} · 黑边 {{info.members.find(member=>member.id===memberId)?.sizeMm??'未知'}} mm</p>
     <img :src="url('svg','member')" :alt="`tag36h11 Q${String(memberId).padStart(3,'0')} 真实单码预览`" data-testid="original-tag-preview">
     <button type="button" :disabled="loading" @click="download('member')" data-testid="reprint-member">下载原尺寸单码 PDF</button>
-    <small>100% / ACTUAL SIZE；保留静区，按 50 mm 尺校验。</small>
    </template>
+   <small v-if="info.printable">100% / ACTUAL SIZE；保留静区，按 50 mm 尺校验。</small>
    <p v-else role="status">{{info.unavailableReason}}</p>
   </template>
  </section>

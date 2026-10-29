@@ -135,7 +135,7 @@ export async function createApp(database?:string) {
  });
  app.get<{Params:{id:string}}>('/api/boards/:id.svg',(req,reply)=>{const options=boardCrosshairQuery.parse(req.query),board=listBoards(store).find(item=>item.id===req.params.id);return board?reply.type('image/svg+xml').send(boardSvg(board,options.centerCrosshair)):reply.code(404).send({error:'定位板不存在'});});
  app.post('/api/boards/pdf',async(req,reply)=>{
-  const request=boardPrintSchema.parse(req.body),plan=boardPlan(request);checkBoardRegistration(store,plan.boards);
+  const request=boardPrintSchema.parse(req.body),plan=boardPlan(request);
   const data=await boardPdf(plan.boards,request.centerCrosshair);registerBoards(store,plan.boards);
   return reply.type('application/pdf').header('Content-Disposition',`attachment; filename="${plan.filename}"`).send(data);
  });
