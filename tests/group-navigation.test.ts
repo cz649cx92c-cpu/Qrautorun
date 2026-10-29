@@ -31,9 +31,11 @@ test('多码组扫描：不同可见子码保持一个地图节点，保存完�
   await app.inject({method:'POST',url:'/api/boards/pdf',payload:request});
   const session=(await app.inject({method:'POST',url:'/api/survey/start',payload:{name:'仅离线API检查'}})).json();assert.equal(session.boards.length,3);
   const samples=Array.from({length:7},(_,i)=>({stamp:i+1,localEpoch:'offline-fixture',pose:{x:i*.5,y:0,yaw:0},representation:'board-centers',groupLayouts:boards,calibrated:true,synchronized:true,tags:boards.map((b,j)=>({id:b.referenceId,groupId:b.id,x:j*1.5-i*.5,y:0,angle:0,sigma:.02,angleSigma:.04,size:.14,memberIds:[b.members[(i+1)%4]!.id],visibleCount:1,detectedCount:1}))}));
-  const bad=structuredClone(samples[0]!);bad.tags[0]!.id=bad.tags[0]!.memberIds[0]!;
+  // 真正非法：id 既不是 referenceId 也不属于任何组内成员
+  const bad=structuredClone(samples[0]!);bad.tags[0]!.id=999;
   assert.equal((await app.inject({method:'POST',url:'/api/survey/import',payload:{sessionId:session.id,samples:[bad]}})).statusCode,400);
-  const imported=await app.inject({method:'POST',url:'/api/survey/import',payload:{sessionId:session.id,samples}});assert.equal(imported.statusCode,200,imported.body);assert.deepEqual(imported.json().counts,{'0':7,'4':7,'8':7});assert.equal(imported.json().visibility.B000.visible,1);
+  const imported=await app.inject({method:'POST',url:'/api/survey/import',payload:{sessionId:session.id,samples}});assert.equal(imported.statusCode,200,imported.body);assert.deepEqual(imported.json().counts,{'0':7,'4':7,'8':7});
+assert.equal(imported.json().visibility.B000.visible,1);
   await addStraightMotion(app);
   await app.inject({method:'POST',url:'/api/survey/stop',payload:{}});
   const optimized=await app.inject({method:'POST',url:'/api/survey/optimize',payload:{sessionId:session.id,anchors:[]}});assert.equal(optimized.statusCode,200,optimized.body);

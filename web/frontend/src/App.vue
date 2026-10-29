@@ -41,6 +41,16 @@ function selectMap(result:any){field.value=result.map;version.value=result.versi
 function setOrthogonalPreview(value:FieldMap|null){orthogonalPreviewMap.value=value;}
 async function onOrthogonalApplied(result:any){selectMap(result);orthogonalPreviewMap.value=null;selectedRouteId.value='';selectedTask.value='';await refresh();message.value='正交校正已保存 · 地图版本 v'+result.version+'；旧路线保持原版本';}
 const boards=ref<Board[]>([]);
+type DetectorInference={id:number;board:Board|null;memberCount:number;message:string;registered:boolean};
+const detectorInference=computed<DetectorInference|null>(()=>{
+ const idsRaw=robot.value.detector?.ids;
+ const ids=(Array.isArray(idsRaw)?idsRaw:[]).map((id:unknown)=>Number(id)).filter((id:number)=>Number.isInteger(id));
+ if(ids.length!==1)return null;
+ const id=ids[0]!;
+ const board=boards.value.find((candidate:Board)=>candidate.members.some(member=>member.id===id))??null;
+ return {id,board,memberCount:board?.members.length??0,registered:!!board,message:board?`已识别 ${label(id)} · 定位组 ${board.id} · 已推断 ${board.members.length} 个码位`:`已识别 ${label(id)} · 未登记定位组，无法推断完整板`};
+});
+
 const scanView=ref<'map'|'camera'>('map');
 const robot=ref<any>({connected:false,state:'OFFLINE',running:false,paused:false,pose:null,chassis:{connected:false},conditions:[],sensors:{},events:[]});
 const faultReason=computed(()=>{
@@ -650,6 +660,31 @@ const nearestGroupId=(point:Point)=>{
 };
 // 一段的"动作类型"取自真实分段规划：找到终点落在该路点上的那段。
 const planArriving=(point:Point)=>routePlans.value.find(plan=>distance(plan.end,point)<=ROUTE_GRID);
+// 折返路径里同一个码会重复出现（如 B080→…→B080），坐标完全相同。
+// 按坐标 find 会永远命中最前面那一段，导致“改后面一行、前面一行跟着变”。
+// 因此按路点索引取段：第 index 个路点由第 index-1 段到达。
+const planArrivingAt=(index:number)=>{
+ if(index<=0)return undefined;
+ const prev=routeAnchors.value[index-1], cur=routeAnchors.value[index];
+ if(!prev||!cur)return undefined;
+ // 用定位组编号匹配，而不是坐标距离：
+ // chainRouteGroups 返回的是投影点，与路点存在毫米~厘米级偏差，
+ // 坐标阈值匹配会在 B032→B096 这类长段上失败，导致改不了动作。
+ const fromId=nearestGroupId(prev), toId=nearestGroupId(cur);
+ const plans=routePlans.value;
+ if(fromId!==null&&toId!==null){
+  let best:typeof plans[number]|undefined;
+  let bestDiff=Number.POSITIVE_INFINITY;
+  plans.forEach((plan,i)=>{
+   if(plan.fromId!==fromId||plan.toId!==toId)return;
+   const diff=Math.abs(i-(index-1));
+   if(diff<bestDiff){bestDiff=diff;best=plan;}
+  });
+  if(best)return best;
+ }
+ // 编号取不到（路点没吸附到组）时按索引兜底，保证选中/改类型仍有可用段。
+ return plans[index-1];
+};
 const nodeName=(index:number)=>{
  const point=routeAnchors.value[index];if(!point)return '';
  const groupId=nearestGroupId(point);
@@ -677,7 +712,7 @@ const workSpeedMps=computed({
 // 路径指令列表：一行一个路点（步骤），可直接上移 / 下移 / 删除，全部作用于真实路点数组。
 const stepRows=computed(()=>routeAnchors.value.map((point,index)=>{
  const previous=index>0?routeAnchors.value[index-1]:null;
- const plan=index>0?planArriving(point):undefined;
+ const plan=index>0?planArrivingAt(index):undefined;
  const groupId=nearestGroupId(point);
  return{
   key:index,
@@ -711,7 +746,7 @@ function moveStepDown(index:number){return reorderAnchors(index,index+1);}
 function selectStep(index:number){
  routeSelected.value=index;
  const point=routeAnchors.value[index];
- const plan=point?planArriving(point):undefined;
+ const plan=planArrivingAt(index);
  selectedSegmentKey.value=plan?.key??'';
 }
 function deleteStep(index:number){
@@ -723,7 +758,7 @@ function deleteStep(index:number){
 // 节点属性里的"动作类型"：直接改真实分段策略，与右侧码间运动策略是同一份数据。
 function setStepMode(index:number,mode:StrategyMode){
  const point=routeAnchors.value[index];if(!point)return;
- const plan=planArriving(point);if(!plan)return;
+ const plan=planArrivingAt(index);if(!plan)return;
  changeSegmentMode(plan,mode);
 }
 // 自动生成航行路径：按地图里已有的真实路线（rows）生成一串可编辑路点。
@@ -852,6 +887,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
      <Button class="w-full mt-2" variant="outline" :disabled="busy||!session||orthogonalPreviewActive" @click="finish"><CheckCircle2 :size="18"/>{{busy?'正在处理…':session?.state==='collecting'?'完成扫描并保存地图':'整理记录并保存地图'}}</Button>
      <Button v-if="session?.state==='stopped'" class="w-full mt-2" variant="outline" :disabled="busy||originChanged||orthogonalPreviewActive" @click="resume">继续补扫此记录</Button>
      <div class="state-card" data-testid="capture-state"><span>{{session?.state==='collecting'?'正在记录':session?'已保存':'未开始'}}</span><strong data-testid="capture-count">已采集 {{capturePointCount}} 个定位点 · {{captureSampleCount}} 帧</strong><details v-if="session?.state==='collecting'&&scanWaitReasons.length" class="capture-diagnostics"><summary>采集诊断</summary><small class="scan-wait" role="status">等待：{{scanWaitReasons.join('；')}}</small></details></div>
+     <div v-if="session?.state==='collecting'&&detectorInference" class="scan-detector-inference" :class="{'is-unregistered':!detectorInference.registered}" data-testid="detector-inference" role="status"><strong>{{detectorInference.message}}</strong><small v-if="detectorInference.registered">单码观测可用于推断整组，继续采集或直接完成保存。</small><small v-else>请先在二维码打印页登记对应定位组，再继续采集。</small></div>
      <ScanRecords :records="sessions" :selected-id="session?.id" :busy="busy" :selection-disabled="session?.state==='collecting'" :error="error" @select="loadSession" @delete="removeSession" @refresh="refreshSurveys"/>
      <details class="scan-map-maintenance scan-fold" data-testid="scan-map-maintenance">
       <summary><Layers :size="16"/>地图维护</summary>
@@ -868,9 +904,9 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
      </details>
      
     </section>
-    <section v-else-if="page==='navigate'&&!editingRoute" class="left-panel navigation-panel"><div class="navigation-settings"><div class="panel-title"><Navigation :size="18"/>导航控制</div><label>导航地图<select v-model="selectedMapId" :disabled="busy||robot.running||editingRoute" data-testid="map-select" @change="chooseMap"><option value="">选择扫描地图</option><option v-for="mapOption in availableMaps" :key="mapOption.id" :value="mapOption.id">{{mapOption.name}}</option></select></label><label>执行路径<select v-model="selectedRouteId" :disabled="busy||robot.running||editingRoute" data-testid="route-select" @change="chooseRoute"><option value="">选择路径</option><option v-for="route in availableRoutes" :key="route.routeId" :value="route.routeId">{{route.name}}</option></select></label>
-     <div class="map-delete-actions" data-testid="navigation-map-delete"><Button class="w-full" variant="outline" size="sm" data-testid="delete-selected-map" :disabled="busy||robot.running||!selectedMapId" @click="askDeleteMap(selectedMapId,field?.name??'')"><Trash2 :size="16"/>删除当前地图</Button></div>
-     <MapDeleteConfirm :info="mapDeletion" :busy="busy" @confirm="confirmDeleteMap" @cancel="mapDeletion=null"/>
+    <section v-else-if="page==='navigate'&&!editingRoute" class="left-panel navigation-panel"><div class="navigation-settings"><div class="panel-title"><Navigation :size="18"/>导航控制</div><label>导航地图<select v-model="selectedMapId" :disabled="busy||robot.running||editingRoute" data-testid="map-select" @change="chooseMap"><option value="">选择扫描地图</option><option v-for="mapOption in availableMaps" :key="mapOption.id" :value="mapOption.id">{{mapOption.name}}</option></select></label>
+     <div class="navigation-map-list" data-testid="map-list" aria-label="当前地图列表"><div class="navigation-map-head">当前地图 · {{availableMaps.length}}</div><div v-if="!availableMaps.length" class="navigation-map-empty">暂无地图</div><button v-for="mapOption in availableMaps" :key="mapOption.id" type="button" data-testid="map-list-item" :class="['navigation-map-item',{active:mapOption.id===selectedMapId}]" :disabled="busy||robot.running" @click="selectedMapId=mapOption.id;chooseMap()"><strong>{{mapOption.name}}</strong><span>v{{mapOption.version}} · {{routes.filter(route=>route.mapId===mapOption.id).length}}条路径</span></button></div>
+     <label>执行路径<select v-model="selectedRouteId" :disabled="busy||robot.running||editingRoute" data-testid="route-select" @change="chooseRoute"><option value="">选择路径</option><option v-for="route in availableRoutes" :key="route.routeId" :value="route.routeId">{{route.name}}</option></select></label>
      <div v-if="availableRoutes.length" class="route-manage-list" data-testid="route-manage-list">
       <div class="route-manage-title">本图路径 · {{availableRoutes.length}}</div>
       <div v-for="route in availableRoutes" :key="route.routeId" :class="['route-manage-row',{active:route.routeId===selectedRouteId}]">
@@ -902,7 +938,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
      <Button v-if="map&&page!=='scan'" size="sm" :disabled="editingRoute||map.tags.length<2" :variant="measuring?'default':'outline'" :aria-pressed="measuring" @click="toggleMeasurement"><Ruler :size="18"/>中心测距</Button>
      <template v-if="page==='navigate'&&field&&!editingRoute">
       <Button size="sm" variant="outline" data-testid="new-route" :disabled="routeLocked" @click="beginNewRoute"><PenLine :size="15"/>新建路径</Button>
-      <Button v-if="selectedRouteId||field.rows.length" size="sm" variant="outline" :disabled="routeLocked" data-testid="edit-route" @click="beginRoute">编辑路径</Button>
+      <Button v-if="field" size="sm" variant="outline" :disabled="routeLocked||(!selectedRouteId&&!field.rows.length)" :title="selectedRouteId||field.rows.length?'编辑已保存路径':'请先点「新建路径」创建路径'" data-testid="edit-route" @click="beginRoute">编辑路径</Button>
       <Button size="sm" variant="outline" :disabled="!field.tags.length" data-testid="view-tag-reprint" @click="openTagInspector">查看二维码/补打</Button>
      </template>
      <span v-if="map" class="ml-auto badge">{{map.tags.length}} 个定位组 · {{map.routeMode==='map-only'?(!selectedRouteId?'未创建路径':'路径已选（routeMode 仍为 map-only）'):map.rows.length+' 条路线'}}</span>
@@ -918,7 +954,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
       <div class="distance-result" data-testid="center-distance-result" role="status"><strong v-if="centerDistance!==null">中心距离 {{centerDistance.toFixed(3)}} m <span>（{{(centerDistance*100).toFixed(1)}} cm）</span></strong><span v-else>{{measureFrom!==''&&measureTo===measureFrom?'请选择两个不同的定位组':measureFrom!==''?'请点击第二个定位组，或选择测距终点':'点击地图上的两个定位组，或选择起点和终点'}}</span></div>
      </div>
      <CameraPreview v-if="page==='scan'&&scanView==='camera'" compact/>
-     <MapCanvas v-else-if="canvasMap" :map="canvasMap" :selected="mapSelected" :measurement="mapMeasurement" row-id="" :tool="measuring?'measure':editingRoute?'route-design':'pan'" @select="measureSelect" @inspect="inspectTag" @tag-detail="openTagDetail" :segment-plans="editingRoute?routePlans:undefined" :selected-segment="selectedSegmentKey" @segment-select="selectSegment" :editable="editingRoute&&!routeLocked&&routeTool!=='pan'" :drawing="mapDrawing" :pan-enabled="editingRoute&&routeTool==='pan'" :route-group-ids="routeGroupIds" :route-skipped-groups="routeSkipped" :route-anchors="routeAnchors" :route-selected="routeSelected" :initial-heading="editingRoute?bodyYawDeg*Math.PI/180:undefined" @heading="setInitialHeadingRad" @blank="appendRoute" @design-select="routeSelected=$event" @design-move="moveRoute" :vehicle="mapVehicle??undefined" :trail="mapTrail"/>
+     <MapCanvas v-else-if="canvasMap" :map="canvasMap" :selected="mapSelected" :measurement="mapMeasurement" row-id="" :tool="measuring?'measure':editingRoute?'route-design':'pan'" @select="measureSelect" @inspect="inspectTag" @tag-detail="openTagDetail" :segment-plans="editingRoute?routePlans:undefined" :selected-segment="selectedSegmentKey" @segment-select="selectSegment" :editable="editingRoute&&!routeLocked&&routeTool!=='pan'" :drawing="mapDrawing" :pan-enabled="editingRoute&&routeTool==='pan'" :route-group-ids="routeGroupIds" :route-skipped-groups="routeSkipped" :route-name="routeNameDraft||availableRoutes.find(r=>r.routeId===selectedRouteId)?.name" :route-anchors="routeAnchors" :route-selected="routeSelected" :draw-mode="editingRoute&&routeTool==='draw'" :initial-heading="editingRoute?bodyYawDeg*Math.PI/180:undefined" @heading="setInitialHeadingRad" @blank="appendRoute" @design-select="routeSelected=$event" @design-move="moveRoute" :vehicle="mapVehicle??undefined" :trail="mapTrail"/>
      <div v-else class="scan-empty"><div class="empty-illustration"><ScanLine v-if="page==='scan'" :size="32"/><Route v-else :size="32"/></div><strong>{{page==='scan'?'暂无扫描数据':'请选择地图'}}</strong><div class="getting-started" data-testid="getting-started"><h2>{{page==='scan'?'打印并铺设定位板后开始扫描':'选择地图与路径后开始导航'}}</h2><p>{{page==='scan'?'检查相机，点「开始扫描」即可。已有记录可从左侧打开继续整理。':'先选择地图，再选择或新建路径。'}}</p><div><Button size="sm" @click="page=page==='scan'?'print':'scan'">{{page==='scan'?'打印定位板':'前往扫描建图'}}<ArrowRight :size="15"/></Button></div></div></div>
      <div class="legend"><span><i class="tag-dot"/>定位组</span><span><i class="line-green"/>作物行</span></div>
      <div v-if="editingRoute&&tagDetail" class="tag-detail-card" data-testid="tag-detail-card" role="status">
@@ -1097,6 +1133,9 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
 .route-steps-trigger{display:flex;align-items:center;gap:10px;width:100%;min-height:42px;padding:9px 14px;border:1px solid var(--line);border-radius:10px;background:white;box-shadow:var(--card-shadow);color:#1e293b;text-align:left;cursor:pointer}
 .route-steps-trigger:hover{background:#f8fbff}.route-steps-trigger-status{margin-left:auto;color:var(--muted);font-size:11px}.route-steps-popover{position:absolute;z-index:20;left:0;right:0;top:calc(100% + 6px);max-height:min(62vh,520px);display:flex;flex-direction:column;overflow:hidden;background:white;border:1px solid var(--line);border-radius:10px;box-shadow:0 16px 36px rgba(15,23,42,.18)}
 .route-steps-close{margin-left:auto;border:0;background:transparent;color:var(--muted);font-size:24px;line-height:1;cursor:pointer;padding:2px 7px}.route-steps-close:hover{color:#1e293b}
+.navigation-map-list{display:flex;flex-direction:column;gap:4px;max-height:150px;overflow-y:auto;margin:7px 0 10px;padding:2px;border:1px solid var(--line);border-radius:7px;background:var(--panel)}
+.navigation-map-item{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;width:100%;padding:7px 9px;border:1px solid transparent;border-radius:5px;background:white;color:var(--text);text-align:left;cursor:pointer}
+.navigation-map-item:hover{background:#f8fbff}.navigation-map-item.active{border-color:var(--accent);background:#eff6ff}.navigation-map-item:disabled{cursor:not-allowed;opacity:.65}.navigation-map-item strong,.navigation-map-item span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.navigation-map-item span{flex:0 0 auto;color:var(--muted);font-size:11px}.navigation-map-head{padding:5px 8px 3px;color:var(--muted);font-size:11px}.navigation-map-empty{padding:9px;color:var(--muted);font-size:12px;text-align:center}
 .route-commands-panel{max-height:clamp(132px,18dvh,208px)}
 .route-commands-table th,.route-commands-table td{padding:clamp(5px,0.6vh,8px) clamp(8px,0.8vw,14px);font-size:clamp(11px,0.55vw + 8px,12.5px)}
 .route-commands-head{padding:clamp(8px,0.8vh,11px) clamp(10px,0.9vw,14px) clamp(6px,0.6vh,9px)}
@@ -1259,4 +1298,5 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
  .app-shell.is-route-editing .route-editor-body{flex:none;min-height:0;overflow:visible}
  .route-rail{flex-direction:row;justify-content:center;margin-top:8px}
 }
+.scan-detector-inference{display:flex;flex-direction:column;gap:4px;margin-top:12px;padding:10px 12px;border:1px solid #bfdbfe;border-radius:8px;background:#eff6ff;color:#1e3a8a;font-size:12px;line-height:1.6}.scan-detector-inference strong{font-weight:600}.scan-detector-inference small{color:#475569}.scan-detector-inference.is-unregistered{border-color:#fed7aa;background:#fff7ed;color:#9a3412}.scan-detector-inference.is-unregistered small{color:#9a3412}
 </style>

@@ -58,20 +58,75 @@ export async function boardPdf(boards:Board[],centerCrosshair=true):Promise<Buff
   doc.end();
  });
 }
-/** Only reads registration state. Suggestions never change an existing board or reserve IDs. */
-export function boardRegistrationPlan(store:Store,raw:unknown){
- // 重复打印不再阻断：已注册编号/板组可按用户输入再次生成 PDF。
+/** Registration planning never blocks a user-specified repeat print. */
+export function boardRegistrationPlan(_store:Store,raw:unknown){
  const plan=boardPlan(raw);
  return {...plan,registration:{available:true}};
 }
-export function boardTables(store:Store){store.db.exec('CREATE TABLE IF NOT EXISTS marker_boards(id TEXT PRIMARY KEY,reference_id INTEGER UNIQUE NOT NULL,body TEXT NOT NULL,created TEXT NOT NULL);');}
+export function boardTables(store:Store){store.db.exec('CREATE TABLE IF NOT EXISTS marker_boards(id TEXT PRIMARY KEY,reference_id INTEGER UNIQUE NOT NULL,body TEXT NOT NULL,created TEXT NOT NULL);CREATE TABLE IF NOT EXISTS board_print_history(id INTEGER PRIMARY KEY AUTOINCREMENT,board_id TEXT NOT NULL,reference_id INTEGER NOT NULL,body TEXT NOT NULL,created TEXT NOT NULL);');}
 export function listBoards(store:Store):Board[]{return (store.db.prepare('SELECT body FROM marker_boards ORDER BY reference_id').all() as {body:string}[]).map(row=>boardSchema.parse(JSON.parse(row.body)));}
 
 /** 重复打印不再阻断：已注册编号/板组允许再次生成。保留函数签名以兼容现有调用。 */
-export function checkBoardRegistration(_store:Store,_boards:Board[]){}
+function boardConflict(message:string):never{throw Object.assign(new Error(message),{statusCode:409});}
+/** 跨板成员冲突明细：只统计与“其他 board ID”的交集；同 id 走幂等/替换语义，不计冲突。 */
+export function boardMemberConflicts(store:Store,boards:Board[]){
+ const existing=listBoards(store),batchIds=new Set(boards.map(b=>b.id)),conflicts:{boardId:string,memberIds:number[]}[]=[];
+ for(const board of boards){
+  const members=new Set(board.members.map(m=>m.id));
+  for(const other of existing){
+   if(batchIds.has(other.id))continue;
+   const overlap=other.members.filter(m=>members.has(m.id)).map(m=>m.id);
+   if(overlap.length)conflicts.push({boardId:other.id,memberIds:overlap});
+  }
+ }
+ return conflicts;
+}
+function conflictMessage(conflicts:{boardId:string,memberIds:number[]}[]){
+ const parts=conflicts.map(c=>`${c.memberIds.slice(0,8).map(label).join('、')}${c.memberIds.length>8?` 等 ${c.memberIds.length} 个子码`:''} 已属于 ${c.boardId}`);
+ return `跨板成员冲突，整批拒绝登记：${parts.join('；')}`;
+}
+/** Compatibility no-op: repeat prints never block registration. */
+export function checkBoardRegistration(_store:Store,_boards:Board[]){return;}
 export function registerBoards(store:Store,boards:Board[]){
  store.db.transaction(()=>{
-  const insert=store.db.prepare('INSERT INTO marker_boards(id,reference_id,body,created) VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING');
-  for(const board of boards)insert.run(board.id,board.referenceId,JSON.stringify(board),new Date().toISOString());
+  const now=new Date().toISOString();
+  const history=store.db.prepare('INSERT INTO board_print_history(board_id,reference_id,body,created) VALUES(?,?,?,?)');
+  const remove=store.db.prepare('DELETE FROM marker_boards WHERE id=?');
+  const insert=store.db.prepare('INSERT INTO marker_boards(id,reference_id,body,created) VALUES(?,?,?,?)');
+  const existing=listBoards(store);
+  const byId=new Map(existing.map(item=>[item.id,item] as const));
+  const batchIds=new Set(boards.map(b=>b.id));
+
+  // 1) 每次打印都写历史（允许任意重叠，历史不做唯一性约束）
+  for(const board of boards)history.run(board.id,board.referenceId,JSON.stringify(board),now);
+
+  // 2) 确定“将被同 id 替换”的板：其旧成员在本批次内释放
+  const replaced=new Set<string>();
+  for(const board of boards){
+   const same=byId.get(board.id);
+   if(same&&JSON.stringify(same)!==JSON.stringify(board))replaced.add(board.id);
+  }
+
+  // 3) 计算本批次写入 marker_boards 后仍占用的成员：其他板（不含本批同 id）成员
+  const kept=[...existing.filter(item=>!batchIds.has(item.id)&&!replaced.has(item.id))];
+
+  // 4) 逐个决定是否可作为导航代表写入
+  const accepted:Board[]=[];
+  for(const board of boards){
+   const same=byId.get(board.id);
+   if(same&&JSON.stringify(same)===JSON.stringify(board))continue; // 幂等：不写不改
+   const memberIds=new Set(board.members.map(m=>m.id));
+   const conflict=kept.some(other=>other.members.some(m=>memberIds.has(m.id)))
+     ||accepted.some(other=>other.members.some(m=>memberIds.has(m.id)));
+   if(conflict)continue; // 与其他 board ID 成员交集非空 → 只留在历史
+   accepted.push(board);
+  }
+
+  // 5) 应用：先删被替换的同 id 行，再插入合法代表
+  for(const id of replaced)remove.run(id);
+  for(const board of accepted){
+   remove.run(board.id);
+   insert.run(board.id,board.referenceId,JSON.stringify(board),now);
+  }
  })();
 }

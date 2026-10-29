@@ -78,6 +78,7 @@ async function loadOptions(){
  finally{if(!closed)loadingOptions.value=false;}
 }
 // 浏览器打印与下载 PDF 共用同一个干净打印面：只输出二维码板主体。
+const boardPreviewSize=computed(()=>{const mm=Number(groupSizeMm.value)||0;if(!mm)return '320px';const capped=Math.min(180,Math.max(20,mm));return Math.round(560*capped/180)+'px';});
 function printBoard(){window.print();}
 async function download(){
  if(busy.value||localError.value||!gridOption.value)return;
@@ -123,9 +124,9 @@ onBeforeUnmount(()=>{closed=true;clearTimeout(timer);sequence++;});
   </div>
   <div class="pdf-preview">
    <div class="preview-toolbar"><strong>定位组预览 · {{boardLabel}}</strong><span>{{gridSize}} × {{gridSize}} · {{groupSizeMm}} mm</span></div>
-   <div class="board-area"><div class="board-preview print-surface"><img v-if="!localError&&gridOption" :src="previewUrl" :alt="boardLabel+' 完整定位组'"/></div></div>
-   <div v-if="plan" class="board-list"><div class="board-list-title">组编号与子码</div><div v-for="board in plan.boards" :key="board.id" class="board-row"><strong>{{board.id}}</strong><span>{{board.members.map(member=>label(member.id)).join(' · ')}}</span></div></div>
-   <div class="preview-status">tag36h11 · A4 · 每页 1 组</div>
+   <div class="board-area"><div class="board-preview print-surface" :style="{'--board-preview-size': boardPreviewSize}"><img v-if="!localError&&gridOption" :src="previewUrl" :alt="boardLabel+' 完整定位组'"/></div></div>
+   <details v-if="plan" class="board-list board-list-collapsed"><summary class="board-list-title">组编号与子码（{{plan.boards.length}} 组）</summary><div v-for="board in plan.boards" :key="board.id" class="board-row"><strong>{{board.id}}</strong><span>{{board.members.map(member=>label(member.id)).join(' · ')}}</span></div></details>
+   <div class="preview-status preview-status-compact">tag36h11 · A4 · 每页 1 组</div>
   </div>
  </section>
 </template>
@@ -133,7 +134,7 @@ onBeforeUnmount(()=>{closed=true;clearTimeout(timer);sequence++;});
 .crosshair-note.crosshair-unavailable{color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:7px 9px}
 .crosshair-option{display:flex;flex-direction:row;align-items:center;gap:8px}.crosshair-note{display:block;margin-top:7px;color:var(--muted);font-size:11px;line-height:1.6}.crosshair-option input{width:16px;height:16px;padding:0;accent-color:var(--accent)}
 
-.pdf-workspace{display:grid;grid-template-columns:clamp(340px,26vw,520px) minmax(0,1fr);flex:1;min-height:0;overflow:hidden;align-items:stretch}
+.pdf-workspace{display:grid;grid-template-columns:clamp(240px,18vw,320px) minmax(0,1fr);flex:1;min-height:0;overflow:hidden;align-items:stretch}
 .pdf-controls{width:auto;min-width:0;padding:clamp(14px,1.2vw,22px);overflow-y:auto;background:var(--background);border-right:1px solid var(--panel)}
 h2{display:flex;align-items:center;gap:10px;margin:0 0 20px;font-size:18px;font-weight:600;color:var(--ink)}
 fieldset{margin:0;padding:0;border:0;min-width:0}
@@ -159,14 +160,14 @@ legend{font-size:14px;color:var(--muted);margin-bottom:12px}
 .preview-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:var(--background);border-bottom:1px solid var(--panel);font-size:14px;flex-wrap:wrap}
 .preview-toolbar strong{font-weight:500;color:var(--ink)}.preview-toolbar span{color:var(--muted)}
 .board-area{padding:clamp(16px,1.6vw,34px);display:flex;justify-content:center;align-items:center;min-height:clamp(240px,30vh,360px);flex:1;min-width:0}
-.board-preview{width:min(100%,clamp(320px,42vh,560px));aspect-ratio:1;background:var(--background);box-shadow:none;flex-shrink:0;min-width:0}
+.board-preview{width:min(100%,clamp(140px,var(--board-preview-size,320px),560px));aspect-ratio:1;background:var(--background);box-shadow:none;flex-shrink:0;min-width:0;margin:0 auto}
 .board-preview img{display:block;width:100%;height:auto;max-width:100%;object-fit:contain}
 .board-list{margin:0 26px 22px;background:var(--background);border:1px solid var(--panel);border-radius:8px;padding:10px 12px;max-height:240px;overflow-y:auto;flex-shrink:0}
 .board-list-title{font-size:14px;font-weight:600;color:var(--ink);margin-bottom:10px}
 .board-row{display:flex;align-items:flex-start;gap:14px;font-size:14px;line-height:1.7;padding:10px 0;border-top:1px solid var(--panel);color:var(--muted)}.board-row strong{color:var(--accent);font-weight:500;flex-shrink:0}.board-row span{overflow-wrap:anywhere}
 .preview-status{border-top:1px solid var(--panel);background:var(--background);padding:16px 26px;font-size:14px;color:var(--muted);flex-shrink:0}
-@media(max-width:1400px){.pdf-workspace{grid-template-columns:clamp(300px,30vw,400px) minmax(0,1fr)}}
-@media(max-width:1200px){.pdf-workspace{grid-template-columns:clamp(280px,32vw,360px) minmax(0,1fr)}.board-area{padding:16px}}
+@media(max-width:1400px){.pdf-workspace{grid-template-columns:clamp(230px,20vw,300px) minmax(0,1fr)}}
+@media(max-width:1200px){.pdf-workspace{grid-template-columns:clamp(220px,24vw,280px) minmax(0,1fr)}.board-area{padding:16px}}
 /* 窄屏：单列堆叠，配置在上、预览在下 */
 @media(max-width:900px){
  .pdf-workspace{grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto;overflow:visible;align-content:start}
@@ -201,3 +202,24 @@ legend{font-size:14px;color:var(--muted);margin-bottom:12px}
   @page{size:A4;margin:0}
 }
 </style>
+
+/* 打印页紧凑化：配置区收窄、预览占主、低频说明收起 */
+.app-shell .pdf-workspace{gap:12px}
+.app-shell .pdf-controls{width:clamp(240px,18vw,320px);padding:14px}
+.app-shell .pdf-controls h2{font-size:13px;margin:0 0 8px}
+.app-shell .pdf-controls label{margin-top:9px;font-size:12px;gap:4px}
+.app-shell .pdf-controls label input,.app-shell .pdf-controls label select{height:32px}
+.app-shell .pdf-controls .grid-option{min-height:34px;font-size:12px;padding:5px 7px}
+.app-shell .pdf-summary{margin:10px 0;padding:10px;gap:7px}
+.app-shell .pdf-summary>div{font-size:12px}
+.app-shell .pdf-summary strong{font-size:12px}
+.app-shell .board-area{padding:12px;min-height:0}
+.app-shell .board-list{margin:8px 14px;padding:8px 10px}
+.app-shell .board-list-collapsed>.board-list-title{cursor:pointer;font-size:12px;margin:0;padding:0}
+.app-shell .board-list-collapsed[open]>.board-list-title{margin-bottom:6px}
+.app-shell .preview-status-compact{padding:8px 14px;font-size:11px}
+.app-shell .crosshair-note{font-size:11px;margin-top:5px}
+@media(max-width:940px){.app-shell .pdf-controls{width:clamp(220px,26vw,300px)}}
+@media(max-width:760px){.app-shell .pdf-controls{width:100%}}
+
+

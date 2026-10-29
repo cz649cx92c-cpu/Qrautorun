@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import Konva from 'konva';
-import {onMounted,onBeforeUnmount,ref,watch} from 'vue';
+import {computed,onMounted,onBeforeUnmount,ref,watch} from 'vue';
 import type {FieldMap,Point} from '../../../shared/model';
 import {exitPoint,heading,distance,orderedTagsById,vehicleFootprintM} from '../../../shared/model';
 import {orthogonalRoute,snapRoutePoint,chainRouteGroups,routeGroupCenters} from '../../../shared/route-design';
@@ -8,7 +8,7 @@ import {orderMotionSegmentsByChain} from '../../../shared/route';
 import {planStrategies,choicesFromSegments,degrees,type SegmentPlan} from '../../../shared/segment-strategy';
 import {Plus,Minus,Scan,MousePointer2} from 'lucide-vue-next';
 import Button from './ui/Button.vue';
-const props=defineProps<{map:FieldMap,selected:number[],rowId:string,tool:string,editable:boolean,drawing:Point[],panEnabled?:boolean,measurement?:number[],vehicle?:{x:number,y:number,yaw:number},trail?:Point[],routeAnchors?:Point[],routeSelected?:number,routeGroupIds?:number[],routeSkippedGroups?:{id:number,distanceM:number}[],segmentPlans?:SegmentPlan[],selectedSegment?:string,initialHeading?:number}>();
+const props=defineProps<{map:FieldMap,selected:number[],rowId:string,tool:string,editable:boolean,drawing:Point[],panEnabled?:boolean,measurement?:number[],vehicle?:{x:number,y:number,yaw:number},trail?:Point[],routeAnchors?:Point[],routeSelected?:number,routeGroupIds?:number[],routeSkippedGroups?:{id:number,distanceM:number}[],routeName?:string,segmentPlans?:SegmentPlan[],selectedSegment?:string,initialHeading?:number,drawMode?:boolean}>();
 const emit=defineEmits<{select:[id:number,multi:boolean],inspect:[id:number],segmentSelect:[key:string],row:[id:string],blank:[point:Point],move:[ids:number[],dx:number,dy:number],point:[rowId:string,index:number,point:Point],zone:[index:number,point:Point],designSelect:[index:number],designMove:[index:number,point:Point],heading:[value:number],tagDetail:[id:number]}>();
 const container=ref<HTMLDivElement>();let stage:Konva.Stage;let layer:Konva.Layer;let overlayLayer:Konva.Layer;let observer:ResizeObserver;let isMounted=false;const coordinate=ref('X 0.00 · Y 0.00 m'),zoom=ref(100);
 // Live telemetry (vehicle/trail) lives on a persistent overlay layer. The static layer below it
@@ -95,23 +95,26 @@ function redraw() {
  for(const t of orderedTagsById(props.map.tags)){const selected=props.selected.includes(t.id)||(props.tool==='route-design'&&!!props.routeGroupIds?.includes(t.id)),[x,y]=px(t);const group=new Konva.Group({name:'tag-'+t.id,x,y,draggable:props.editable&&props.tool==='select'});
   const skipped=props.tool==='route-design'&&props.routeSkippedGroups?.some(tag=>tag.id===t.id);
   const size=ms(t.size*100,5);group.add(new Konva.Rect({x:-size/2,y:-size/2,width:size,height:size,cornerRadius:ms(2,1.2),fill:skipped?'#d97706':selected?'#2563a6':t.kind==='end'?'#2563a6':'#39444f',stroke:selected?'#c9d0d7':'white',strokeWidth:ms(2,1)}));
+  if(props.tool==='route-design'){const hit=Math.max(size,32/scale);group.add(new Konva.Rect({x:-hit/2,y:-hit/2,width:hit,height:hit,fill:'transparent',listening:true}));group.setAttr('aria-label',`二维码 Q${String(t.id).padStart(3,'0')}${t.groupId?`，定位组 ${t.groupId}`:''}`);}
   // 编辑路径时只标注与路线相关的码（途经/偏离/选中），其余码不写名字：
   // 码密时满屏 B1xx 会盖住路径本身。扫描/导航页仍全部标注。
-  if(props.tool!=='route-design'||selected||skipped)group.add(new Konva.Text({fontFamily:"QR Sans, QR CJK, sans-serif",x:-40/scale,y:14/scale,width:80/scale,align:'center',text:t.groupId??`Q${String(t.id).padStart(3,'0')}`,fontSize:16/scale,fill:skipped?'#d97706':selected?'#2563a6':'#56616d',listening:false}));
+  // 路径编辑时同样标注全部定位组（淡色小字），否则满屏方块无法分辨该连哪一个点；
+  // 被选中/偏离的点仍用醒目颜色，路径本身画在最上层不会被遮挡。
+  group.add(new Konva.Text({fontFamily:"QR Sans, QR CJK, sans-serif",x:-40/scale,y:(props.tool==='route-design'?12:14)/scale,width:80/scale,align:'center',text:t.groupId??`Q${String(t.id).padStart(3,'0')}`,fontSize:(props.tool==='route-design'?12:16)/scale,fill:skipped?'#d97706':selected?'#2563a6':(props.tool==='route-design'?'#9aa6b2':'#56616d'),listening:false,opacity:props.tool==='route-design'&&!selected&&!skipped?.55:1}));
   group.on('click tap',e=>{
    e.cancelBubble=true;
    if(props.tool!=='route-design'){emit('select',t.id,!!e.evt.shiftKey);return;}
    if(stageMoved||panGesture||props.panEnabled)return;
-   // 同一个码的第二次点击 = 双击：取消落点，改为显示这块码的信息
+   // 路径编辑：每次点击立刻追加路点，允许同一码重复经过（如 B064→B080→B016→B080）。
+   if(props.editable){
+    flushPendingClick();emit('inspect',t.id);emit('blank',{x:t.x,y:t.y});return;
+   }
+   // 只读查看：同一码第二次点击视为双击，显示该码详情。
    if(pendingClick&&pendingClick.tagId===t.id){
     clearTimeout(pendingClick.timer);pendingClick=null;emit('tagDetail',t.id);return;
    }
-   // 点到别的码：先把上一个待定点击立刻落点，避免丢点
    flushPendingClick();
-   if(props.editable){
-    const timer=window.setTimeout(()=>{const pc=pendingClick;pendingClick=null;if(pc){emit('inspect',t.id);emit('blank',{x:pc.x,y:pc.y});}},230);
-    pendingClick={x:t.x,y:t.y,tagId:t.id,timer};
-   }else emit('inspect',t.id);
+   emit('inspect',t.id);
   });
   group.on('dragend',()=>emit('move',selected?props.selected:[t.id],(group.x()-x!)/100,-(group.y()-y!)/100));layer.add(group);
  }
@@ -132,12 +135,16 @@ function redraw() {
   updatePreview(props.drawing);
   hoverMarker=new Konva.Circle({radius:ms(17,8),stroke:'#2563a6',strokeWidth:ms(2,1),dash:[4/scale,3/scale],visible:false,listening:false});layer.add(hoverMarker);
   (props.routeAnchors??[]).forEach((p,i)=>{const [x,y]=px(p),selected=i===props.routeSelected;
+   // 折返点：本点与更早的某个路点重合（例如 B080→…→B080）。序号错开并换色，避免与原点重叠看不出。
+   const anchorsAll=props.routeAnchors??[];
+   const revisit=anchorsAll.slice(0,i).some(q=>distance(q,p)<0.01);
+   const stepColor=revisit?'#d97706':color;
    const handleSize=ms(selected?16:12,selected?9:7);
-   const handle=new Konva.Rect({name:'route-waypoint-'+i,x,y,offsetX:handleSize/2,offsetY:handleSize/2,width:handleSize,height:handleSize,fill:selected?'#ffffff':'#39444f',stroke:color,strokeWidth:selected?ms(3,1.6):ms(2,1),draggable:props.editable});
+   const handle=new Konva.Rect({name:'route-waypoint-'+i,x,y,offsetX:handleSize/2,offsetY:handleSize/2,width:handleSize,height:handleSize,fill:selected?'#ffffff':'#39444f',stroke:stepColor,strokeWidth:selected?ms(3,1.6):ms(2,1),draggable:props.editable&&!props.drawMode,listening:!props.drawMode});
    handle.on('click tap',e=>{e.cancelBubble=true;if(props.editable)emit('designSelect',i);});
    handle.on('dragmove',()=>{const snapped=snapRoutePoint({x:handle.x()/100,y:-handle.y()/100},props.map.tags);handle.position({x:snapped.x*100,y:-snapped.y*100});const anchors=(props.routeAnchors??[]).map((a,j)=>j===i?snapped:a);updatePreview(orthogonalRoute(anchors));layer.batchDraw();});
    handle.on('dragend',()=>{suppressDesignClick=true;setTimeout(()=>{suppressDesignClick=false;},0);emit('designMove',i,{x:handle.x()/100,y:-handle.y()/100});redraw();});layer.add(handle);
-   layer.add(new Konva.Text({x:x!+9/scale,y:y!-18/scale,text:String(i+1),fontSize:12/scale,fontFamily:'monospace',fontStyle:selected?'bold':'normal',fill:selected?color:'#39444f',listening:false}));
+   layer.add(new Konva.Text({x:x!+(revisit?10:9)/scale,y:y!+(revisit?16:-18)/scale,text:String(i+1),fontSize:12/scale,fontFamily:'monospace',fontStyle:selected?'bold':'normal',fill:revisit?stepColor:(selected?color:'#39444f'),listening:false}));
   });
   // 初始车头朝向不再在画布上画琥珀色箭头/拖拽点（已在左侧参数卡里用数值设置）。
  }else if(props.drawing.length) {layer.add(new Konva.Line({points:props.drawing.flatMap(px),stroke:'#2563a6',strokeWidth:2/scale,listening:false}));for(const p of props.drawing){const [x,y]=px(p);layer.add(new Konva.Circle({x,y,radius:4/scale,fill:'#2563a6',listening:false}));}}

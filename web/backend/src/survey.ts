@@ -77,7 +77,8 @@ export function appendSamples(store:Store,id:string,raw:unknown){
    if(sample.representation!=='board-centers')throw new Error('多码组扫描必须保存整组中心');
    const layouts=sample.groupLayouts??[];
    for(const t of sample.tags){
-    const board=session.boards.find(b=>b.referenceId===t.id),snapshot=layouts.find(b=>b.id===t.groupId);
+    // 单码即可推断整组：t.id 允许是组内任意成员（不再要求等于 referenceId）
+    const board=session.boards.find(b=>b.referenceId===t.id||b.members.some(m=>m.id===t.id)),snapshot=layouts.find(b=>b.id===t.groupId);
     if(!board||t.groupId!==board.id||!snapshot||JSON.stringify(snapshot)!==JSON.stringify(board))throw new Error('观测定位组布局与扫描记录不一致');
     if(!t.memberIds?.length||new Set(t.memberIds).size!==t.memberIds.length||t.visibleCount!==t.memberIds.length||t.memberIds.some(mid=>!board.members.some(m=>m.id===mid)))throw new Error('观测子码与定位组成员不符');
     const penalty=Math.max(t.memberIds.length===1?1.5:1,Math.sqrt(board.members.length/t.memberIds.length));if(t.sigma+.0000001<.01*penalty)throw new Error('部分子码定位不确定性不足');if(t.size!==undefined&&Math.abs(t.size-board.sizeMm/1000)>1e-9)throw new Error('观测整组尺寸不一致');

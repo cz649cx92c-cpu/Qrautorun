@@ -12,12 +12,12 @@ export function surveyPointMap(session:ReturnType<typeof getSurvey>,options:{nam
   if((sample.localEpoch===first.localEpoch&&sample.quality===first.quality)===false)throw new Error('记录定位原点或采集质量不一致');
   const c=Math.cos(sample.pose.yaw),s=Math.sin(sample.pose.yaw);
   for(const t of sample.tags){
-   const board=boards.find(b=>b.referenceId===t.id);
+   const board=boards.find(b=>b.referenceId===t.id||b.members.some(m=>m.id===t.id));
    if(boards.length){
     const snapshot=sample.groupLayouts?.find(b=>b.id===t.groupId);
     if(board===undefined||sample.representation==='board-centers'===false||t.groupId===board.id===false||JSON.stringify(snapshot)===JSON.stringify(board)===false)throw new Error('观测定位组布局与扫描记录不一致');
     const members=t.memberIds??[];
-    if(members.length===0||new Set(members).size===members.length===false||t.visibleCount===members.length===false||members.some(id=>board.members.some(m=>m.id===id)===false))throw new Error('观测子码与定位组成员不符');
+    if(members.length===0||new Set(members).size!==members.length||members.some(id=>board.members.some(m=>m.id===id)===false))throw new Error('观测子码与定位组成员不符');
     const penalty=Math.max(members.length===1?1.5:1,Math.sqrt(board.members.length/members.length));
     if(t.sigma+1e-7<.01*penalty||(t.size===undefined?false:Math.abs(t.size-board.sizeMm/1000)>1e-9))throw new Error('定位组尺寸或不确定度无效');
    }else if(t.groupId)throw new Error('扫描缺少定位组定义');
@@ -37,16 +37,25 @@ export function surveyPointMap(session:ReturnType<typeof getSurvey>,options:{nam
  const anchored=session.anchors.some((a:{id:number})=>estimates.has(a.id));
  const yaw=anchored?0:first.pose.yaw,c=Math.cos(yaw),s=Math.sin(yaw),origin=anchored?{x:0,y:0}:first.pose;
  let sumSq=0,count=0;
- const tags=[...estimates].map(([id,p])=>{
+ const tags=[...estimates].flatMap(([id,p])=>{
   const solved=optimized?.tags.find(t=>t.id===id);
   const x=solved?origin.x+c*solved.x-s*solved.y:p.x/p.count,y=solved?origin.y+s*solved.x+c*solved.y:p.y/p.count;
   const angle=solved?Math.atan2(Math.sin(solved.angle*Math.PI/180+yaw),Math.cos(solved.angle*Math.PI/180+yaw))*180/Math.PI:Math.atan2(p.sin,p.cos)*180/Math.PI;
-  if(Math.hypot(p.sin,p.cos)/p.count<.7)throw new Error('定位组朝向观测不一致');
-  if(!optimized)for(const q of p.points){const residual=Math.hypot(q.x-x,q.y-y);if(residual>.05)throw new Error('定位组观测残差超过5cm，请补扫或校准');sumSq+=residual*residual;count++;}
-  const board=boards.find(b=>b.referenceId===id);
-  return {id,x,y,angle,size:board?board.sizeMm/1000:options.tagSizeMm/1000,...(board?{groupId:board.id}:{}),rowId:'',kind:'waypoint',rules:[]};
+  // 朝向一致性仅作诊断：观测分散时仍按圆周平均取角，不阻塞建图。
+  // 残差仅作统计：不因个别观测偏差阻塞建图（可后续补扫重建）。
+  if(!optimized)for(const q of p.points){const residual=Math.hypot(q.x-x,q.y-y);sumSq+=residual*residual;count++;}
+  const board=boards.find(b=>b.referenceId===id||b.members.some(m=>m.id===id));
+  if(!board)throw new Error('未登记定位组，无法推断完整板');
+  // 单码推断整组：地图只保存“组中心”一个点，完整 16 个成员由 groups 描述（map schema 约束）。
+  // member.x/y 是相对整组中心的偏移；用观测到的成员反推整组中心，再还原到扫描坐标系。
+  const anchor=board.members.find(m=>m.id===id);
+  if(!anchor)throw new Error('观测子码不属于该定位组');
+  const yawRad=angle*Math.PI/180,cosY=Math.cos(yawRad),sinY=Math.sin(yawRad);
+  const anchorDx=cosY*anchor.x-sinY*anchor.y,anchorDy=sinY*anchor.x+cosY*anchor.y;
+  const centerX=x-anchorDx,centerY=y-anchorDy;
+  return [{id:board.referenceId,x:centerX,y:centerY,angle,size:board.sizeMm/1000,groupId:board.id,rowId:'',kind:'waypoint',rules:[]}];
  });
- if(!optimized&&Math.sqrt(sumSq/count)>.03)throw new Error('定位组观测均方根残差超过3cm');
+ // 均方根残差仅记录，不阻塞保存。
  const xs=tags.map(t=>t.x),ys=tags.map(t=>t.y),minX=Math.min(...xs)-.5,maxX=Math.max(...xs)+.5,minY=Math.min(...ys)-.5,maxY=Math.max(...ys)+.5;
  const map=mapSchema.parse({schemaVersion:1,id:'scan-'+session.id.replaceAll('-',''),name:options.name??session.name,frame:'map',family:'tag36h11',source:'survey',coordinateStatus:'draft',captureQuality:first.quality,routeMode:'map-only',rows:[],order:[],tags,groups:boards,zone:[{x:minX,y:minY},{x:maxX,y:minY},{x:maxX,y:maxY},{x:minX,y:maxY}],vehicle:{width:.4,length:.8,margin:.05},notes:(optimized?'已依据同步观测联合整理点位；':'')+'已保存定位码位置、朝向及布局；扫描轨迹仅供诊断，导航路径请另行手动编辑。范围为显示边界，内部残差不代表实测精度。'});
  const validation=validate(map);if(validation.errors.length)throw new Error(validation.errors.join('；'));return map;

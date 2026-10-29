@@ -7,10 +7,14 @@ export function snapRoutePoint(point:Point,centers:Point[],grid=ROUTE_GRID):Poin
  const nearest=centers.reduce<Point|undefined>((best,p)=>distance(point,p)<=GROUP_SNAP+1e-9&&(!best||distance(point,p)<distance(point,best))?p:best,undefined);
  return nearest?{x:nearest.x,y:nearest.y}:{x:Math.round(point.x/grid)*grid,y:Math.round(point.y/grid)*grid};
 }
+// 1mm：亚毫米级的坐标差（例如两块码的中心差 0.3mm）不应被当成一次拐弯，
+// 否则会插入一个几乎重合的拐角点，使后续按拐角串联定位组时失败。
+const ALIGN_EPS=.001;
 export function orthogonalRoute(anchors:Point[]):Point[] {
  const points:Point[]=[];
- const append=(p:Point)=>{if(!points.length||distance(points.at(-1)!,p)>1e-8)points.push({...p});};
- for(const p of anchors){const previous=points.at(-1);if(previous&&Math.abs(p.x-previous.x)>1e-8&&Math.abs(p.y-previous.y)>1e-8){
+ const append=(p:Point)=>{if(!points.length||distance(points.at(-1)!,p)>ALIGN_EPS)points.push({...p});};
+ for(const p of anchors){const previous=points.at(-1);
+  if(previous&&Math.abs(p.x-previous.x)>ALIGN_EPS&&Math.abs(p.y-previous.y)>ALIGN_EPS){
   append(Math.abs(p.x-previous.x)>=Math.abs(p.y-previous.y)?{x:p.x,y:previous.y}:{x:previous.x,y:p.y});
  }append(p);}
  return points;
