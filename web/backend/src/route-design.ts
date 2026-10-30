@@ -6,15 +6,22 @@ import trial from '../../../src/greenhouse_navigation/greenhouse_navigation/reco
 
 export const routeDesignSchema=z.object({
  mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),baseVersion:z.number().int().positive(),
- points:z.array(pointSchema).min(2).max(501),bodyYawDeg:z.number().finite().min(-180).max(180),initialHeadingRad:z.number().finite().min(-Math.PI).max(Math.PI).nullable().optional(),routeId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),routeName:z.string().trim().min(1).max(100).optional(),saveAs:z.boolean().default(false),routeUpdated:z.string().datetime().optional()
+ points:z.array(pointSchema).min(2).max(501),bodyYawDeg:z.number().finite().min(-180).max(180),initialHeadingRad:z.number().finite().min(-Math.PI).max(Math.PI).nullable().optional(),routeId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),routeName:z.string().trim().min(1).max(100).optional(),saveAs:z.boolean().default(false),routeUpdated:z.string().datetime().optional(),distanceModel:z.literal('center-euclidean').default('center-euclidean'),spacingOverrides:z.array(z.object({fromId:z.number().int().min(0).max(586),toId:z.number().int().min(0).max(586),occurrence:z.number().int().positive().default(1),targetM:z.number().finite().min(.08).max(50)})).max(100).optional()
 }).extend({segmentModes:z.array(segmentChoiceSchema).max(100).optional()}).strict();
 const wrap=(a:number)=>Math.atan2(Math.sin(a),Math.cos(a));
 const EPS=1e-8;
 
-export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:number,segmentModes:SegmentChoice[]=[]){
+export function validateSpacingOverrides(source:FieldMap, overrides:any[]){ const ids=new Set(source.tags.map(t=>t.id)); const seen=new Set<string>(); for(const o of overrides??[]){ if(!ids.has(o.fromId)||!ids.has(o.toId)||o.fromId===o.toId)throw new Error('间距二维码必须存在且不同'); const k=`${o.fromId}>${o.toId}#${o.occurrence??1}`; if(seen.has(k))throw new Error('重复间距覆盖必须指定不同 occurrence'); seen.add(k); const d=Math.hypot((source.tags.find(t=>t.id===o.toId)!.x-source.tags.find(t=>t.id===o.fromId)!.x),(source.tags.find(t=>t.id===o.toId)!.y-source.tags.find(t=>t.id===o.fromId)!.y)); if(d<.08||o.targetM<.08)throw new Error('二维码物理间距不得小于8厘米'); } return true; }
+
+export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:number,segmentModes:SegmentChoice[]=[],spacingOverrides:any[]=[]){
  if(!Number.isFinite(bodyYawDeg)||Math.abs(bodyYawDeg)>180)throw new Error('车头朝向必须为 -180 到 180 度');
  if(input.length<2||input.length>501)throw new Error('路径需要 2–501 个控制点');
  const raw=input.map(p=>pointSchema.parse(p));
+ validateSpacingOverrides(source,spacingOverrides);
+ // Route-level distance overrides move only the selected endpoint along its existing
+ // segment axis; map tag centres remain immutable.
+ for(const ov of spacingOverrides??[]){ const idx=raw.findIndex(p=>p.x===source.tags.find(t=>t.id===ov.toId)?.x&&p.y===source.tags.find(t=>t.id===ov.toId)?.y); const from=source.tags.find(t=>t.id===ov.fromId),to=source.tags.find(t=>t.id===ov.toId); if(idx>=0&&from&&to){const d=Math.hypot(to.x-from.x,to.y-from.y);if(d<.08)throw new Error('相邻二维码物理间距不足8厘米'); const ux=(to.x-from.x)/d,uy=(to.y-from.y)/d;raw[idx]={x:from.x+ux*ov.targetM,y:from.y+uy*ov.targetM};}}
+
  for(let i=1;i<raw.length;i++){
   const a=raw[i-1]!,b=raw[i]!;
   if(distance(a,b)<.001)throw new Error('相邻路点距离不能小于1毫米');
@@ -28,6 +35,9 @@ export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:nu
  const chain=chainRouteGroups(corners,routeGroupCenters(source));
  if(chain.problem)throw new Error(chain.problem);
  const boundaries=chain.nodes;
+ const adjacentOccurrences=new Map<string,number>();
+ for(let i=1;i<boundaries.length;i++){const key=boundaries[i-1]!.id+'>'+boundaries[i]!.id;adjacentOccurrences.set(key,(adjacentOccurrences.get(key)??0)+1);}
+ for(const ov of spacingOverrides??[]){const key=ov.fromId+'>'+ov.toId;if((adjacentOccurrences.get(key)??0)<(ov.occurrence??1))throw new Error('间距覆盖必须对应路径上的相邻二维码及有效经过次数');}
  if(new Set(boundaries.map(node=>node.id)).size<2)throw new Error('可直线串联的定位组不足两个，请沿码连线绘制路径');
  if(boundaries.length>101)throw new Error('定位组区间不能超过100段，请拆分任务');
  if(chain.lengthM>50+EPS)throw new Error('吸附后路径总长度不能超过50米，请拆分任务');

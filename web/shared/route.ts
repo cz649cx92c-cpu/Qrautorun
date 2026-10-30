@@ -13,6 +13,8 @@ export const routeSchema=z.object({
  // Explicitly chosen starting body heading. null/absent means "not set by the
  // user": the editor then defaults to the first leg's travel direction.
  initialHeadingRad:z.number().finite().nullable().optional(),
+ distanceModel:z.literal('center-euclidean').default('center-euclidean'),
+ spacingOverrides:z.array(z.object({fromId:z.number().int().min(0).max(586),toId:z.number().int().min(0).max(586),occurrence:z.number().int().positive().default(1),targetM:z.number().finite().min(0.08).max(50)})).max(100).default([]),
  created:z.string().datetime(),
  updated:z.string().datetime()
 });

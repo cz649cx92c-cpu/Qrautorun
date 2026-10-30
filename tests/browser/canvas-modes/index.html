@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+ <meta charset="UTF-8"/>
+ <title>MapCanvas 交互模式夹具</title>
+ <style>
+  html,body{margin:0;height:100%;font:13px system-ui;background:#f8fafc}
+  #harness{display:flex;gap:8px;height:100%;padding:8px;box-sizing:border-box}
+  /* 只补齐 MapCanvas 依赖的最小布局样式，不引入 App.vue / 后端。
+     画布给固定像素尺寸，避免 stage 以 0 宽高初始化。 */
+  .canvas-wrap{position:relative;flex:0 0 900px;width:900px;height:640px;overflow:hidden;background:#f8fafc}
+  .map-container{position:absolute;inset:0}
+  .canvas-caption{position:absolute;top:6px;left:6px;pointer-events:none}
+  .canvas-controls{position:absolute;right:6px;bottom:8px;pointer-events:none}
+  .canvas-footer{position:absolute;left:0;right:0;bottom:0;pointer-events:none}
+  .draw-hint{position:absolute;left:10px;bottom:40px;pointer-events:none}
+ </style>
+</head>
+<body>
+ <div id="harness"></div>
+ <script type="module" src="./main.ts"></script>
+</body>
+</html>

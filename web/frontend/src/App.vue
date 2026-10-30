@@ -9,6 +9,7 @@ import PdfGenerator from './components/PdfGenerator.vue';
 import TagInspector from './components/TagInspector.vue';
 import SegmentStrategyEditor from './components/SegmentStrategyEditor.vue';
 import OrthogonalCorrectionPanel from './components/OrthogonalCorrectionPanel.vue';
+import MapSpacingPicker from './components/MapSpacingPicker.vue';
 import MapDeleteConfirm from './components/MapDeleteConfirm.vue';
 import {planStrategies,choicesFromSegments,segmentExecutionBlockers,strategyOptions,type SegmentChoice,type SegmentPlan,type StrategyMode} from '../../shared/segment-strategy';
 import ScanRecords from './components/ScanRecords.vue';
@@ -33,13 +34,89 @@ const routeEditId=ref(''),routeEditUpdated=ref('');
 const maps=ref<{id:string;name:string;version:number;created:string}[]>([]),showCaptureTrail=ref(false);
 const routeDetailsOpen=ref(false);
 const orthogonalPreviewMap=ref<FieldMap|null>(null);
+// Only one map-maintenance draft may own the canvas at a time: the orthogonal
+// correction preview and the QR position draft are mutually exclusive views of
+// the same immutable base version.
+const mapDraftSource=ref<'orthogonal'|'tag-position'|null>(null);
+const tagPositionEditing=ref(false);
+const tagPositionPanel=ref<{selectTag:(id:number|null)=>void;moveTags:(ids:number[],dx:number,dy:number)=>void;reset:()=>void}|null>(null);
 // A pending orthogonal-correction preview is a read-only view of a candidate map:
 // path drawing, path saving and navigation must stay blocked until it is applied or discarded.
 const orthogonalPreviewActive=computed(()=>orthogonalPreviewMap.value!==null);
 const mapApproval=ref<{kind:string|null,accepted:boolean,digestValid:boolean}|null>(null);
 function selectMap(result:any){field.value=result.map;version.value=result.version;mapApproval.value=result.acceptance??null;}
-function setOrthogonalPreview(value:FieldMap|null){orthogonalPreviewMap.value=value;}
-async function onOrthogonalApplied(result:any){selectMap(result);orthogonalPreviewMap.value=null;selectedRouteId.value='';selectedTask.value='';await refresh();message.value='正交校正已保存 · 地图版本 v'+result.version+'；旧路线保持原版本';}
+function setOrthogonalPreview(value:FieldMap|null){orthogonalPreviewMap.value=value;mapDraftSource.value=value?'orthogonal':null;}
+function setTagPositionPreview(value:FieldMap|null){orthogonalPreviewMap.value=value;if(value)mapDraftSource.value='tag-position';else if(mapDraftSource.value==='tag-position')mapDraftSource.value=null;}
+// 图内直接改间距：画布上每条相邻段都画出 cm 标注，点标注就地输入，
+// 回车直接保存为新地图版本。侧栏不再承担输入职责。
+const spacingCanvasGaps=computed<{fromId:number;toId:number;m:number}[]>(()=>{
+ if(!tagPositionEditing.value||!field.value)return [];
+ // 用画布上正在渲染的地图（预览优先），这样输入目标间距时标注立即变成新值。
+ const tags=(canvasMap.value??field.value).tags;
+ const byId=new Map(tags.map(tag=>[tag.id,tag]));
+ const picked=spacingSelectedIds.value.filter(id=>byId.has(id));
+ if(picked.length<2)return [];
+ // 同一直线：按主轴排序，保证相邻段顺序稳定
+ const xs=picked.map(id=>byId.get(id)!.x),ys=picked.map(id=>byId.get(id)!.y);
+ const horizontal=(Math.max(...xs)-Math.min(...xs))>=(Math.max(...ys)-Math.min(...ys));
+ const ordered=[...picked].sort((a,b)=>{
+  const A=byId.get(a)!,B=byId.get(b)!;
+  return horizontal?A.x-B.x:A.y-B.y;
+ });
+ const gaps:{fromId:number;toId:number;m:number}[]=[];
+ for(let i=1;i<ordered.length;i++){
+  const a=byId.get(ordered[i-1]!),b=byId.get(ordered[i]!);
+  if(a&&b)gaps.push({fromId:a.id,toId:b.id,m:Math.hypot(b.x-a.x,b.y-a.y)});
+ }
+ return gaps;
+});
+interface GapEditState{fromId:number;toId:number;m:number;left:number;top:number;value:string;busy:boolean;error:string}
+const gapEdit=ref<GapEditState|null>(null);
+function onGapEdit(payload:{fromId:number;toId:number;m:number;x:number;y:number}){
+ if(!field.value||robot.value.running)return;
+ gapEdit.value={fromId:payload.fromId,toId:payload.toId,m:payload.m,left:payload.x,top:payload.y,value:(payload.m*100).toFixed(1),busy:false,error:''};
+ void nextTick(()=>{const input=document.querySelector('[data-testid="gap-inline-input"]') as HTMLInputElement|null;input?.focus();input?.select();});
+}
+function cancelGapEdit(){gapEdit.value=null;}
+async function commitGapEdit(){
+ const state=gapEdit.value;
+ if(!state||!field.value||state.busy)return;
+ const cm=Number(state.value);
+ if(!Number.isFinite(cm)||cm<8){state.error='至少 8 厘米';return;}
+ const targetM=Math.round(cm)/100;
+ if(Math.abs(targetM-state.m)<0.005){gapEdit.value=null;return;}
+ state.busy=true;state.error='';
+ try{
+  const response=await fetch(`/api/maps/${encodeURIComponent(field.value.id)}/tag-distance`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({baseVersion:version.value,fromId:state.fromId,toId:state.toId,targetM})});
+  const result=await response.json();
+  if(!response.ok)throw Object.assign(new Error(result.error??'保存失败'),{status:response.status});
+  gapEdit.value=null;
+  selectMap(result);await refresh();
+  message.value=`已把间距改为 ${cm.toFixed(1)} cm · 地图版本 v${result.version}；旧路线与旧任务仍绑定旧版本`;
+ }catch(reason){
+  const status=Number((reason as {status?:number}).status);
+  state.error=status===409?'地图已更新，请重新加载后再改':(reason instanceof Error?reason.message:String(reason));
+  state.busy=false;
+ }
+}
+function onTagPositionEditing(active:boolean){tagPositionEditing.value=active;if(!active)spacingSelectedIds.value=[];if(active){orthogonalPreviewMap.value=null;mapDraftSource.value='tag-position';}else if(mapDraftSource.value==='tag-position'){orthogonalPreviewMap.value=null;mapDraftSource.value=null;}}
+async function onTagPositionApplied(result:any){
+ // 保存后保持间距模式与选区：现场要连着改多组，并要立刻在画布上看到新间距。
+ // 只把基准地图替换成新版本，不能让用户重新点一遍。
+ mapDraftSource.value=null;orthogonalPreviewMap.value=null;
+ selectMap(result);
+ selectedRouteId.value='';selectedTask.value='';
+ await refresh();
+ // 必须再取一次最新地图：接口回包的 map 是保存时构建的候选，
+ // 而 refresh() 不会刷新 field，所以这里不重新 GET 就会继续显示旧坐标。
+ try{
+  const fresh=await api('/maps/'+encodeURIComponent((result.map??field.value).id));
+  selectMap(fresh);
+  if(mapDraftSource.value===null&&tagPositionEditing.value)mapDraftSource.value='tag-position';
+ }catch{}
+ message.value='已保存地图二维码位置 · 地图版本 v'+result.version+'；旧路线与旧任务仍绑定旧版本';
+}
+async function onOrthogonalApplied(result:any){selectMap(result);orthogonalPreviewMap.value=null;mapDraftSource.value=null;selectedRouteId.value='';selectedTask.value='';await refresh();message.value='正交校正已保存 · 地图版本 v'+result.version+'；旧路线保持原版本';}
 const boards=ref<Board[]>([]);
 type DetectorInference={id:number;board:Board|null;memberCount:number;message:string;registered:boolean};
 const detectorInference=computed<DetectorInference|null>(()=>{
@@ -100,6 +177,7 @@ const mapDeletion=ref<any>(null);
 async function askDeleteMap(mapId:string,fallbackName=''){
  await act(async()=>{
   if(!mapId)throw new Error('请先选择要删除的地图');
+  if(tagPositionEditing.value)throw new Error('二维码位置调整中，请先保存或退出调整再删除地图');
   if(orthogonalPreviewActive.value)throw new Error('正交校正预览中，请先应用或撤销预览再删除地图');
   if(robot.value.running)throw new Error('请先停止导航再删除地图');
   const info=await api('/maps/'+encodeURIComponent(mapId)+'/deletion');
@@ -166,6 +244,7 @@ async function savePositionMap(){
 async function savePoints(){await act(savePositionMap);}
 const selectedMapSurvey=computed(()=>selectedMapId.value?sessions.value.find(item=>'scan-'+item.id.replace(/-/g,'')===selectedMapId.value):undefined);
 async function rebuildSelectedMap(){await act(async()=>{
+ if(tagPositionEditing.value)throw new Error('二维码位置调整中，请先保存或退出调整再重建地图');
  if(orthogonalPreviewActive.value)throw new Error('正交校正预览中，请先应用或撤销预览再重建地图');
  if(!field.value||field.value.routeMode!=='map-only')throw new Error('当前地图不是可重建的定位码地图');
  const source=selectedMapSurvey.value;if(!source)throw new Error('找不到该地图对应的已停止原始扫描记录');
@@ -332,7 +411,12 @@ const mapVehicle=computed(()=>page.value==='navigate'&&!editingRoute.value&&brid
 const displayedPose=mapVehicle;
 // Static/interactive props are derived once per real state change instead of being allocated
 // inline in the template (where every telemetry render produced new arrays and forced a redraw).
-const mapSelected=computed<number[]>(()=>measuring.value?measurementIds.value:inspectedTagId.value===null?EMPTY_TAG_IDS:[inspectedTagId.value]);
+const spacingSelectedIds=ref<number[]>([]);
+const mapSelected=computed<number[]>(()=>{
+ if(measuring.value)return measurementIds.value;
+ if(tagPositionEditing.value)return spacingSelectedIds.value.length?spacingSelectedIds.value:EMPTY_TAG_IDS;
+ return inspectedTagId.value===null?EMPTY_TAG_IDS:[inspectedTagId.value];
+});
 const mapMeasurement=computed<number[]>(()=>measuring.value?measurementIds.value:EMPTY_TAG_IDS);
 const mapDrawing=computed<Point[]>(()=>editingRoute.value?routeDrawing.value:EMPTY_POINTS);
 // Capture trail is a diagnostic overlay available on the scan page only while its explicit
@@ -358,7 +442,7 @@ const centerDistance=computed(()=>{
 });
 function measureLabel(tag:FieldMap['tags'][number]){return tag.groupId??'Q'+String(tag.id).padStart(3,'0');}
 function clearMeasurement(){measureFrom.value='';measureTo.value='';}
-function toggleMeasurement(){measuring.value=!measuring.value;clearMeasurement();if(measuring.value&&page.value==='scan')scanView.value='map';}
+function toggleMeasurement(){if(tagPositionEditing.value)return;measuring.value=!measuring.value;clearMeasurement();if(measuring.value&&page.value==='scan')scanView.value='map';}
 function measureSelect(id:number){
  if(!measuring.value)return;
  if(measureFrom.value===''||measureTo.value!==''){measureFrom.value=id;measureTo.value='';}
@@ -421,7 +505,7 @@ function endRouteStepsResize(){
  if(routeStepsLayout.value)routeStepsLayout.value=clampRouteStepsLayout(routeStepsLayout.value);
  routeStepsResize=null;
 }
-const editingRoute=ref(false),routeAnchors=ref<Point[]>([]),routeSelected=ref(-1),bodyYawDeg=ref(0),initialHeadingManual=ref(false),routeTool=ref<'select'|'draw'|'pan'>('draw');
+const editingRoute=ref(false),routeAnchors=ref<Point[]>([]),routeSelected=ref(-1),bodyYawDeg=ref(0),initialHeadingManual=ref(false),routeTool=ref<'select'|'draw'|'pan'>('select');
 const tagInspectorVisible=ref(false);
 // 双击地图上的二维码 → 就地弹出基本信息（不再显示子码/原图）
 const tagDetailId=ref<number|null>(null);
@@ -437,7 +521,27 @@ const tagDetail=computed(()=>{
 function openTagDetail(id:number){tagDetailId.value=id;}
 
 const inspectedTagId=ref<number|null>(null),selectedSegmentKey=ref(''),routeModes=ref<SegmentChoice[]>([]),routePolicyHistory=ref<SegmentChoice[][]>([]);
+// Map QR position editing is a separate stage: canvas clicks only select a point
+// and drags only move that point's centre. Route waypoint/drawing events never
+// run while this stage is active.
+function mapCanvasSelect(id:number){
+ if(tagPositionEditing.value){
+  // 画布直接点选：再点一次取消；支持连续点多码做批量等间距。
+  inspectedTagId.value=id;
+  spacingSelectedIds.value=spacingSelectedIds.value.includes(id)
+   ?spacingSelectedIds.value.filter(item=>item!==id)
+   :[...spacingSelectedIds.value,id];
+  return;
+ }
+ measureSelect(id);
+}
+function mapCanvasMove(ids:number[],dx:number,dy:number){tagPositionPanel.value?.moveTags(ids,dx,dy);if(ids.length===1)inspectedTagId.value=ids[0]!;}
 const routeHistory=ref<Point[][]>([]),routeSkippedHold=ref<SkippedRouteGroup[]>([]);
+const spacingFrom=ref<number|null>(null),spacingTo=ref<number|null>(null),spacingTargetM=ref<number|null>(null),spacingOverrides=ref<{fromId:number;toId:number;occurrence:number;targetM:number}[]>([]);
+const spacingPair=computed(()=>{if(spacingFrom.value===null||spacingTo.value===null)return null;const a=field.value?.tags.find(t=>t.id===spacingFrom.value),b=field.value?.tags.find(t=>t.id===spacingTo.value);if(!a||!b)return null;const eu=Math.hypot(b.x-a.x,b.y-a.y);const target=spacingTargetM.value??eu;return {a,b,eu,target};});
+function applySpacingPreview(){const pair=spacingPair.value;if(!pair||spacingTargetM.value===null||spacingTargetM.value<.08)return;const ids=routeGroupIds.value;const ai=ids.indexOf(pair.a.id),bi=ids.indexOf(pair.b.id);if(ai<0||bi!==ai+1){message.value='请选择路径上相邻且按行进顺序的两个二维码';return;}const next={fromId:pair.a.id,toId:pair.b.id,occurrence:1,targetM:spacingTargetM.value};spacingOverrides.value=[...spacingOverrides.value.filter(x=>!(x.fromId===next.fromId&&x.toId===next.toId&&x.occurrence===1)),next];}
+function chooseSpacingPair(){const ids=routeGroupIds.value;if(ids.length<2)return;spacingFrom.value=ids[0]??null;spacingTo.value=ids[1]??null;const a=field.value?.tags.find(t=>t.id===spacingFrom.value),b=field.value?.tags.find(t=>t.id===spacingTo.value);if(a&&b)spacingTargetM.value=Math.hypot(b.x-a.x,b.y-a.y);}
+
 const routeDrawing=computed(()=>orthogonalRoute(routeAnchors.value));
 const routeChain=computed(()=>chainRouteGroups(routeDrawing.value,field.value?routeGroupCenters(field.value):[]));
 const routeGroupIds=computed(()=>[...new Set(routeChain.value.nodes.map(node=>node.id))]);
@@ -475,15 +579,19 @@ const routeSkipped=computed(()=>{
  return [...byId.values()].filter(tag=>!routeGroupIds.value.includes(tag.id)).map(tag=>({...tag,distanceM:distanceToRoute(tag,routeDrawing.value)}));
 });
 const routeLength=computed(()=>routeDrawing.value.slice(1).reduce((sum,p,i)=>sum+distance(routeDrawing.value[i]!,p),0));
+// 路径编辑的"硬锁"：只有真正互斥的状态才锁（机器人运行、指令等待、地图预览）。
+// 二维码间距调整不再锁路径编辑——它只锁"保存路径/导航/删除路径"这些会写版本的动作。
 const routeLocked=computed(()=>busy.value||robot.value.running||commandFeedback.value?.state==='waiting'||orthogonalPreviewActive.value);
+// 间距调整期间禁止的是会同时写地图/版本的动作，不是路径点编辑本身。
+const spacingBusy=computed(()=>tagPositionEditing.value);
 function rememberRoute(){routeSkippedHold.value=[];routeHistory.value=[...routeHistory.value.slice(-99),routeAnchors.value.map(p=>({...p}))];routePolicyHistory.value=[...routePolicyHistory.value.slice(-99),routeModes.value.map(choice=>({...choice}))];}
 function beginRoute(){
  if(!field.value||routeLocked.value)return;
  orthogonalPreviewMap.value=null;
  routeDetailsOpen.value=false;tagInspectorVisible.value=false;
- routeModes.value=choicesFromSegments(routes.value.find(route=>route.routeId===selectedRouteId.value)?.motionSegments??field.value.motionSegments??[]);routePolicyHistory.value=[];inspectedTagId.value=null;selectedSegmentKey.value='';
- routeTool.value='draw';measuring.value=false;clearMeasurement();routeSelected.value=-1;routeHistory.value=[];routeSkippedHold.value=[];
- const selectedRoute=routes.value.find(route=>route.routeId===selectedRouteId.value);routeEditId.value=selectedRoute?.routeId??'';routeEditUpdated.value=selectedRoute?.updated??'';const row=field.value.rows[0],points=selectedRoute?.points??(row?[exitPoint(row),...row.points]:[]);routeNameDraft.value=selectedRoute?.name??row?.name??field.value.name;
+ const selectedRoute=routes.value.find(route=>route.routeId===selectedRouteId.value);routeModes.value=choicesFromSegments(selectedRoute?.motionSegments??field.value.motionSegments??[]);spacingOverrides.value=selectedRoute?.spacingOverrides?.map(item=>({...item}))??[];spacingFrom.value=null;spacingTo.value=null;spacingTargetM.value=null;routePolicyHistory.value=[];inspectedTagId.value=null;selectedSegmentKey.value='';
+ routeTool.value='select';measuring.value=false;clearMeasurement();routeSelected.value=-1;routeHistory.value=[];routeSkippedHold.value=[];
+ routeEditId.value=selectedRoute?.routeId??'';routeEditUpdated.value=selectedRoute?.updated??'';const row=field.value.rows[0],points=selectedRoute?.points??(row?[exitPoint(row),...row.points]:[]);routeNameDraft.value=selectedRoute?.name??row?.name??field.value.name;
  const orthogonal=points.every((p,i)=>!i||Math.abs(p.x-points[i-1]!.x)<1e-8||Math.abs(p.y-points[i-1]!.y)<1e-8);
  routeAnchors.value=orthogonal?routeCorners(points):[];
  const storedHeading=selectedRoute?.initialHeadingRad;
@@ -549,13 +657,14 @@ async function deleteNamedRoute(){const route=routes.value.find(item=>item.route
 async function saveRoute(saveAs=false){await act(async()=>{
  if(!field.value||!editingRoute.value)return;
  if(orthogonalPreviewActive.value)throw new Error('正交校正预览中，请先应用或撤销预览再保存路径');
+ if(tagPositionEditing.value)throw new Error('正在调整二维码间距，请先点「退出」再保存路径');
  if(routeAnchors.value.length>=2&&!Number.isFinite(bodyYawDeg.value))throw new Error('请先设置有效的初始车头朝向（0–359°）');
  const invalid=routePlans.value.find(plan=>plan.problem);if(invalid)throw new Error(invalid.problem);
  const orthogonalPoints=routeDrawing.value;
  for(let i=1;i<orthogonalPoints.length;i++){const a=orthogonalPoints[i-1]!,b=orthogonalPoints[i]!;
   if(Math.abs(a.x-b.x)>1e-6&&Math.abs(a.y-b.y)>1e-6)throw new Error('路径必须由水平/垂直直线段组成；斜线段请先在画布上正交拆分（拖动路点会自动正交）');
  }
- const skippedCount=routeSkipped.value.length;const initialHeadingDeg=wrapDeg180(bodyYawDeg.value);const payload:any={mapId:field.value.id,baseVersion:version.value,points:orthogonalPoints,bodyYawDeg:initialHeadingDeg,initialHeadingRad:initialHeadingManual.value?initialHeadingDeg*Math.PI/180:null,routeName:routeNameDraft.value.trim()||uniqueRouteName(field.value.name+'新路径'),segmentModes:routePlans.value.filter(plan=>plan.mode!=='auto').map(({fromId,toId,occurrence,mode})=>({fromId,toId,occurrence,mode}))};if(routeEditId.value){payload.routeId=routeEditId.value;payload.routeUpdated=routeEditUpdated.value;}if(saveAs||!routeEditId.value)payload.saveAs=true;
+ const skippedCount=routeSkipped.value.length;const initialHeadingDeg=wrapDeg180(bodyYawDeg.value);const payload:any={mapId:field.value.id,baseVersion:version.value,points:orthogonalPoints,bodyYawDeg:initialHeadingDeg,initialHeadingRad:initialHeadingManual.value?initialHeadingDeg*Math.PI/180:null,routeName:routeNameDraft.value.trim()||uniqueRouteName(field.value.name+'新路径'),segmentModes:routePlans.value.filter(plan=>plan.mode!=='auto').map(({fromId,toId,occurrence,mode})=>({fromId,toId,occurrence,mode})),distanceModel:'center-euclidean',spacingOverrides:spacingOverrides.value};if(routeEditId.value){payload.routeId=routeEditId.value;payload.routeUpdated=routeEditUpdated.value;}if(saveAs||!routeEditId.value)payload.saveAs=true;
  const result=await api('/route/design',payload);selectMap(result);await refresh();selectedRouteId.value=result.route?.routeId??'';selectedTask.value=result.task?.id??selectedTask.value;selectedMapId.value=field.value.id;
  if(result.route){routeEditId.value=result.route.routeId;routeEditUpdated.value=result.route.updated;routeNameDraft.value=result.route.name;routeModes.value=result.route.motionSegments?choicesFromSegments(result.route.motionSegments):[];}
  editingRoute.value=false;
@@ -563,7 +672,9 @@ async function saveRoute(saveAs=false){await act(async()=>{
  if(savedStrategyBlockers.value.length)message.value='路径规划已保存 · '+savedStrategyBlockers.value[0];
  });}
 
-watch([()=>page.value,()=>field.value?.id],()=>{editingRoute.value=false;routeSelected.value=-1;routeStepsOpen.value=false;inspectedTagId.value=null;tagInspectorVisible.value=false;orthogonalPreviewMap.value=null;});
+watch([()=>page.value,()=>field.value?.id],()=>{editingRoute.value=false;routeSelected.value=-1;routeStepsOpen.value=false;inspectedTagId.value=null;tagInspectorVisible.value=false;orthogonalPreviewMap.value=null;mapDraftSource.value=null;tagPositionEditing.value=false;spacingSelectedIds.value=[];});
+// 退出路径编辑时必须一并退出间距调整，否则面板与锁会残留到下一次进入。
+watch(()=>editingRoute.value,active=>{if(!active&&tagPositionEditing.value){tagPositionEditing.value=false;spacingSelectedIds.value=[];orthogonalPreviewMap.value=null;mapDraftSource.value=null;}});
 onMounted(()=>{window.addEventListener('keydown',routeKey);window.addEventListener('wheel',blockNumericWheel,{passive:false});document.addEventListener('pointerdown',routeStepsPointer);});
 onBeforeUnmount(()=>{window.removeEventListener('keydown',routeKey);window.removeEventListener('wheel',blockNumericWheel);document.removeEventListener('pointerdown',routeStepsPointer);});
 const canNavigate=computed(()=>{if(editingRoute.value||orthogonalPreviewActive.value||speedDirty.value||savedStrategyBlockers.value.length||lateralStrategyBlocked.value)return false;const task=tasks.value.find(t=>t.id===selectedTask.value);return !!task&&task.mapId===field.value?.id&&task.mapVersion===version.value&&field.value?.captureQuality!=='draft'&&robot.value.connected&&robot.value.localization?.mapId===field.value?.id&&robot.value.localization?.mapVersion===version.value&&robot.value.localization?.poseAvailable===true&&!robot.value.running&&robot.value.conditions.length>0&&robot.value.conditions.every((c:any)=>c.ready);});
@@ -606,6 +717,7 @@ const pendingConditions=computed(()=>robot.value.conditions.filter((condition:an
 const diagnosticsSummary=computed(()=>!robot.value.connected?'设备离线':!robot.value.conditions.length?'等待设备状态':pendingConditions.value.length?`${pendingConditions.value.length} 项待恢复`:'设备正常');
 const navigationBlockReason=computed(()=>{
  if(robot.value.running||canNavigate.value)return '';
+ if(tagPositionEditing.value)return '二维码位置调整中，请先保存为新版本或退出调整';
  if(orthogonalPreviewActive.value)return '正交校正预览中，请应用或撤销预览后再继续';
  if(editingRoute.value)return '请保存路径或退出编辑后再开始导航';
  const task=tasks.value.find(t=>t.id===selectedTask.value);
@@ -858,6 +970,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
        <div v-if="routeSkipped.length" class="route-skipped-groups" data-testid="route-skipped-groups" role="status"><p v-for="tag in routeSkipped" :key="tag.id">Q{{String(tag.id).padStart(3,'0')}} · 偏离路线 {{(tag.distanceM*100).toFixed(1)}} cm，未串联：建议把路线画过此码或调整铺码</p></div>
       </div>
      </div>
+     <div class="route-tool-card route-spacing-card"><MapSpacingPicker v-if="field?.routeMode==='map-only'" :map="field" :version="version" :selection="spacingSelectedIds" :disabled="busy||robot.running||(orthogonalPreviewActive&&mapDraftSource!=='tag-position')" @update:selection="spacingSelectedIds=$event" @preview-map="setTagPositionPreview" @editing="onTagPositionEditing" @applied="onTagPositionApplied"/></div>
      <div class="route-tool-card">
       <button type="button" class="panel-title panel-toggle" :aria-expanded="paramsOpen" @click="paramsOpen=!paramsOpen"><Settings2 :size="18"/>路径参数设置<span class="panel-caret">{{paramsOpen?'▾':'▸'}}</span></button>
       <div v-show="paramsOpen">
@@ -928,7 +1041,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
      
      
      <details v-if="field&&unifyAnglesInfo" class="scan-details" data-testid="unify-angles"><summary><Ruler :size="18"/>统一所有码朝向</summary><div class="unify-angle-list"><div v-for="a in unifyAnglesInfo.list" :key="a.id" class="unify-angle-row"><span>Q{{String(a.id).padStart(3,'0')}}</span><span>{{a.angleDeg.toFixed(2)}}°</span><span class="muted">→ {{unifyAnglesInfo.targetDeg.toFixed(2)}}°</span></div></div><Button class="w-full mt-2" :disabled="busy||unifyAnglesInfo.spreadDeg<0.5" @click="unifyAngles">统一朝向并保存新版本</Button></details>
-     <div v-if="field?.routeMode==='map-only'" class="map-rebuild-actions"><Button class="w-full" variant="outline" data-testid="rebuild-map-from-survey" :disabled="busy||robot.running||!selectedMapSurvey||orthogonalPreviewActive" @click="rebuildSelectedMap">从原始扫描重建新版本</Button></div><OrthogonalCorrectionPanel v-if="field?.routeMode==='map-only'" :map="field" :version="version" :disabled="busy||robot.running" @preview-map="setOrthogonalPreview" @applied="onOrthogonalApplied"/>
+     <div v-if="field?.routeMode==='map-only'" class="map-rebuild-actions"><Button class="w-full" variant="outline" data-testid="rebuild-map-from-survey" :disabled="busy||robot.running||!selectedMapSurvey||orthogonalPreviewActive||tagPositionEditing" @click="rebuildSelectedMap">从原始扫描重建新版本</Button></div><OrthogonalCorrectionPanel v-if="field?.routeMode==='map-only'" :map="field" :version="version" :disabled="busy||robot.running||tagPositionEditing||(orthogonalPreviewActive&&mapDraftSource!=='orthogonal')" @preview-map="setOrthogonalPreview" @applied="onOrthogonalApplied"/>
      
      </div><div class="navigation-actions"><Button class="w-full mt-3" :disabled="busy||commandFeedback?.state==='waiting'||!canNavigate" @click="navigation('start')"><Play :size="20"/>开始导航</Button><div class="export-grid mt-2"><Button variant="outline" :disabled="!robot.running" @click="navigation(robot.paused?'resume':'pause')"><Pause :size="18"/>{{robot.paused?'继续':'暂停'}}</Button><Button variant="destructive" @click="navigation('stop')"><Square :size="18"/>停止</Button></div></div>
     </section>
@@ -948,13 +1061,24 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
       <label>地图二维码<select v-model="inspectedTagId" aria-label="查看地图二维码"><option v-for="tag in orderedTagsById(field.tags)" :key="tag.id" :value="tag.id">{{tag.groupId??label(tag.id)}}{{tag.groupId?' · 码组中心':' · 单码'}}</option></select></label>
       <TagInspector v-if="inspectedTagId!==null" :map="field" :version="version" :tag-id="inspectedTagId"/>
      </div>
+     <div v-if="gapEdit" class="gap-inline" data-testid="gap-inline-editor" :style="{left:gapEdit.left+'px',top:gapEdit.top+'px'}">
+      <div class="gap-inline-head">{{gapEdit.fromId}} → {{gapEdit.toId}}</div>
+      <div class="gap-inline-row">
+       <input ref="gapInput" v-model="gapEdit.value" data-testid="gap-inline-input" type="number" step="0.1" min="8" :disabled="gapEdit.busy" aria-label="相邻二维码间距（厘米）"
+        @keydown.enter.prevent="commitGapEdit" @keydown.esc.prevent="cancelGapEdit"/>
+       <span>cm</span>
+       <button type="button" data-testid="gap-inline-apply" :disabled="gapEdit.busy" @click="commitGapEdit">{{gapEdit.busy?'…':'确定'}}</button>
+       <button type="button" data-testid="gap-inline-cancel" :disabled="gapEdit.busy" @click="cancelGapEdit">取消</button>
+      </div>
+      <div v-if="gapEdit.error" class="gap-inline-error" data-testid="gap-inline-error">{{gapEdit.error}}</div>
+     </div>
      <div v-if="editingRoute&&(error||message)" class="route-toast" :class="{'route-toast-error':error}" :role="error?'alert':'status'" :title="error||message">{{error||message}}</div>
      <div v-if="measuring&&map&&(page!=='scan'||scanView==='map')" class="distance-panel">
       <div class="distance-fields"><label>起点<select v-model.number="measureFrom" aria-label="测距起点"><option value="">请选择定位组</option><option v-for="tag in orderedTagsById(map.tags)" :key="tag.id" :value="tag.id">{{measureLabel(tag)}}</option></select></label><span class="distance-arrow">↔</span><label>终点<select v-model.number="measureTo" aria-label="测距终点"><option value="">请选择定位组</option><option v-for="tag in orderedTagsById(map.tags)" :key="tag.id" :value="tag.id">{{measureLabel(tag)}}</option></select></label><Button size="sm" variant="ghost" @click="clearMeasurement">清除测距</Button></div>
       <div class="distance-result" data-testid="center-distance-result" role="status"><strong v-if="centerDistance!==null">中心距离 {{centerDistance.toFixed(3)}} m <span>（{{(centerDistance*100).toFixed(1)}} cm）</span></strong><span v-else>{{measureFrom!==''&&measureTo===measureFrom?'请选择两个不同的定位组':measureFrom!==''?'请点击第二个定位组，或选择测距终点':'点击地图上的两个定位组，或选择起点和终点'}}</span></div>
      </div>
      <CameraPreview v-if="page==='scan'&&scanView==='camera'" compact/>
-     <MapCanvas v-else-if="canvasMap" :map="canvasMap" :selected="mapSelected" :measurement="mapMeasurement" row-id="" :tool="measuring?'measure':editingRoute?'route-design':'pan'" @select="measureSelect" @inspect="inspectTag" @tag-detail="openTagDetail" :segment-plans="editingRoute?routePlans:undefined" :selected-segment="selectedSegmentKey" @segment-select="selectSegment" :editable="editingRoute&&!routeLocked&&routeTool!=='pan'" :drawing="mapDrawing" :pan-enabled="editingRoute&&routeTool==='pan'" :route-group-ids="routeGroupIds" :route-skipped-groups="routeSkipped" :route-name="routeNameDraft||availableRoutes.find(r=>r.routeId===selectedRouteId)?.name" :route-anchors="routeAnchors" :route-selected="routeSelected" :draw-mode="editingRoute&&routeTool==='draw'" :initial-heading="editingRoute?bodyYawDeg*Math.PI/180:undefined" @heading="setInitialHeadingRad" @blank="appendRoute" @design-select="routeSelected=$event" @design-move="moveRoute" :vehicle="mapVehicle??undefined" :trail="mapTrail"/>
+     <MapCanvas v-else-if="canvasMap" :map="canvasMap" :selected="mapSelected" :measurement="mapMeasurement" row-id="" :tool="measuring?'measure':tagPositionEditing?'select':editingRoute?(routeTool==='pan'?'pan':'route-design'):'pan'" @select="mapCanvasSelect" @inspect="inspectTag" @tag-detail="openTagDetail" :segment-plans="editingRoute?routePlans:undefined" :selected-segment="selectedSegmentKey" @segment-select="selectSegment" :editable="tagPositionEditing?true:(editingRoute?(editingRoute&&!routeLocked&&routeTool!=='pan'):false)" :drawing="mapDrawing" :pan-enabled="editingRoute?(routeTool==='pan'):true" :spacing-mode="tagPositionEditing" :spacing-line="spacingSelectedIds" :spacing-gaps="spacingCanvasGaps" :route-group-ids="routeGroupIds" :route-skipped-groups="routeSkipped" :route-name="routeNameDraft||availableRoutes.find(r=>r.routeId===selectedRouteId)?.name" :route-anchors="routeAnchors" :route-selected="routeSelected" :draw-mode="editingRoute&&routeTool==='draw'" :initial-heading="editingRoute?bodyYawDeg*Math.PI/180:undefined" @heading="setInitialHeadingRad" @blank="appendRoute" @design-select="routeSelected=$event" @design-move="moveRoute" @gap-edit="onGapEdit" @move="mapCanvasMove" :vehicle="mapVehicle??undefined" :trail="mapTrail"/>
      <div v-else class="scan-empty"><div class="empty-illustration"><ScanLine v-if="page==='scan'" :size="32"/><Route v-else :size="32"/></div><strong>{{page==='scan'?'暂无扫描数据':'请选择地图'}}</strong><div class="getting-started" data-testid="getting-started"><h2>{{page==='scan'?'打印并铺设定位板后开始扫描':'选择地图与路径后开始导航'}}</h2><p>{{page==='scan'?'检查相机，点「开始扫描」即可。已有记录可从左侧打开继续整理。':'先选择地图，再选择或新建路径。'}}</p><div><Button size="sm" @click="page=page==='scan'?'print':'scan'">{{page==='scan'?'打印定位板':'前往扫描建图'}}<ArrowRight :size="15"/></Button></div></div></div>
      <div class="legend"><span><i class="tag-dot"/>定位组</span><span><i class="line-green"/>作物行</span></div>
      <div v-if="editingRoute&&tagDetail" class="tag-detail-card" data-testid="tag-detail-card" role="status">
@@ -986,6 +1110,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
       </div>
       <div class="route-commands-scroll">
       <table class="route-commands-table">
+       <colgroup><col class="col-index"/><col class="col-name"/><col class="col-type"/><col class="col-qr"/><col class="col-coord"/><col class="col-speed"/><col class="col-distance"/><col class="col-dwell"/><col class="col-ops"/></colgroup>
        <thead><tr><th scope="col">#</th><th scope="col">步骤名称</th><th scope="col">类型</th><th scope="col">关联二维码</th><th scope="col">坐标 (m)</th><th scope="col">速度 / m·s⁻¹</th><th scope="col">距离 / m</th><th scope="col">停留 / s</th><th scope="col">操作</th></tr></thead>
        <tbody>
         <tr v-for="row in stepRows" :key="row.key" :class="{blocked:row.blocked,active:row.key===routeSelected}" @click="selectStep(row.key)">
@@ -1045,6 +1170,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
 .map-pose-card{display:flex;flex-direction:column;gap:7px;margin-top:12px;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);font-size:14px;overflow-wrap:anywhere}.map-pose-card b{font-weight:500}.map-pose-card small{color:var(--muted);line-height:1.6}
 .distance-panel{padding:12px 18px;border-bottom:1px solid var(--line);background:var(--panel);flex-shrink:0}
 .distance-fields{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.distance-fields label{display:flex;align-items:center;gap:8px;font-size:14px;margin:0;flex:1;min-width:145px}.distance-fields select{width:100%;min-width:0;max-width:220px;height:40px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:white;color:var(--ink)}.distance-arrow{color:var(--muted)}.distance-result{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 16px;margin-top:10px;color:var(--ink);font-size:14px}.distance-result strong{font-size:14px;font-weight:600}.distance-result strong span{font-size:14px;font-weight:400}.distance-result small{display:block;font-size:13px;color:var(--muted)}.canvas-toolbar{flex-wrap:wrap}
+.canvas-section{position:relative}
 @media(max-width:760px){.canvas-section{height:auto;min-height:430px}.distance-panel{padding:10px 12px}.distance-fields{gap:6px}.distance-fields label{min-width:120px}.distance-fields .distance-arrow{display:none}.distance-result strong{font-size:14px}}
 
 .scan-detector-status{margin-top:12px;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);font-size:14px;line-height:1.65;overflow-wrap:anywhere}
@@ -1133,12 +1259,29 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
 .route-steps-trigger{display:flex;align-items:center;gap:10px;width:100%;min-height:42px;padding:9px 14px;border:1px solid var(--line);border-radius:10px;background:white;box-shadow:var(--card-shadow);color:#1e293b;text-align:left;cursor:pointer}
 .route-steps-trigger:hover{background:#f8fbff}.route-steps-trigger-status{margin-left:auto;color:var(--muted);font-size:11px}.route-steps-popover{position:absolute;z-index:20;left:0;right:0;top:calc(100% + 6px);max-height:min(62vh,520px);display:flex;flex-direction:column;overflow:hidden;background:white;border:1px solid var(--line);border-radius:10px;box-shadow:0 16px 36px rgba(15,23,42,.18)}
 .route-steps-close{margin-left:auto;border:0;background:transparent;color:var(--muted);font-size:24px;line-height:1;cursor:pointer;padding:2px 7px}.route-steps-close:hover{color:#1e293b}
+/* 图内就地改间距：输入框直接压在被点的 cm 标注上 */
+.gap-inline{position:absolute;z-index:40;transform:translate(-50%,-50%);display:flex;flex-direction:column;gap:4px;padding:7px 9px;border:1px solid #93c5fd;border-radius:8px;background:white;box-shadow:0 10px 24px rgb(29 78 216 / 22%)}
+.gap-inline-head{font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.gap-inline-row{display:flex;align-items:center;gap:5px}
+.gap-inline-row input{width:82px;padding:3px 6px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums}
+.gap-inline-row input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgb(37 99 235 / 14%)}
+.gap-inline-row span{font-size:11px;color:var(--muted)}
+.gap-inline-row button{padding:3px 8px;border:1px solid var(--line);border-radius:6px;background:white;font-size:11.5px;color:#334155;cursor:pointer}
+.gap-inline-row button[data-testid="gap-inline-apply"]{background:var(--accent);border-color:var(--accent);color:white}
+.gap-inline-row button:disabled{opacity:.5;cursor:default}
+.gap-inline-error{font-size:11px;color:#b91c1c}
 .navigation-map-list{display:flex;flex-direction:column;gap:4px;max-height:150px;overflow-y:auto;margin:7px 0 10px;padding:2px;border:1px solid var(--line);border-radius:7px;background:var(--panel)}
 .navigation-map-item{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;width:100%;padding:7px 9px;border:1px solid transparent;border-radius:5px;background:white;color:var(--text);text-align:left;cursor:pointer}
 .navigation-map-item:hover{background:#f8fbff}.navigation-map-item.active{border-color:var(--accent);background:#eff6ff}.navigation-map-item:disabled{cursor:not-allowed;opacity:.65}.navigation-map-item strong,.navigation-map-item span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.navigation-map-item span{flex:0 0 auto;color:var(--muted);font-size:11px}.navigation-map-head{padding:5px 8px 3px;color:var(--muted);font-size:11px}.navigation-map-empty{padding:9px;color:var(--muted);font-size:12px;text-align:center}
 .route-commands-panel{max-height:clamp(132px,18dvh,208px)}
 .route-commands-table th,.route-commands-table td{padding:clamp(5px,0.6vh,8px) clamp(8px,0.8vw,14px);font-size:clamp(11px,0.55vw + 8px,12.5px)}
 .route-commands-head{padding:clamp(8px,0.8vh,11px) clamp(10px,0.9vw,14px) clamp(6px,0.6vh,9px)}
+.route-commands-ops{flex-wrap:nowrap;gap:6px;padding-right:8px}
+.route-commands-ops .btn,.route-commands-ops button{white-space:nowrap;flex:0 0 auto;word-break:keep-all}
+@media(max-width:1500px){
+ .route-commands-ops{gap:4px}
+ .route-commands-ops .btn,.route-commands-ops button{padding-left:8px;padding-right:8px;font-size:11.5px}
+}
 /* 浮动操作条随屏宽 */
 .app-shell.is-route-editing .route-editor{gap:6px;padding:clamp(4px,0.4vw,7px)}
 /* 宽屏（≥1600）：整体放大一点，但封顶 */
@@ -1225,7 +1368,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
 .route-type-select{width:auto;min-width:96px;height:28px;padding:2px 6px;font-size:12px;border-radius:6px;background:white}
 .route-type-select.blocked{border-color:#fde68a;color:#b45309}
 .route-commands-table tbody tr.active td{color:#1e3a8a}
-.route-command-ops{display:flex;gap:4px}
+.route-command-ops{display:flex;gap:4px;flex-wrap:nowrap}
 .route-command-ops button{width:26px;height:26px;padding:0;border:1px solid var(--line);border-radius:6px;background:white;color:#475569;font-size:12px;line-height:1}
 .route-command-ops button:disabled{opacity:.4}
 .route-command-ops button:not(:disabled):hover{background:var(--panel);border-color:#93c5fd;color:var(--accent)}
@@ -1255,8 +1398,45 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
 .route-commands-head .status-badge{margin-left:auto}
 .route-commands-scroll{flex:1;min-height:0;overflow:auto}
 .route-commands-table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
-.route-commands-table th{position:sticky;top:0;z-index:1;background:var(--panel);color:var(--muted);font-weight:600;font-size:11px;text-align:left;padding:7px 12px;border-bottom:1px solid #eef2f7;white-space:nowrap}
-.route-commands-table td{padding:7px 12px;color:#334155;white-space:nowrap}
+/* 列宽固定：操作列必须留够 3 个按钮的位置，否则在最右会被裁掉。
+   距离列给输入框 + cm 提示留出真实空间。 */
+.route-commands-table{table-layout:fixed;width:100%;min-width:0}
+.route-commands-table col.col-index{width:3.4%}
+.route-commands-table col.col-name{width:14%}
+.route-commands-table col.col-type{width:10%}
+.route-commands-table col.col-qr{width:12.5%}
+.route-commands-table col.col-coord{width:11.5%}
+.route-commands-table col.col-speed{width:10.5%}
+.route-commands-table col.col-distance{width:15%}
+.route-commands-table col.col-dwell{width:7.6%}
+.route-commands-table col.col-ops{width:15.5%}
+.route-commands-table td.route-command-ops{white-space:nowrap}
+.route-leg-editable{color:var(--accent);font-size:10px;font-weight:600;letter-spacing:0;white-space:nowrap;opacity:.85}
+.route-commands-table th{position:sticky;top:0;z-index:1;background:var(--panel);color:var(--muted);font-weight:600;font-size:11px;text-align:left;padding:7px 12px;border-bottom:1px solid #eef2f7;white-space:normal;line-height:1.25;vertical-align:bottom}
+.route-commands-table td:first-child,.route-commands-table th:first-child{overflow:visible;text-overflow:clip;padding-right:4px}
+.route-commands-table td{padding:7px 12px;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.route-commands-table td.route-leg-cell,.route-commands-table td.route-command-ops{overflow:visible;text-overflow:clip}
+/* 路径步骤「距离 / m」可编辑：给输入框固定宽度与数字排版，
+   否则在 nowrap 的窄列里会被压成只显示一位数字和下拉箭头。 */
+.route-commands-table .route-leg-input{
+ width:76px;min-width:76px;box-sizing:border-box;
+ padding:3px 6px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;
+ color:#0f172a;font:inherit;font-variant-numeric:tabular-nums;text-align:right;
+}
+.route-commands-table .route-leg-input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgb(37 99 235 / 12%)}
+.route-commands-table .route-leg-input:disabled{background:#f8fafc;color:#94a3b8}
+/* 第一步没有路段距离：用同样的排版占位，但不画成输入框。 */
+.route-commands-table .route-leg-input.is-static{display:inline-block;width:76px;min-width:76px;padding:3px 6px;border-color:transparent;background:transparent;color:var(--muted);text-align:right;box-sizing:border-box}
+.route-commands-table td:has(> .route-leg-input){padding-left:6px;padding-right:6px}
+.route-commands-table th:nth-child(7){min-width:96px}
+/* 该列同时给出 cm 以便现场核对 */
+.route-leg-hint{margin-left:4px;margin-right:6px;color:var(--muted);font-size:10.5px;font-variant-numeric:tabular-nums}
+.route-commands-table td.route-leg-cell{padding-right:8px}
+/* 停留列单独右对齐，和距离列之间保持清晰间隔 */
+.route-commands-table th:nth-child(8),.route-commands-table td:nth-child(8){padding-left:12px;text-align:right}
+@media(max-width:1200px){
+ .route-commands-table .route-leg-input{width:72px;min-width:72px}
+}
 .route-commands-table tbody tr:nth-child(even){background:#fcfdff}
 .route-commands-table tbody tr:hover{background:#f1f7ff}
 .route-commands-table tbody tr.blocked{background:#fffbeb}

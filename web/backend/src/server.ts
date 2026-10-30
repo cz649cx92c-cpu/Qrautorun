@@ -28,12 +28,28 @@ import {CameraPreview} from './camera';
 import {CameraCalibration} from './calibration';
 import {CalibrationStore,calibrationDatabasePath,imuCalibrationFromSnapshot} from './calibration-store';
 import {registerCalibrationRoutes} from './calibration-routes';
+import {previewTagPositions,TAG_POSITION_DISCLAIMER} from '../../shared/map-tag-position';
+import {previewTagDistance,previewEqualSpacing,TAG_DISTANCE_DISCLAIMER,MIN_TAG_DISTANCE_M} from '../../shared/map-tag-distance';
 export const root=fileURLToPath(new URL('../../../',import.meta.url));
 const mapConfirmationSchema=z.object({mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),version:z.number().int().positive(),confirm:z.literal(true),operator:z.string().trim().max(80).optional().default(''),updateTasks:z.boolean().default(false)}).strict();
 const mapConfirmationEvidenceSchema=mapConfirmationSchema.extend({kind:z.literal('user_confirmation'),acceptedVersion:z.number().int().positive(),created:z.string().datetime()}).strict();
 const mapMeasurementSchema=z.object({mapId:z.string(),version:z.number().int().positive(),measurements:z.array(anchorSchema).min(3).max(587),operator:z.string().trim().max(80).optional().default('')});
 const mapUnifyAnglesSchema=z.object({mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),version:z.number().int().positive(),confirm:z.literal(true),operator:z.string().trim().max(80).optional().default(''),updateTasks:z.boolean().default(false)}).strict();
 const mapMeasurementEvidenceSchema=mapMeasurementSchema.extend({kind:z.literal('measurement').optional(),residuals:z.array(z.number().finite().min(0).max(.03)).min(3).max(587),created:z.string().datetime()}).strict();
+// Operator-entered map point corrections. Only existing IDs are accepted and every
+// coordinate must already satisfy the same map schema range used by the scanner.
+const tagPositionEditSchema=z.object({id:z.number().int().min(0).max(586),x:z.number().finite().min(-10000).max(10000),y:z.number().finite().min(-10000).max(10000),angle:z.number().finite().min(-3600).max(3600).optional()}).strict();
+const tagPositionRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),tags:z.array(tagPositionEditSchema).min(1).max(587)}).strict().superRefine((value,ctx)=>{
+  const ids=new Set<number>();
+  for(const tag of value.tags){if(ids.has(tag.id))ctx.addIssue({code:z.ZodIssueCode.custom,message:`Q${tag.id} 的位置被重复提交`});ids.add(tag.id);}
+});
+// Spacing edits are distance-only: the operator names two points (or a straight
+// run) and a wanted centre-to-centre pitch, never raw coordinates.
+const tagDistanceRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),fromId:z.number().int().min(0).max(586),toId:z.number().int().min(0).max(586),targetM:z.number().finite().min(MIN_TAG_DISTANCE_M).max(100)}).strict();
+const tagEqualSpacingRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),ids:z.array(z.number().int().min(0).max(586)).min(2).max(587),targetM:z.number().finite().min(MIN_TAG_DISTANCE_M).max(100)}).strict().superRefine((value,ctx)=>{
+  const ids=new Set<number>();
+  for(const id of value.ids){if(ids.has(id))ctx.addIssue({code:z.ZodIssueCode.custom,message:`Q${id} 被重复提交`});ids.add(id);}
+});
 function routeMapSnapshot(source:z.infer<typeof mapSchema>,route:Route){
  const path=route.motionSegments.length?[route.motionSegments[0]!.points[0]!,...route.motionSegments.flatMap(segment=>segment.points.slice(1))]:route.points;
  const sourceRow=source.rows[0];
@@ -147,6 +163,74 @@ export async function createApp(database?:string) {
  app.post('/api/maps/generate',req=>({map:generate(generationSchema.parse(req.body))}));
  app.post('/api/maps/validate',req=>validate(mapSchema.parse(req.body)));
  app.post('/api/maps',req=>{const body=z.object({map:mapSchema,baseVersion:z.number().int().nonnegative()}).parse(req.body);return saveMap(body.map,body.baseVersion);});
+ // Map QR position adjustment is its own stage, separate from route editing.
+ // The request only carries absolute centres/headings for existing points; the
+ // server rebuilds the candidate, reapplies mapSchema+validate and saves a new
+ // version. Routes, tasks and historical map versions are deliberately untouched.
+ app.post<{Params:{id:string}}>('/api/maps/:id/tag-positions',req=>{
+  const body=tagPositionRequestSchema.parse(req.body);
+  return store.db.transaction(()=>{
+   const item=store.get(req.params.id);if(!item)throw Object.assign(new Error('地图不存在'),{statusCode:404});
+   if(item.version!==body.baseVersion)throw Object.assign(new Error('地图已有新版本，请重新加载后再调整二维码位置'),{statusCode:409});
+   if(item.map.routeMode!=='map-only')throw Object.assign(new Error('二维码位置调整仅适用于尚未创建路径的定位码地图；已包含路径的地图请保留旧版本并新建扫描'),{statusCode:409});
+   const preview=previewTagPositions(item.map,body.tags);
+   if(!preview.ready||!preview.map)throw Object.assign(new Error('二维码位置无效：'+preview.reasons.map(reason=>reason.message).join('；')),{statusCode:400});
+   const saved=body.newVersion?saveMap(preview.map,body.baseVersion):store.saveInPlace(preview.map,body.baseVersion);
+   log('调整地图二维码位置 '+item.map.id+' v'+saved.version+' · '+preview.changedIds.length+' 个定位组 · 最大位移 '+(preview.maxDisplacementM*100).toFixed(1)+' cm');
+   return {...saved,previousVersion:item.version,changedTags:preview.points.map(({id,before,after,displacementM,rigidMemberCount})=>({id,before,after,displacementM,rigidMemberCount})),maxDisplacementM:preview.maxDisplacementM,maxAngleChangeDeg:preview.maxAngleChangeDeg,disclaimer:TAG_POSITION_DISCLAIMER};
+  })();
+ });
+ // Spacing is its own stage too: the request carries a distance, not coordinates,
+ // so the server is the only place that decides where the point lands. Same gates
+ // as the position editor: latest version, map-only map, mapSchema+validate, new
+ // version. Routes, tasks and every older map version stay untouched.
+ const spacingGuard=(id:string,baseVersion:number)=>{
+  const item=store.get(id);if(!item)throw Object.assign(new Error('地图不存在'),{statusCode:404});
+  if(item.version!==baseVersion)throw Object.assign(new Error('地图已有新版本，请重新加载后再调整二维码间距'),{statusCode:409});
+  if(item.map.routeMode!=='map-only')throw Object.assign(new Error('二维码间距调整仅适用于尚未创建路径的定位码地图；已包含路径的地图请保留旧版本并新建扫描'),{statusCode:409});
+  return item;
+ };
+ app.post<{Params:{id:string}}>('/api/maps/:id/tag-distance',req=>{
+  const body=tagDistanceRequestSchema.parse(req.body);
+  return store.db.transaction(()=>{
+   const item=spacingGuard(req.params.id,body.baseVersion);
+   const preview=previewTagDistance(item.map,{fromId:body.fromId,toId:body.toId,targetM:body.targetM});
+   if(!preview.ready||!preview.map)throw Object.assign(new Error('二维码间距无效：'+preview.reasons.map(reason=>reason.message).join('；')),{statusCode:400});
+   const saved=body.newVersion?saveMap(preview.map,body.baseVersion):store.saveInPlace(preview.map,body.baseVersion);
+   log('调整地图二维码间距 '+item.map.id+' v'+saved.version+' · '+preview.points.map(point=>point.label+' '+(point.offsetBeforeM*100).toFixed(1)+'→'+(point.offsetAfterM*100).toFixed(1)+' cm').join('、')+' · 最大位移 '+(preview.maxDisplacementM*100).toFixed(1)+' cm');
+   return {...saved,previousVersion:item.version,
+    changedTags:preview.points.map(({id,label,before,after,displacementM,rigidMemberCount})=>({id,label,before,after,displacementM,rigidMemberCount})),
+    neighbors:preview.line?preview.line.memberIds:[],
+    axis:preview.axis,
+    beforeM:preview.beforeM,afterM:preview.afterM,
+    beforeDistance:preview.before,afterDistance:preview.after,
+    targetM:preview.targetM,deltaM:preview.deltaM,
+    maxDisplacementM:preview.maxDisplacementM,
+    notes:preview.notes,
+    disclaimer:TAG_DISTANCE_DISCLAIMER};
+  })();
+ });
+ app.post<{Params:{id:string}}>('/api/maps/:id/tag-equal-spacing',req=>{
+  const body=tagEqualSpacingRequestSchema.parse(req.body);
+  return store.db.transaction(()=>{
+   const item=spacingGuard(req.params.id,body.baseVersion);
+   const preview=previewEqualSpacing(item.map,{ids:body.ids,targetM:body.targetM});
+   if(!preview.ready||!preview.map)throw Object.assign(new Error('二维码等间距无效：'+preview.reasons.map(reason=>reason.message).join('；')),{statusCode:400});
+   const saved=body.newVersion?saveMap(preview.map,body.baseVersion):store.saveInPlace(preview.map,body.baseVersion);
+   log('批量重排地图二维码间距 '+item.map.id+' v'+saved.version+' · '+preview.changedIds.length+' 个点位等距 '+(body.targetM*100).toFixed(1)+' cm · 最大位移 '+(preview.maxDisplacementM*100).toFixed(1)+' cm');
+   return {...saved,previousVersion:item.version,
+    changedTags:preview.points.map(({id,label,before,after,displacementM,beforeGapM,afterGapM,rigidMemberCount})=>({id,label,before,after,displacementM,beforeGapM,afterGapM,rigidMemberCount})),
+    order:preview.ids,
+    axis:preview.axis,
+    targetM:preview.targetM,
+    count:preview.count,
+    spanBeforeM:preview.spanBeforeM,spanAfterM:preview.spanAfterM,
+    maxDisplacementM:preview.maxDisplacementM,
+    maxLateralM:preview.maxLateralM,
+    notes:preview.notes,
+    disclaimer:TAG_DISTANCE_DISCLAIMER};
+  })();
+ });
  // Read-only cascade preview for the delete dialog: what else disappears with this map.
  app.get<{Params:{id:string}}>('/api/maps/:id/deletion',(req,reply)=>{
   const info=store.mapDeletionInfo(req.params.id);if(!info)return reply.code(404).send({error:'地图不存在'});
@@ -174,15 +258,15 @@ export async function createApp(database?:string) {
   const body=parsed.data,status=robot.status();if(status.running||robot.poll().some(c=>c.type==='start'))throw new Error('请先停止导航并等待启动指令处理完成，再编辑路径');
   return store.db.transaction(()=>{
    const latest=store.get(body.mapId),item=store.get(body.mapId,body.baseVersion);if(!latest)throw Object.assign(new Error('地图不存在'),{statusCode:404});if(!item)throw Object.assign(new Error('地图版本不存在或已被其他页面保存，请重新加载最新版本后再修改'),{statusCode:409});if(latest.version!==body.baseVersion)throw Object.assign(new Error('地图已有新版本，请重新加载后再编辑路径'),{statusCode:409});
-   const compiled=compileDesignedRoute(item.map,body.points,body.bodyYawDeg,body.segmentModes);
+   const compiled=compileDesignedRoute(item.map,body.points,body.bodyYawDeg,body.segmentModes,body.spacingOverrides);
    if(body.routeId||body.routeName||body.saveAs||item.map.routeMode==='map-only'){
     const routeId=body.saveAs||!body.routeId?'route-'+randomBytes(12).toString('hex'):body.routeId;const now=new Date().toISOString();
-    const route=store.saveRoute({routeId,mapId:body.mapId,name:body.routeName??item.map.name+'路线',mapVersion:body.baseVersion,mapDigest:store.digest(item.map),points:body.points,motionSegments:compiled.map.motionSegments!,bodyYawDeg:body.bodyYawDeg,initialHeadingRad:body.initialHeadingRad??null,created:now,updated:now},body.routeUpdated);
+    const route=store.saveRoute({routeId,mapId:body.mapId,name:body.routeName??item.map.name+'路线',mapVersion:body.baseVersion,mapDigest:store.digest(item.map),points:body.points,motionSegments:compiled.map.motionSegments!,bodyYawDeg:body.bodyYawDeg,initialHeadingRad:body.initialHeadingRad??null,distanceModel:body.distanceModel??'center-euclidean',spacingOverrides:body.spacingOverrides??[],created:now,updated:now},body.routeUpdated);
     const snapshot=routeMapSnapshot(item.map,route);const tasks=(store.db.prepare('SELECT body FROM tasks ORDER BY updated DESC').all() as {body:string}[]).map(row=>taskSchema.parse(JSON.parse(row.body)));const matching=tasks.find(task=>task.routeId===route.routeId);
     const task=taskSchema.parse({...matching,id:matching?.id??'task-route-'+randomBytes(12).toString('hex'),name:route.name.slice(0,98)+'任务',mapId:route.mapId,mapVersion:route.mapVersion,routeId:route.routeId,routeSnapshot:route,rowOrder:snapshot.order,forwardSpeed:matching?.forwardSpeed??.08,reverseSpeed:matching?.reverseSpeed??.06,lateralSpeed:matching?.lateralSpeed??.05,endWaitSeconds:matching?.endWaitSeconds??2,returnToStart:matching?.returnToStart??false,enabled:matching?.enabled??true});
     store.db.prepare('INSERT INTO tasks VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,updated=excluded.updated').run(task.id,JSON.stringify(task),route.updated);return {...route,route,map:snapshot,version:item.version,task,updatedTasks:[task],trimmed:compiled.trimmed,lengthM:compiled.lengthM,routeGroups:compiled.routeGroups,acceptance:mapApproval(item)};
    }
-   const saved=saveMap(compiled.map,body.baseVersion);const existing=(store.db.prepare('SELECT body FROM tasks ORDER BY updated DESC').all() as {body:string}[]).map(row=>taskSchema.parse(JSON.parse(row.body))).filter(task=>task.mapId===item.map.id&&task.routeId===undefined);const updatedTasks=(existing.length?existing:[taskSchema.parse({id:'task-scan-design-'+randomBytes(12).toString('hex'),name:item.map.name.slice(0,95)+'任务',mapId:item.map.id,mapVersion:saved.version,rowOrder:saved.map.order,forwardSpeed:.08,reverseSpeed:.06,lateralSpeed:.05,endWaitSeconds:2})]).map(task=>taskSchema.parse({...task,mapVersion:saved.version,rowOrder:saved.map.order}));for(const task of updatedTasks)store.db.prepare('INSERT INTO tasks VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,updated=excluded.updated').run(task.id,JSON.stringify(task),new Date().toISOString());const legacyId=legacyRouteId(saved.map.id),existingRoute=store.getRoute(legacyId),now=new Date().toISOString();const legacyRoute=store.saveRoute({routeId:legacyId,mapId:saved.map.id,name:saved.map.rows[0]?.name??saved.map.name+'路线',mapVersion:saved.version,mapDigest:store.digest(saved.map),points:body.points,motionSegments:saved.map.motionSegments!,bodyYawDeg:body.bodyYawDeg,initialHeadingRad:body.initialHeadingRad??null,created:now,updated:now},existingRoute?.updated);log('保存自定义正交路径 '+saved.map.id+' v'+saved.version);return {...saved,route:legacyRoute,task:updatedTasks[0],updatedTasks,trimmed:compiled.trimmed,lengthM:compiled.lengthM,routeGroups:compiled.routeGroups};
+   const saved=saveMap(compiled.map,body.baseVersion);const existing=(store.db.prepare('SELECT body FROM tasks ORDER BY updated DESC').all() as {body:string}[]).map(row=>taskSchema.parse(JSON.parse(row.body))).filter(task=>task.mapId===item.map.id&&task.routeId===undefined);const updatedTasks=(existing.length?existing:[taskSchema.parse({id:'task-scan-design-'+randomBytes(12).toString('hex'),name:item.map.name.slice(0,95)+'任务',mapId:item.map.id,mapVersion:saved.version,rowOrder:saved.map.order,forwardSpeed:.08,reverseSpeed:.06,lateralSpeed:.05,endWaitSeconds:2})]).map(task=>taskSchema.parse({...task,mapVersion:saved.version,rowOrder:saved.map.order}));for(const task of updatedTasks)store.db.prepare('INSERT INTO tasks VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body,updated=excluded.updated').run(task.id,JSON.stringify(task),new Date().toISOString());const legacyId=legacyRouteId(saved.map.id),existingRoute=store.getRoute(legacyId),now=new Date().toISOString();const legacyRoute=store.saveRoute({routeId:legacyId,mapId:saved.map.id,name:saved.map.rows[0]?.name??saved.map.name+'路线',mapVersion:saved.version,mapDigest:store.digest(saved.map),points:body.points,motionSegments:saved.map.motionSegments!,bodyYawDeg:body.bodyYawDeg,initialHeadingRad:body.initialHeadingRad??null,distanceModel:body.distanceModel??'center-euclidean',spacingOverrides:body.spacingOverrides??[],created:now,updated:now},existingRoute?.updated);log('保存自定义正交路径 '+saved.map.id+' v'+saved.version);return {...saved,route:legacyRoute,task:updatedTasks[0],updatedTasks,trimmed:compiled.trimmed,lengthM:compiled.lengthM,routeGroups:compiled.routeGroups};
   })();
  });
  app.get<{Params:{id:string},Querystring:{version?:string}}>('/api/maps/:id',(req,reply)=>{const version=req.query.version===undefined?undefined:z.coerce.number().int().positive().parse(req.query.version);const item=store.get(req.params.id,version);return item?{...item,acceptance:mapApproval(item)}:reply.code(404).send({error:'地图不存在'});});

@@ -46,3 +46,10 @@ import './map-switch-reanchor.test';
 
 import './auto-map-select.test';
 import './vehicle-icon-size.test';
+import './map-tag-position.test';
+
+import './route-distance.test';
+import './route-leg-distance.test';
+
+import './map-tag-distance.test';
+import './map-inplace.test';
