@@ -20,6 +20,8 @@ async function setup(page:Page,intermediate=false,offAxis=false,shifted=false){
   if(path==='/api/surveys'||path==='/api/boards')return route.fulfill({json:[]});
   if(path==='/api/camera/status')return route.fulfill({json:{running:false,present:false}});
   if(path==='/api/maps/'+map.id)return route.fulfill({json:{map,version}});
+  // v15 起页面会加载二维码现场别名（只影响显示）；旧 mock 没覆盖，会被“未预期的 API”守卫判失败。
+  if(path==='/api/maps/'+map.id+'/tag-aliases')return route.fulfill({json:{mapId:map.id,mapVersion:version,aliases:[]}});
   if(path==='/api/route/design'){
    const body=route.request().postDataJSON();requests.push(body);
    if(reject)return route.fulfill({status:409,json:{error:'地图已被其他页面保存，请重新加载最新版本后再修改'}});
@@ -44,8 +46,17 @@ const anchors=(page:Page)=>page.locator('.route-commands-table tbody tr');
 
 test('路径编辑：点击吸附、自动正交、拖动、删除、撤销、清空、取消',async({page})=>{
  const h=await setup(page);await page.getByRole('button',{name:'清空',exact:true}).click();await expect(anchors(page)).toHaveCount(0);
+ // v15 起「空白单击追加路点」只属于「加点」工具：选择态单击既不选也不加点。
+ // 这里先显式切到加点，再切回选择才能拖动路点（加点态下路点手柄不可拖）。
+ await page.getByTestId('route-draw-tool').click();
  await clickPoint(page,{x:.013,y:.012});await clickPoint(page,{x:1.024,y:.012});await clickPoint(page,{x:1,y:1});await expect(anchors(page)).toHaveCount(3);const coords=await page.locator('.route-commands-table tbody tr td:nth-child(5)').allTextContents();expect(coords).toEqual(['0.00, 0.00','1.00, 0.00','1.00, 1.00']);
  await expect(anchors(page).nth(0)).toContainText('0.00, 0.00');await expect(anchors(page).nth(1)).toContainText('1.00, 0.00');
+ // 拖路点前必须回到选择态，否则手柄是 listening=false 的。
+ // 切工具会重建图层，必须等重建真的完成再按下鼠标，否则会按在一个即将被销毁的
+ // 节点上，拖动被吞掉（表现为“路点拖不动”）。用重绘计数等待，而不是 sleep。
+ const buildsBefore=Number(await page.getByTestId('map-canvas').getAttribute('data-konva-static-builds'));
+ await page.getByTestId('route-select-tool').click();
+ await expect.poll(async()=>Number(await page.getByTestId('map-canvas').getAttribute('data-konva-static-builds'))).toBeGreaterThan(buildsBefore);
  const from=await location(page,{x:1,y:1}),to=await location(page,{x:.72,y:.38});await page.mouse.move(from.x,from.y);await page.mouse.down();await page.mouse.move(to.x,to.y,{steps:8});await page.mouse.up();
  await expect(anchors(page).nth(2)).toContainText('0.70, 0.40');
  await page.getByRole('button',{name:'删除路点',exact:true}).click();await expect(anchors(page)).toHaveCount(2);

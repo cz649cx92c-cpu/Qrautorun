@@ -20,6 +20,7 @@ import {zipSync,strToU8} from 'fflate';
 import {batchPlan,exportBatch} from './batch-print';
 import {compileScan,scanSettings} from './scan-map';
 import {compileDesignedRoute,routeDesignSchema} from './route-design';
+import {registerRouteGeometryRoutes} from './route-geometry';
 import {segmentExecutionBlockers} from '../../shared/segment-strategy';
 import {registerTagReprintRoutes} from './tag-reprint';
 import {boardOptions,boardPlan,boardRegistrationPlan,boardSvg,boardPdf,boardTables,listBoards,checkBoardRegistration,registerBoards} from './boards';
@@ -30,6 +31,12 @@ import {CalibrationStore,calibrationDatabasePath,imuCalibrationFromSnapshot} fro
 import {registerCalibrationRoutes} from './calibration-routes';
 import {previewTagPositions,TAG_POSITION_DISCLAIMER} from '../../shared/map-tag-position';
 import {previewTagDistance,previewEqualSpacing,TAG_DISTANCE_DISCLAIMER,MIN_TAG_DISTANCE_M} from '../../shared/map-tag-distance';
+import {checkTagAliasName,tagAliasNameKey,TAG_ALIAS_DISCLAIMER} from '../../shared/tag-naming';
+import {routeTopologySchema,topologyFromSegments,topologyToPoints,validateTopology,topologyStrategyChoices,topologySummary,TOPOLOGY_DISCLAIMER} from '../../shared/route-topology';
+import {routeTopologyTables,listRouteTopology,saveRouteTopology,deleteRouteTopology,deleteRouteTopologiesForMap} from './route-topology-store';
+import {previewTagUpdates,TAG_UPDATE_DISCLAIMER,type TagUpdateEdit} from '../../shared/map-tag-update';
+import {createTag,createTagGrid,createTagLine,removeTags,alignTags,MAX_TAG_ID,MAX_TAG_COUNT,MAX_GRID_POINTS,MIN_TAG_SIZE_M,MAX_TAG_SIZE_M,MIN_CREATION_DISTANCE_M,TAG_ALIGN_MODES,TAG_CREATION_DISCLAIMER} from '../../shared/map-tag-creation';
+import {createBlankMap,BLANK_MAP_DISCLAIMER} from '../../shared/map-design';
 export const root=fileURLToPath(new URL('../../../',import.meta.url));
 const mapConfirmationSchema=z.object({mapId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),version:z.number().int().positive(),confirm:z.literal(true),operator:z.string().trim().max(80).optional().default(''),updateTasks:z.boolean().default(false)}).strict();
 const mapConfirmationEvidenceSchema=mapConfirmationSchema.extend({kind:z.literal('user_confirmation'),acceptedVersion:z.number().int().positive(),created:z.string().datetime()}).strict();
@@ -46,6 +53,18 @@ const tagPositionRequestSchema=z.object({baseVersion:z.number().int().nonnegativ
 // Spacing edits are distance-only: the operator names two points (or a straight
 // run) and a wanted centre-to-centre pitch, never raw coordinates.
 const tagDistanceRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),fromId:z.number().int().min(0).max(586),toId:z.number().int().min(0).max(586),targetM:z.number().finite().min(MIN_TAG_DISTANCE_M).max(100)}).strict();
+// 新建空白地图的请求形状。语义校验（名称长度、四点范围、退化面积、车辆包络）
+// 一律交给纯函数 createBlankMap，这里只保证"形状与类型"是 strict 的：未知字段
+// 直接 400，免得前端把点位数组之类的东西误发进来被静默忽略。
+const blankMapZonePointSchema=z.object({x:z.number().finite().min(-10000).max(10000),y:z.number().finite().min(-10000).max(10000)}).strict();
+const blankMapRequestSchema=z.object({
+ name:z.string(),
+ id:z.string().optional(),
+ zone:z.array(blankMapZonePointSchema).optional(),
+ vehicle:z.object({width:z.number().finite().optional(),length:z.number().finite().optional(),margin:z.number().finite().optional()}).strict().optional(),
+ tagSizeMm:z.number().finite().optional(),
+ notes:z.string().optional(),
+}).strict();
 const tagEqualSpacingRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),ids:z.array(z.number().int().min(0).max(586)).min(2).max(587),targetM:z.number().finite().min(MIN_TAG_DISTANCE_M).max(100)}).strict().superRefine((value,ctx)=>{
   const ids=new Set<number>();
   for(const id of value.ids){if(ids.has(id))ctx.addIssue({code:z.ZodIssueCode.custom,message:`Q${id} 被重复提交`});ids.add(id);}
@@ -77,7 +96,7 @@ export function localizationScopePhase(exists:boolean,mapId:string,mapVersion:nu
 export async function createApp(database?:string) {
  const config=JSON.parse(readFileSync(resolve(root,'config/web.json'),'utf8'));mkdirSync(resolve(root,'maps'),{recursive:true});
  const keyFile=resolve(root,config.bridgeKeyFile);if(!existsSync(keyFile))writeFileSync(keyFile,randomBytes(32).toString('hex'),{mode:0o600});const bridgeKey=readFileSync(keyFile,'utf8').trim();
- const app=Fastify({logger:!database,disableRequestLogging:true,bodyLimit:8*1024*1024});const store=new Store(database??resolve(root,config.database));surveyTables(store);boardTables(store);
+ const app=Fastify({logger:!database,disableRequestLogging:true,bodyLimit:8*1024*1024});const store=new Store(database??resolve(root,config.database));surveyTables(store);boardTables(store);routeTopologyTables(store.db);
  store.db.exec('CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,body TEXT,updated TEXT); CREATE TABLE IF NOT EXISTS acceptances(map_id TEXT,version INTEGER,digest TEXT,body TEXT,PRIMARY KEY(map_id,version)); CREATE TABLE IF NOT EXISTS runtime_log(stamp TEXT,event TEXT);');
  const robot=new RobotLink();const clients=new Set<{send:(data:string)=>void,readyState:number,close:()=>void}>();let surveyId:string|null=((store.db.prepare("SELECT id FROM survey_sessions WHERE state='collecting' ORDER BY created DESC LIMIT 1").get() as {id:string}|undefined)?.id??null);
  const broadcast=()=>{const msg=JSON.stringify({type:'robot',status:robot.status()});for(const c of clients)if(c.readyState===1)c.send(msg);};
@@ -141,6 +160,8 @@ export async function createApp(database?:string) {
  app.post('/api/robot/ack',req=>{authorized(req);const b=z.object({id:z.string(),ok:z.boolean().optional(),message:z.string().max(1000).optional()}).parse(req.body);robot.ack(b.id,b.ok,b.message);log(`${b.id} ${b.ok===undefined?'UNCONFIRMED':b.ok?'OK':'REJECTED'} ${b.message??''}`);return {ok:true};});
  app.get('/api/maps',()=>store.list());
  registerTagReprintRoutes(app,store);
+ // 路径几何编辑：严格 schema + 纯函数几何运算，编译仍然走 compileDesignedRoute 的全部安全门。
+ registerRouteGeometryRoutes(app,{store,robot,log});
  app.get('/api/boards/options',()=>boardOptions());
  app.get('/api/boards',()=>listBoards(store));
  app.post('/api/boards/plan',req=>boardRegistrationPlan(store,req.body));
@@ -162,7 +183,73 @@ export async function createApp(database?:string) {
  app.get<{Params:{id:string}}>('/api/print/tag/:id.svg',(req,reply)=>{const id=z.coerce.number().int().min(0).max(586).parse(req.params.id);const q=z.object({sizeMm:z.coerce.number().min(20).max(150).default(80),x:z.coerce.number().finite().min(-10000).max(10000).optional(),y:z.coerce.number().finite().min(-10000).max(10000).optional(),angle:z.coerce.number().finite().min(-10000).max(10000).optional()}).parse(req.query);return reply.type('image/svg+xml').send(tagSvg({id,size:q.sizeMm/1000,x:q.x,y:q.y,angle:q.angle}));});
  app.post('/api/maps/generate',req=>({map:generate(generationSchema.parse(req.body))}));
  app.post('/api/maps/validate',req=>validate(mapSchema.parse(req.body)));
+ // ===== 二维码现场别名（按 map 作用域）=====
+ // 铁律：别名只影响显示。真实 tag36h11 编号、坐标、朝向、地图摘要与版本都不动，
+ // 也不写 versions 表——所以旧路线与旧任务的摘要校验永远不受影响。
+ app.get<{Params:{id:string}}>('/api/maps/:id/tag-aliases',req=>{
+  const item=store.get(req.params.id);if(!item)throw Object.assign(new Error('地图不存在'),{statusCode:404});
+  return {mapId:item.map.id,mapVersion:item.version,aliases:store.listTagAliases(item.map.id),disclaimer:TAG_ALIAS_DISCLAIMER};
+ });
+ const tagAliasRequestSchema=z.object({
+  baseVersion:z.number().int().nonnegative().optional(),
+  aliases:z.array(z.object({tagId:z.number().int().min(0).max(586),name:z.string()})).max(587),
+ }).strict();
+ app.post<{Params:{id:string}}>('/api/maps/:id/tag-aliases',req=>{
+  const body=tagAliasRequestSchema.parse(req.body);
+  return store.db.transaction(()=>{
+   const item=store.get(req.params.id);if(!item)throw Object.assign(new Error('地图不存在'),{statusCode:404});
+   const known=new Set(item.map.tags.map(tag=>tag.id));
+   const problems:string[]=[];
+   const byName=new Map<string,number>();
+   const next:{tagId:number;name:string;updated:string}[]=[];
+   const now=new Date().toISOString();
+   for(const alias of body.aliases){
+    if(!known.has(alias.tagId)){problems.push('Q'+String(alias.tagId).padStart(3,'0')+' 不在这张地图中');continue;}
+    const check=checkTagAliasName(alias.name);
+    if(!check.ok){problems.push('Q'+String(alias.tagId).padStart(3,'0')+'：'+check.message);continue;}
+    const key=tagAliasNameKey(check.name);
+    const clash=byName.get(key);
+    if(clash!==undefined){problems.push('名称「'+check.name+'」被 Q'+String(clash).padStart(3,'0')+' 与 Q'+String(alias.tagId).padStart(3,'0')+' 重复使用');continue;}
+    byName.set(key,alias.tagId);
+    next.push({tagId:alias.tagId,name:check.name,updated:now});
+   }
+   if(problems.length)throw Object.assign(new Error(problems.join('；')),{statusCode:400});
+   const before=store.listTagAliases(item.map.id);
+   const saved=store.saveTagAliases(item.map.id,next);
+   const changed=saved.aliases.filter(alias=>{const old=before.find(entry=>entry.tagId===alias.tagId);return !old||old.name!==alias.name;}).length;
+   const removed=before.filter(entry=>!saved.aliases.some(alias=>alias.tagId===entry.tagId)).length;
+   log('保存地图二维码别名 '+item.map.id+' · '+saved.aliases.length+' 个 · 改 '+changed+' · 删 '+removed);
+   return {mapId:item.map.id,mapVersion:item.version,aliases:saved.aliases,changed,removed,disclaimer:TAG_ALIAS_DISCLAIMER};
+  })();
+ });
+ app.delete<{Params:{id:string}}>('/api/maps/:id/tag-aliases',req=>{
+  return store.db.transaction(()=>{
+   const item=store.get(req.params.id);if(!item)throw Object.assign(new Error('地图不存在'),{statusCode:404});
+   const removed=store.deleteTagAliases(item.map.id);
+   log('清空地图二维码别名 '+item.map.id+' · '+removed+' 个');
+   return {mapId:item.map.id,removed,aliases:[]};
+  })();
+ });
  app.post('/api/maps',req=>{const body=z.object({map:mapSchema,baseVersion:z.number().int().nonnegative()}).parse(req.body);return saveMap(body.map,body.baseVersion);});
+ // 新建空白地图（手动铺码的起点）。与 POST /api/maps 刻意分成两条路径：那条要求
+ // 调用方自带完整 map + baseVersion，语义是"在某个已有版本之上保存改动"；这里
+ // 服务端才是唯一决定 id / zone / vehicle 的地方，一张新图的 baseVersion 恒为 0，
+ // 绝不与"原地覆盖当前版本"或"在 vN 之上新建 vN+1"的语义混用。
+ // 地图合法性与导航可用性都走同一套 mapSchema.parse + validate()（在 createBlankMap 内）；
+ // 空点位只是 warning，因此空图可以保存，但 /api/navigation/start 会以 423 拒绝 map-only。
+ app.post('/api/maps/new',req=>{
+  const body=blankMapRequestSchema.parse(req.body);
+  return store.db.transaction(()=>{
+   const design=createBlankMap({...(body.id===undefined?{}:{id:body.id}),name:body.name,...(body.zone===undefined?{}:{zone:body.zone}),...(body.vehicle===undefined?{}:{vehicle:body.vehicle}),...(body.tagSizeMm===undefined?{}:{tagSizeMm:body.tagSizeMm}),...(body.notes===undefined?{}:{notes:body.notes})});
+   if(!design.ready||!design.map)throw Object.assign(new Error('新建空白地图无效：'+(design.reasons.map(reason=>reason.message).join('；')||'未知原因')),{statusCode:400});
+   // 同编号已存在时绝不覆盖：新建空白图必须每次都得到一张新图，否则会静默改动别的地图。
+   const existing=store.get(design.map.id);
+   if(existing)throw Object.assign(new Error('地图编号 '+design.map.id+' 已存在（当前 v'+existing.version+'），新建空白地图不能覆盖已有地图'),{statusCode:409});
+   const saved=store.save(design.map,0);
+   log('新建空白地图 '+saved.map.id+' v'+saved.version+' · 范围 '+saved.map.zone.map(point=>'('+point.x+', '+point.y+')').join(' ')+' · 铺码边长 '+design.tagSizeMm+' mm');
+   return {map:saved.map,version:saved.version,validation:saved.validation,created:true,id:saved.map.id,tagSizeMm:design.tagSizeMm,reasons:design.reasons,notes:design.notes,disclaimer:BLANK_MAP_DISCLAIMER};
+  })();
+ });
  // Map QR position adjustment is its own stage, separate from route editing.
  // The request only carries absolute centres/headings for existing points; the
  // server rebuilds the candidate, reapplies mapSchema+validate and saves a new
@@ -231,6 +318,107 @@ export async function createApp(database?:string) {
     disclaimer:TAG_DISTANCE_DISCLAIMER};
   })();
  });
+// 建图阶段直接新建二维码：单点 / 矩形阵列 / 直线铺码 / 删除 / 对齐。
+// 与位置、间距两个阶段同一套门限：必须是最新版本、必须是定位码地图、
+// 候选地图重新过 mapSchema+validate（纯函数引擎里做），ready 为 false 一律 400。
+// 默认原地覆盖当前版本（现场铺码会连续加很多点，不必每次都多一个版本）；
+// newVersion:true 时才升号，历史版本、路线与任务绑定保持不变。
+const tagCreateRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),x:z.number().finite().min(-10000).max(10000),y:z.number().finite().min(-10000).max(10000),sizeM:z.number().finite().min(MIN_TAG_SIZE_M).max(MAX_TAG_SIZE_M).optional(),angleDeg:z.number().finite().min(-3600).max(3600).optional(),groupId:z.string().regex(/^B\d{3}$/).optional()}).strict();
+const tagGridRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),originX:z.number().finite().min(-10000).max(10000),originY:z.number().finite().min(-10000).max(10000),columns:z.number().int().min(1).max(MAX_GRID_POINTS),rows:z.number().int().min(1).max(MAX_GRID_POINTS),spacingXM:z.number().finite().min(MIN_CREATION_DISTANCE_M).max(100),spacingYM:z.number().finite().min(MIN_CREATION_DISTANCE_M).max(100),angleDeg:z.number().finite().min(-3600).max(3600).optional(),sizeM:z.number().finite().min(MIN_TAG_SIZE_M).max(MAX_TAG_SIZE_M).optional(),onConflict:z.enum(['reject','skip']).default('reject')}).strict().superRefine((value,ctx)=>{
+ if(value.columns*value.rows>MAX_GRID_POINTS)ctx.addIssue({code:z.ZodIssueCode.custom,message:`阵列最多 ${MAX_GRID_POINTS} 个点位`,path:['columns']});
+});
+const tagLineRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),fromTagId:z.number().int().min(0).max(MAX_TAG_ID).optional(),startX:z.number().finite().min(-10000).max(10000).optional(),startY:z.number().finite().min(-10000).max(10000).optional(),count:z.number().int().min(1).max(MAX_TAG_COUNT),spacingM:z.number().finite().min(MIN_CREATION_DISTANCE_M).max(100),axis:z.enum(['horizontal','vertical']),direction:z.union([z.literal(1),z.literal(-1)]).default(1),angleDeg:z.number().finite().min(-3600).max(3600).optional(),sizeM:z.number().finite().min(MIN_TAG_SIZE_M).max(MAX_TAG_SIZE_M).optional()}).strict().superRefine((value,ctx)=>{
+ if(value.fromTagId===undefined&&(value.startX===undefined||value.startY===undefined))ctx.addIssue({code:z.ZodIssueCode.custom,message:'铺码必须提供 fromTagId 或 startX/startY',path:['fromTagId']});
+});
+const tagDeleteRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),ids:z.array(z.number().int().min(0).max(MAX_TAG_ID)).max(MAX_TAG_COUNT),orphanGroups:z.enum(['reject','prune']).default('reject')}).strict();
+const tagAlignRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),ids:z.array(z.number().int().min(0).max(MAX_TAG_ID)).min(2).max(MAX_TAG_COUNT),mode:z.enum(TAG_ALIGN_MODES)}).strict().superRefine((value,ctx)=>{
+ const ids=new Set<number>();
+ for(const id of value.ids){if(ids.has(id))ctx.addIssue({code:z.ZodIssueCode.custom,message:`Q${id} 被重复提交`});ids.add(id);}
+});
+const creationGuard=(id:string,baseVersion:number)=>{
+ const mapItem=store.get(id);if(!mapItem)throw Object.assign(new Error('地图不存在'),{statusCode:404});
+ if(mapItem.version!==baseVersion)throw Object.assign(new Error('地图已有新版本，请重新加载后再新建二维码'),{statusCode:409});
+ if(mapItem.map.routeMode!=='map-only')throw Object.assign(new Error('二维码新建仅适用于尚未创建路径的定位码地图；已包含路径的地图请保留旧版本并新建扫描'),{statusCode:409});
+ return mapItem;
+};
+const creationSaved=(candidate:z.infer<typeof mapSchema>,baseVersion:number,newVersion:boolean)=>newVersion?saveMap(candidate,baseVersion):store.saveInPlace(candidate,baseVersion);
+// POST /api/maps/:id/tags/create — 单点新建
+app.post<{Params:{id:string}}>('/api/maps/:id/tags/create',req=>{
+ const body=tagCreateRequestSchema.parse(req.body);
+ return store.db.transaction(()=>{
+  const item=creationGuard(req.params.id,body.baseVersion);
+  const preview=createTag(item.map,{x:body.x,y:body.y,...(body.sizeM===undefined?{}:{sizeM:body.sizeM}),...(body.angleDeg===undefined?{}:{angleDeg:body.angleDeg}),...(body.groupId===undefined?{}:{groupId:body.groupId})});
+  if(!preview.ready||!preview.map)throw Object.assign(new Error('新建二维码无效：'+preview.reasons.map(reason=>reason.message).join('；')),{statusCode:400});
+  const saved=creationSaved(preview.map,body.baseVersion,body.newVersion);
+  log('新建地图二维码 '+item.map.id+' v'+saved.version+' · '+preview.tag!.id+' @('+preview.tag!.x+', '+preview.tag!.y+')');
+  return {...saved,previousVersion:item.version,created:1,deleted:0,changed:1,tags:[preview.tag],reasons:preview.reasons,notes:preview.notes,disclaimer:TAG_CREATION_DISCLAIMER};
+ })();
+});
+// POST /api/maps/:id/tags/grid — 矩形阵列
+app.post<{Params:{id:string}}>('/api/maps/:id/tags/grid',req=>{
+ const body=tagGridRequestSchema.parse(req.body);
+ return store.db.transaction(()=>{
+  const item=creationGuard(req.params.id,body.baseVersion);
+  const preview=createTagGrid(item.map,{originX:body.originX,originY:body.originY,columns:body.columns,rows:body.rows,spacingXM:body.spacingXM,spacingYM:body.spacingYM,onConflict:body.onConflict,...(body.angleDeg===undefined?{}:{angleDeg:body.angleDeg}),...(body.sizeM===undefined?{}:{sizeM:body.sizeM})});
+  if(!preview.ready||!preview.map)throw Object.assign(new Error('新建二维码阵列无效：'+preview.reasons.map(reason=>reason.message).join('；')),{statusCode:400});
+  const saved=creationSaved(preview.map,body.baseVersion,body.newVersion);
+  log('新建地图二维码阵列 '+item.map.id+' v'+saved.version+' · '+body.columns+'×'+body.rows+' 生成 '+preview.created+' 个');
+  return {...saved,previousVersion:item.version,created:preview.created,deleted:0,changed:preview.created,tags:preview.tags,spanXM:preview.spanXM,spanYM:preview.spanYM,skipped:preview.skipped,reasons:preview.reasons,notes:preview.notes,disclaimer:TAG_CREATION_DISCLAIMER};
+ })();
+});
+// POST /api/maps/:id/tags/line — 直线铺码
+app.post<{Params:{id:string}}>('/api/maps/:id/tags/line',req=>{
+ const body=tagLineRequestSchema.parse(req.body);
+ return store.db.transaction(()=>{
+  const item=creationGuard(req.params.id,body.baseVersion);
+  const preview=createTagLine(item.map,{...(body.fromTagId===undefined?{}:{fromTagId:body.fromTagId}),...(body.startX===undefined?{}:{startX:body.startX}),...(body.startY===undefined?{}:{startY:body.startY}),count:body.count,spacingM:body.spacingM,axis:body.axis,direction:body.direction,...(body.angleDeg===undefined?{}:{angleDeg:body.angleDeg}),...(body.sizeM===undefined?{}:{sizeM:body.sizeM})});
+  if(!preview.ready||!preview.map)throw Object.assign(new Error('直线铺码无效：'+preview.reasons.map(reason=>reason.message).join('；')),{statusCode:400});
+  const saved=creationSaved(preview.map,body.baseVersion,body.newVersion);
+  log('直线铺码 '+item.map.id+' v'+saved.version+' · '+body.axis+' 间距 '+(body.spacingM*100).toFixed(1)+' cm 新建 '+preview.created+' 个');
+  return {...saved,previousVersion:item.version,created:preview.created,deleted:0,changed:preview.created,tags:preview.tags,axis:preview.axis,direction:preview.direction,spacingM:preview.spacingM,spanM:preview.spanM,points:preview.points,reasons:preview.reasons,notes:preview.notes,disclaimer:TAG_CREATION_DISCLAIMER};
+ })();
+});
+// DELETE /api/maps/:id/tags — 画错回退
+app.delete<{Params:{id:string}}>('/api/maps/:id/tags',req=>{
+ const body=tagDeleteRequestSchema.parse(req.body);
+ return store.db.transaction(()=>{
+  const item=creationGuard(req.params.id,body.baseVersion);
+  const preview=removeTags(item.map,body.ids,{orphanGroups:body.orphanGroups});
+  if(!preview.ready||!preview.map)throw Object.assign(new Error('删除二维码无效：'+preview.reasons.map(reason=>reason.message).join('；')),{statusCode:400});
+  const saved=creationSaved(preview.map,body.baseVersion,body.newVersion);
+  log('删除地图二维码 '+item.map.id+' v'+saved.version+' · '+preview.removed+' 个'+(preview.prunedGroups.length?' · 移除定位组 '+preview.prunedGroups.join('、'):''));
+  return {...saved,previousVersion:item.version,created:0,deleted:preview.removed,changed:preview.removed,ids:preview.ids,tags:preview.tags,prunedGroups:preview.prunedGroups,reasons:preview.reasons,notes:preview.notes,disclaimer:TAG_CREATION_DISCLAIMER};
+ })();
+});
+// POST /api/maps/:id/tags/update — 统一改编号/坐标/朝向/尺寸
+const tagUpdateEditSchema=z.object({id:z.number().int().min(0).max(586),nextId:z.number().int().min(0).max(586).optional(),x:z.number().finite().min(-10000).max(10000).optional(),y:z.number().finite().min(-10000).max(10000).optional(),angle:z.number().finite().min(-3600).max(3600).optional(),size:z.number().finite().min(0.02).max(0.18).optional()}).strict();
+const tagUpdateRequestSchema=z.object({baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),edits:z.array(tagUpdateEditSchema).min(1).max(587)}).strict().superRefine((value,ctx)=>{
+ const ids=new Set<number>();
+ for(const edit of value.edits){if(ids.has(edit.id))ctx.addIssue({code:z.ZodIssueCode.custom,message:`Q${edit.id} 被重复提交`});ids.add(edit.id);}
+});
+app.post<{Params:{id:string}}>('/api/maps/:id/tags/update',req=>{
+ const body=tagUpdateRequestSchema.parse(req.body);
+ return store.db.transaction(()=>{
+  const item=creationGuard(req.params.id,body.baseVersion);
+  const preview=previewTagUpdates(item.map,body.edits as TagUpdateEdit[]);
+  if(!preview.ready||!preview.map)throw Object.assign(new Error('点位修改无效：'+preview.reasons.map(reason=>reason.message).join('；')),{statusCode:400});
+  const saved=body.newVersion?saveMap(preview.map,body.baseVersion):store.saveInPlace(preview.map,body.baseVersion);
+  log('修改地图二维码点位 '+item.map.id+' v'+saved.version+' · '+preview.changedIds.length+' 点 · 改号 '+preview.renumbered.length+' 个');
+  return {...saved,previousVersion:item.version,points:preview.points,changedIds:preview.changedIds,renumbered:preview.renumbered,maxDisplacementM:preview.maxDisplacementM,maxAngleChangeDeg:preview.maxAngleChangeDeg,notes:preview.notes,disclaimer:TAG_UPDATE_DISCLAIMER};
+ })();
+});
+// POST /api/maps/:id/tags/align — 对齐 / 等间距
+app.post<{Params:{id:string}}>('/api/maps/:id/tags/align',req=>{
+ const body=tagAlignRequestSchema.parse(req.body);
+ return store.db.transaction(()=>{
+  const item=creationGuard(req.params.id,body.baseVersion);
+  const preview=alignTags(item.map,body.ids,body.mode);
+  if(!preview.ready||!preview.map)throw Object.assign(new Error('二维码对齐无效：'+preview.reasons.map(reason=>reason.message).join('；')),{statusCode:400});
+  const saved=creationSaved(preview.map,body.baseVersion,body.newVersion);
+  log('对齐地图二维码 '+item.map.id+' v'+saved.version+' · '+body.mode+' · '+preview.changedIds.length+' 个点位 · 最大位移 '+(preview.maxDisplacementM*100).toFixed(1)+' cm');
+  return {...saved,previousVersion:item.version,created:0,deleted:0,changed:preview.changedIds.length,order:preview.order,changedIds:preview.changedIds,changedTags:preview.points.map(({id,label,before,after,displacementM})=>({id,label,before,after,displacementM})),mode:preview.mode,axis:preview.axis,fixedIds:preview.fixedIds,maxDisplacementM:preview.maxDisplacementM,tags:preview.points.map(point=>({id:point.id,x:point.after.x,y:point.after.y})),reasons:preview.reasons,notes:preview.notes,disclaimer:TAG_CREATION_DISCLAIMER};
+ })();
+});
  // Read-only cascade preview for the delete dialog: what else disappears with this map.
  app.get<{Params:{id:string}}>('/api/maps/:id/deletion',(req,reply)=>{
   const info=store.mapDeletionInfo(req.params.id);if(!info)return reply.code(404).send({error:'地图不存在'});
@@ -241,6 +429,7 @@ export async function createApp(database?:string) {
   if(robot.status().running)throw Object.assign(new Error('车辆正在执行导航任务，请先停止导航再删除地图'),{statusCode:409});
   if(robot.poll().some(command=>command.type==='start'))throw Object.assign(new Error('导航启动指令正在处理，请稍后再删除地图'),{statusCode:409});
   const result=store.deleteMap(req.params.id);
+  deleteRouteTopologiesForMap(store.db,req.params.id);
   log(`删除地图 ${result.name} ${result.mapId} · 版本${result.deletedVersions} · 路径${result.deletedRoutes} · 任务${result.deletedTasks}`);
   return result;
  });
@@ -252,6 +441,63 @@ export async function createApp(database?:string) {
   const result=store.deleteRoute(req.params.id,req.query.detachTasks==='1');
   log(`删除路径 ${result.name} ${result.routeId}`+(result.deletedTasks?` · 同时移除 ${result.deletedTasks} 个任务绑定`:''));
   return result;
+ });
+ // ===== 稳定 tagId 的有向路线拓扑 =====
+ // 顶点是真实 tagId，边是「第几次经过」；几何只是渲染结果。
+ // savePoints 时折线交给现有 compileDesignedRoute，安全门完全复用。
+ const topologyGuard=(id:string,baseVersion?:number)=>{
+  const route=store.getRoute(id);if(!route)throw Object.assign(new Error('路径不存在'),{statusCode:404});
+  const item=store.get(route.mapId,route.mapVersion);if(!item)throw Object.assign(new Error('路径引用的地图版本不存在'),{statusCode:409});
+  if(baseVersion!==undefined&&route.mapVersion!==baseVersion)throw Object.assign(new Error('路径引用的地图版本已变化（当前 v'+route.mapVersion+'），请重新加载后再改拓扑'),{statusCode:409});
+  return {route,item};
+ };
+ const topologyTagCenters=(map:z.infer<typeof mapSchema>)=>map.tags.map(tag=>({id:tag.id,x:tag.x,y:tag.y}));
+ app.get<{Params:{id:string}}>('/api/routes/:id/topology',req=>{
+  const {route,item}=topologyGuard(req.params.id);
+  const stored=listRouteTopology(store.db,route.routeId);
+  const centers=topologyTagCenters(item.map);
+  // 没有存过拓扑时从 motionSegments 还原，而不是 404：旧路径也有拓扑。
+  const restored=stored?null:topologyFromSegments(route.motionSegments);
+  const parsedStored=stored?routeTopologySchema.safeParse(stored.topology):null;
+  const topology=parsedStored?.success?parsedStored.data:restored!.topology;
+  const report=validateTopology(topology,centers);
+  return {routeId:route.routeId,mapId:route.mapId,mapVersion:route.mapVersion,
+   stored:!!stored,topology,summary:topologySummary(topology,centers),
+   issues:[...(restored?restored.issues:[]),...report.errors,...report.warnings],
+   strategyChoices:topologyStrategyChoices(topology),
+   disclaimer:TOPOLOGY_DISCLAIMER};
+ });
+ app.put<{Params:{id:string}}>('/api/routes/:id/topology',req=>{
+  const body=z.object({baseVersion:z.number().int().nonnegative(),topology:routeTopologySchema,savePoints:z.boolean().default(false)}).strict().parse(req.body);
+  return store.db.transaction(()=>{
+   const {route,item}=topologyGuard(req.params.id,body.baseVersion);
+   const centers=topologyTagCenters(item.map);
+   const report=validateTopology(body.topology,centers);
+   if(report.errors.length)throw Object.assign(new Error('路线拓扑无效：'+report.errors.map(issue=>issue.message).join('；')),{statusCode:400});
+   const now=new Date().toISOString();
+   const saved=saveRouteTopology(store.db,{routeId:route.routeId,mapId:route.mapId,mapVersion:route.mapVersion,topology:body.topology,updated:now});
+   let writtenRoute=route;
+   if(body.savePoints){
+    // 复用现有编译安全门：正交/最短段/最长段/点数/区间数/端点捕获全在这里。
+    const flat=topologyToPoints(body.topology,centers);
+    if(flat.issues.length)throw Object.assign(new Error('拓扑无法展平：'+flat.issues.map(issue=>issue.message).join('；')),{statusCode:400});
+    const choices=topologyStrategyChoices(body.topology);
+    const compiled=compileDesignedRoute(item.map,flat.points,route.bodyYawDeg,choices.choices,route.spacingOverrides);
+    writtenRoute=store.saveRoute({...route,points:flat.points,motionSegments:compiled.map.motionSegments!,mapVersion:route.mapVersion,mapDigest:route.mapDigest,created:route.created,updated:now},route.updated);
+   }
+   log('保存路线拓扑 '+route.routeId+' · '+body.topology.edges.length+' 段'+(body.savePoints?' · 已重写折线':''));
+   return {routeId:route.routeId,mapId:route.mapId,mapVersion:route.mapVersion,stored:true,topology:saved.topology,
+    summary:topologySummary(body.topology,centers),issues:[...report.errors,...report.warnings],
+    strategyChoices:topologyStrategyChoices(body.topology),
+    route:writtenRoute,points:writtenRoute.points,segments:writtenRoute.motionSegments,
+    disclaimer:TOPOLOGY_DISCLAIMER};
+  })();
+ });
+ app.delete<{Params:{id:string}}>('/api/routes/:id/topology',req=>{
+  const route=store.getRoute(req.params.id);if(!route)throw Object.assign(new Error('路径不存在'),{statusCode:404});
+  const removed=deleteRouteTopology(store.db,route.routeId);
+  log('删除路线拓扑 '+route.routeId+' · '+removed+' 条');
+  return {routeId:route.routeId,removed};
  });
  app.post('/api/route/design',req=>{
   const parsed=routeDesignSchema.safeParse(req.body);if(!parsed.success)throw new Error('路径参数无效：mapId、正整数 baseVersion、2–501 个有限坐标 points、-180 到 180 度 bodyYawDeg 必须完整填写');
@@ -402,7 +648,8 @@ export async function createApp(database?:string) {
  app.get('/api/surveys',()=>listSurveys(store));
  app.delete<{Params:{id:string}}>('/api/surveys/:id',req=>{const result=deleteSurvey(store,req.params.id);log('删除扫描记录 '+result.name+' '+result.id);return result;});
  app.post('/api/survey/start',req=>{const {name}=z.object({name:z.string().min(1).max(100)}).parse(req.body);if(surveyId)throw new Error('已有采集任务，请先停止');const session=createSurvey(store,name,listBoards(store));surveyId=session.id;return session;});
- app.get<{Params:{id:string}}>('/api/surveys/:id',req=>getSurvey(store,req.params.id));
+ // 界面详情：summary 模式（有界记录 + 明确标注不完整 + 校验结论标 complete:false）。
+ app.get<{Params:{id:string}}>('/api/surveys/:id',req=>getSurvey(store,req.params.id,'summary'));
  app.post('/api/survey/stop',async req=>{
   const {sessionId}=z.object({sessionId:z.string().optional()}).parse(req.body??{});
   const targetId=sessionId??surveyId;
@@ -439,7 +686,7 @@ export async function createApp(database?:string) {
   return result;
  });
  app.post('/api/survey/map',async req=>{
-  const body=mapOnlyRequestSchema.parse(req.body),session=getSurvey(store,body.sessionId);
+  const body=mapOnlyRequestSchema.parse(req.body),session=getSurvey(store,body.sessionId,'full');
   if(session.state!=="stopped")throw new Error("请先停止扫描，再保存定位码地图");
   const id="scan-"+session.id.replaceAll("-",""),existing=store.get(id);
   if(existing&&existing.map.routeMode!=="map-only")throw Object.assign(new Error("此记录已有旧导航地图，请保留原地图并另建扫描"),{statusCode:409});
@@ -456,17 +703,22 @@ export async function createApp(database?:string) {
   })();
  });
  app.post('/api/survey/draft',req=>{
-  const body=z.object({sessionId:z.string(),tagSizeMm:z.number().min(20).max(180).default(80)}).parse(req.body),session=getSurvey(store,body.sessionId);
+  const body=z.object({sessionId:z.string(),tagSizeMm:z.number().min(20).max(180).default(80)}).parse(req.body),session=getSurvey(store,body.sessionId,'full');
   if(session.state!=='stopped')throw new Error('请先停止扫描，再保存地图草稿');
   const map=pointDraftMap(session,body.tagSizeMm),existing=store.get(map.id);
   const saved=saveMap(map,existing?.version??0);log('保存扫描点位草稿 '+session.id);return saved;
  });
  app.post('/api/survey/optimize',async req=>{const body=z.object({sessionId:z.string(),anchors:z.array(anchorSchema).max(587)}).parse(req.body);const session=getSurvey(store,body.sessionId);if(session.state==='collecting')throw new Error('请先停止扫描再整理记录');const samples=optimizationSamples(session.samples);const result=await optimizeSurvey(root,{samples,anchors:body.anchors});const latest=getSurvey(store,body.sessionId);if(latest.state!=='stopped'||latest.samples.length!==session.samples.length||latest.samples.at(-1)?.stamp!==session.samples.at(-1)?.stamp)throw new Error('整理期间扫描记录发生变化，请重新停止并整理');store.db.prepare('UPDATE survey_sessions SET anchors=?,result=? WHERE id=?').run(JSON.stringify(body.anchors),JSON.stringify(result),body.sessionId);return getSurvey(store,body.sessionId);});
  app.post('/api/workflow/finalize',req=>{
-  const body=scanSettings.parse(req.body),session=getSurvey(store,body.sessionId);
+  const body=scanSettings.parse(req.body);
+  // 建图是**安全校验 + 编译**，必须基于**全量**运动记录：
+  // validateMotionSegments 靠完整时间序列找换挡点，只校验尾部会把早期异常放行成「通过」。
+  // 所以这里显式用 full 模式，而不是界面用的 summary 摘要。
+  const session=getSurvey(store,body.sessionId,'full');
   if(session.state!=='stopped')throw new Error('请先停止扫描，再生成地图');
   if(!session.result)throw new Error('没有已整理的扫描记录');
-  if(!session.motionValidation.ready)throw new Error('区间模式校验未通过，请重新录制：'+[...session.motionValidation.reasons,...session.motionValidation.segments.flatMap(s=>s.reasons)].filter((v,i,a)=>a.indexOf(v)===i).join('；'));
+  if(session.motionTruncated)throw new Error('运动记录未能完整读取，禁止据此处生成地图（会漏检早期异常），请重试或缩小记录规模');
+  if(!session.motionValidation.ready)throw new Error('区间模式校验未通过，请重新录制：'+[...session.motionValidation.reasons,...session.motionValidation.segments.flatMap((s:any)=>s.reasons)].filter((v:string,i:number,a:string[])=>a.indexOf(v)===i).join('；'));
 
   const compiled=compileScan(session.result,body,session.boards,session.samples.flatMap(sample=>sample.tags.map((tag:{id:number})=>tag.id)),session.motionRecords.length?{samples:session.samples,optimizedSamples:optimizationSamples(session.samples),records:session.motionRecords}:undefined);compiled.map.captureQuality=session.captureQuality as 'draft'|'verified';const existing=store.get(compiled.map.id);
   if(existing)throw Object.assign(new Error('此扫描已生成地图，请加载原地图进行确认'),{statusCode:409});

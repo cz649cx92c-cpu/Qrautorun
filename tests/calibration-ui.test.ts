@@ -183,8 +183,11 @@ test('切页保留标定设置：KeepAlive 常驻 + 重新激活不重置本地�
  // 切页离开只停轮询，不重置设置、不发请求。
  assert.ok(workspace.includes('onDeactivated(stopPolling)'),'onDeactivated 只应停止轮询');
  assert.equal(/onDeactivated\([^)]*(selectedMapId|form\.value|trialForm\.value)/.test(workspace),false,'onDeactivated 不得重置设置');
- assert.equal(/localStorage|sessionStorage/.test(workspace),false,'不得用 localStorage/sessionStorage 伪造持久化');
- assert.equal(/localStorage|sessionStorage/.test(app),false,'App.vue 也不得写 localStorage/sessionStorage');
+ assert.equal(/localStorage|sessionStorage/.test(workspace),false,'标定工作区不得用 localStorage/sessionStorage 伪造持久化');
+ // 编辑器布局持久化是明确需求，但它必须由 usePanelLayout 统一负责，
+ // 不能散落在 App.vue 里；App.vue 自身仍然不得直接读写 storage。
+ assert.equal(/localStorage|sessionStorage/.test(app),false,'App.vue 自身不得直接读写 localStorage/sessionStorage（布局持久化走 usePanelLayout）');
+ assert.ok(app.includes('EditorShell'),'布局持久化必须经由 EditorShell/usePanelLayout，而不是在 App.vue 内联');
  // 地图选择被 props.maps 覆盖的兜底不能反过来清空用户选择：只有当前值不在列表里才改。
  assert.ok(workspace.includes('if(!selectedMapId.value||!list.some(map=>map.id===selectedMapId.value))selectedMapId.value=list[0]!.id'),'只有当前选择失效时才回退到第一张地图');
 });

@@ -26,8 +26,8 @@ test('输入目标间距后，画布标注立即变成新值（所见即所得�
  const before=JSON.parse(await page.getByTestId('map-canvas').getAttribute('data-gap-labels')||'[]');
  expect(before.length).toBe(3);
  for(const l of before)expect(l.m).toBeCloseTo(0.532,2);
- // 输入 0.55 但不保存
- await page.getByTestId('map-spacing-target').fill('0.55');
+ // 输入 55 cm 但不保存
+ await page.getByTestId('map-spacing-target').fill('55');
  await page.waitForTimeout(700);
  const after=JSON.parse(await page.getByTestId('map-canvas').getAttribute('data-gap-labels')||'[]');
  for(const l of after)expect(l.m,'预览应立刻反映到画布标注').toBeCloseTo(0.55,2);

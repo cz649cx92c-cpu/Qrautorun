@@ -53,3 +53,16 @@ import './route-leg-distance.test';
 
 import './map-tag-distance.test';
 import './map-inplace.test';
+
+import './map-tag-creation.test';
+import './map-design.test';
+
+import './panel-layout.test';
+import './shortcuts.test';
+import './act-mutex.test';
+import './motion-bound.test';
+import './tag-naming.test';
+import './tag-alias-api.test';
+import './route-topology.test';
+import './route-topology-api.test';
+import './canvas-fit.test';

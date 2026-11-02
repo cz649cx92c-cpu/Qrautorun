@@ -94,8 +94,14 @@ class QrIntervalStartTests(unittest.TestCase):
                      self.pose(along=self.middle,yaw=.11)):
             with self.subTest(pose=pose):
                 with self.assertRaises(ValueError):self.start(pose)
+        # 自用版：人工现场验收已废弃，不再是执行前置（draft 地图也能启动）。
+        # 但它只是「来源标记」，其余真实安全门必须照旧拦截 —— 下面逐项证明。
         unreviewed=copy.deepcopy(self.field);unreviewed['coordinateStatus']='draft'
-        with self.assertRaisesRegex(ValueError,'现场坐标验收'):self.start(self.pose(along=self.middle),unreviewed)
+        self.start(self.pose(along=self.middle),unreviewed)  # 不再因未验收而拒绝
+
+        # 未验收地图 + 真实安全门不满足 → 仍必须拒绝（防止把「去掉验收」变成「放松安全」）。
+        bad_pose=self.pose(along=self.middle,cross=.5)
+        with self.assertRaises(ValueError):self.start(bad_pose,unreviewed)
 
     def test_non_straight_path_does_not_expand_original_start_area(self):
         bent=copy.deepcopy(self.field)

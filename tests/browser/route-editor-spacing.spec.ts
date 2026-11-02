@@ -68,7 +68,7 @@ test('路径编辑内的批量等间距：整排预览与保存',async({page})=>
  await addTags(page,[0,4,8]);
  await expect(page.getByTestId('map-spacing-line')).toContainText('同一水平线');
  await expect(page.getByTestId('map-spacing-gaps')).toContainText('60.0 cm');
- await page.getByTestId('map-spacing-target').fill('0.5');
+ await page.getByTestId('map-spacing-target').fill('50');
  await expect(page.getByTestId('map-spacing-preview')).toContainText('统一等间距');
  await page.getByTestId('map-spacing-save').click();
  await expect.poll(()=>body?.targetM).toBe(0.5);

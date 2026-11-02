@@ -78,10 +78,10 @@ test('共线邻居：按顺序返回同一行、不混入其他行、拐角两�
  // map-only 地图本身不允许带 rowId（mapSchema 会拒绝带导航路径字段的定位码地图），
  // 所以「按行名隔离」在这张图上永远是惰性的：真正挡住相邻行的是几何容差。
  assert.equal(map.tags.every(tag=>tag.rowId===''),true);
- assert.throws(()=>mapSchema.parse({...map,tags:map.tags.map(tag=>({...tag,rowId:'row-1'}))}),/定位码地图需要有效点位/);
+ assert.throws(()=>mapSchema.parse({...map,tags:map.tags.map(tag=>({...tag,rowId:'row-1'}))}),/定位码地图不能包含导航路径或动作/);
  assert.throws(()=>neighborsOnLine(map,999),/不在这张地图中/);
  assert.equal(LINE_TOLERANCE_M,.02);
- assert.equal(MIN_TAG_DISTANCE_M,.08);
+ assert.equal(MIN_TAG_DISTANCE_M,.1);
 });
 
 test('单点改距离：固定 A 只移动 B，读当前/新距离，位移与受影响点可核对',()=>{
@@ -147,9 +147,11 @@ test('单点改距离：跨拐角/非共线、同码、<8cm、未变化一律拒
   assert.equal(tooSmall.ready,false,`targetM=${targetM} 必须拒绝`);
   assert.ok(codes(tooSmall.reasons).some(code=>code==='distance-too-small'||code==='invalid-target'),JSON.stringify(tooSmall.reasons));
  }
+ // 下限已与 validate() 同源（1.25*size 半宽和：两个 80mm 独立码 = 10 cm）。
+ // 8 cm 现在直接落在"小于最小允许值"这一层，不再依赖后续重叠校验兜底。
  const boundary=previewTagDistance(map,{fromId:0,toId:1,targetM:.08});
- assert.equal(boundary.ready,false,'8 cm 恰好等于下限但 8 cm 码仍会压盖，必须由几何校验拦下');
- assert.ok(codes(boundary.reasons).includes('overlap'),JSON.stringify(boundary.reasons));
+ assert.equal(boundary.ready,false,'8 cm 小于与 validate() 同源的下限，必须拒绝');
+ assert.ok(codes(boundary.reasons).includes('distance-too-small'),JSON.stringify(boundary.reasons));
  const unchanged=previewTagDistance(map,{fromId:0,toId:1,targetM:.6});
  assert.equal(unchanged.ready,false); assert.ok(codes(unchanged.reasons).includes('no-changes'));
  const rows=previewTagDistance(rowsMap(),{fromId:0,toId:1,targetM:.5});

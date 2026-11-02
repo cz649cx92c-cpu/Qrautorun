@@ -44,7 +44,11 @@ class Mission:
 
     def start(self,field,task,pose):
         if self.running:raise ValueError('已有任务正在运行')
-        if field.get('coordinateStatus')!='reviewed':raise ValueError('地图未通过现场坐标验收')
+        # 自用版：现场坐标人工验收属已废弃的商业确认流程，不再是执行前置。
+        # 与 localization.py 的「坐标是否已验收只是来源标记」保持同口径。
+        # 其余真实安全门逐项保留（位姿/IMU/相机/底盘反馈/看门狗/急停/接管/
+        # 尺寸扫掠/命令独占/解锁/作用域新鲜度/路径策略/版本摘要一致性）。
+        self.coordinate_reviewed=field.get('coordinateStatus')=='reviewed'
         if not task['rowOrder'] or len(set(task['rowOrder']))!=len(task['rowOrder']):raise ValueError('作业顺序无效')
         self.segment_executor=None
         if field.get('motionSegments'):

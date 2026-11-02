@@ -16,7 +16,25 @@ const emit=defineEmits<{
 
 const active=ref(false),busy=ref(false),error=ref(''),message=ref('');
 const base=ref<FieldMap|null>(null);
-const targetM=ref<number|null>(null);
+// 目标间距以**厘米**录入（与画布上的就地输入框同一单位），
+// 内部一律换算成米交给预览与接口。用字符串草稿而不是数字双向绑定：
+// 数字输入框每次重渲染都会把用户刚敲的字符改写成别的值。
+const targetText=ref<string>('');
+// 只接受字符串草稿：`v-model` 绑在 type="number" 上会被 Vue 自动转成数字，
+// 任何字符串操作都会抛错，进而把整个预览 computed 弄挂、保存按钮静默失效。
+function onTargetInput(event:Event){targetText.value=(event.target as HTMLInputElement).value;}
+const targetM=computed<number|null>({
+ get(){
+  const raw=targetText.value.trim();
+  if(raw==='')return null;
+  const cm=Number(raw);
+  if(!Number.isFinite(cm)||cm<=0)return null;
+  return Number((cm/100).toFixed(4));
+ },
+ set(value){
+  targetText.value=value===null||value===undefined?'':String(Number((value*100).toFixed(1)));
+ }
+});
 const mode=ref<'auto'|'pair'|'spacing'>('auto');
 
 // 基准永远跟随父组件最新地图：保存升版本后必须立即反映新坐标。
@@ -103,12 +121,15 @@ function exit(){
  if(!active.value)return;
  active.value=false;base.value=null;targetM.value=null;error.value='';emit('preview-map',null);emit('editing',false);
 }
+// 以 0.1 cm 精度播种。以前四舍五入到整厘米，53.2 cm 会被写成 53 cm，
+// 于是“用当前值”本身就先改掉了 2 mm，用户看到的就是数字自己变了。
+const seedFrom=(m:number)=>Number((Math.round(m*1000)/1000).toFixed(3));
 function seedIfEmpty(){
  if(targetM.value!==null&&targetM.value!==undefined)return;
  const uniform=uniformGap.value;
  const first=gaps.value[0]?.m;
  const base=uniform??first??null;
- if(base!==null)targetM.value=Math.round(base*100)/100;
+ if(base!==null)targetM.value=seedFrom(base);
 }
 function selectTag(id:number|null){
  if(!active.value)return;
@@ -133,8 +154,7 @@ function selectAllOnLine(){
 function seedTarget(){
  const uniform=uniformGap.value;
  const base=uniform??gaps.value[0]?.m??null;
- // 侧栏只给到厘米精度：填浮点原值会让"看起来没变"变成一次改动。
- targetM.value=base===null?null:Math.round(base*100)/100;
+ targetM.value=base===null?null:seedFrom(base);
 }
 async function save(){
  if(!active.value||props.disabled||busy.value)return;
@@ -152,7 +172,14 @@ async function save(){
   const response=await fetch(`/api/maps/${encodeURIComponent(props.map.id)}/${endpoint}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const result=await response.json();
   if(!response.ok)throw Object.assign(new Error(result.error??'保存新地图版本失败'),{status:response.status});
-  const success=`已保存到地图 v${result.version}（原地更新）`;
+  // 回读服务端真正落库的间距：如果与填写值不同，必须当场说出来，
+  // 而不是复述输入值让现场以为改成功了。
+  const achieved=typeof result.afterM==='number'?result.afterM
+   :typeof result.targetM==='number'?result.targetM:null;
+  const asked=targetM.value;
+  const success=achieved!==null&&asked!==null&&Math.abs(achieved-asked)>0.001
+   ? `已保存到地图 v${result.version}：实际间距 ${(achieved*100).toFixed(1)} cm（填写 ${(asked*100).toFixed(1)} cm）`
+   : `已保存到地图 v${result.version}（原地更新，间距 ${achieved===null?'已写入':(achieved*100).toFixed(1)+' cm'}）`;
   // 不退出调整：现场要连续改多组，保存后立刻能看到新的间距。
   // 基准地图换成新版本，草稿清空，选区保留。
   // 接口回包里就是新版本地图；用它替换基准，gaps 立刻反映新间距。
@@ -170,10 +197,22 @@ async function save(){
 }
 watch([()=>props.map.id],()=>{if(active.value)exit();});
 // 版本变化（保存后升版本）不能退出调整，否则用户刚改完就被踢出面板。
-watch(()=>props.version,(next,prev)=>{if(active.value&&next!==prev)base.value=props.map;});
-watch(()=>props.map,(map)=>{if(active.value)base.value=map;},{deep:false});
+watch(()=>props.version,(next,prev)=>{
+ if(!active.value||next===prev)return;
+ base.value=props.map;targetText.value='';emit('preview-map',null);
+});
+// 父组件换了地图（画布上就地改间距保存成功、或其它面板保存成功）时，
+// 必须同时清空本面板的目标值：否则预览会按**旧目标**重算一遍并把结果
+// 重新 emit 成画布草稿，把刚保存的新间距顶回旧值——这就是
+// “我在这调整 55，应用自己又调回 53”的真实原因。
+watch(()=>props.map,(map,previous)=>{
+ if(!active.value)return;
+ base.value=map;
+ if(previous&&map!==previous){targetText.value='';emit('preview-map',null);}
+},{deep:false});
 watch(()=>props.disabled,disabled=>{if(disabled&&active.value)exit();});
 onBeforeUnmount(()=>{if(active.value){active.value=false;emit('preview-map',null);emit('editing',false);}});
+defineExpose({start,isActive:()=>active.value});
 </script>
 
 <template>
@@ -217,8 +256,9 @@ onBeforeUnmount(()=>{if(active.value){active.value=false;emit('preview-map',null
    </div>
 
    <label v-if="selection.length>=2" class="map-spacing-field">
-    {{effectiveMode==='pair'?'目标中心距离':'统一间距'}} / 米
-    <input type="number" min="0.08" step="0.01" :value="targetM===null||targetM===undefined?'':Number(targetM.toFixed(2))" :disabled="busy" data-testid="map-spacing-target" @input="targetM=($event.target as HTMLInputElement).valueAsNumber"/>
+    {{effectiveMode==='pair'?'目标中心距离':'统一间距'}} / 厘米
+    <input :value="targetText" type="number" min="8" step="0.1" :disabled="busy" data-testid="map-spacing-target" aria-label="目标中心间距（厘米）" @input="onTargetInput"/>
+    <span class="map-spacing-unit" data-testid="map-spacing-target-m">{{targetM===null?'—':targetM.toFixed(3)+' m'}}</span>
     <Button size="sm" variant="outline" :disabled="busy" data-testid="map-spacing-seed" @click.prevent="seedTarget">用当前值</Button>
    </label>
 
@@ -261,7 +301,8 @@ onBeforeUnmount(()=>{if(active.value){active.value=false;emit('preview-map',null
 .map-spacing-gap{display:flex;justify-content:space-between;gap:10px;color:#475569}
 .map-spacing-uniform{margin-top:2px;color:#047857;font-size:11px}
 .map-spacing-field{display:flex;align-items:center;gap:6px;font-size:12px;color:#334155}
-.map-spacing-field input{width:96px;padding:4px 7px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;text-align:right;font-variant-numeric:tabular-nums}
+.map-spacing-field input{width:82px;padding:4px 7px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;text-align:right;font-variant-numeric:tabular-nums}
+.map-spacing-unit{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .map-spacing-preview{padding:6px 8px;border-radius:6px;background:#f8fafc;font-size:11.5px;line-height:1.6;color:#334155}
 .map-spacing-blocked{color:#b91c1c}
 .map-spacing-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}

@@ -38,6 +38,11 @@ async function mock(page:Page,{scan=false,maps=[field(),field('other-distance-ma
   const path=new URL(route.request().url()).pathname;calls.push(path);
   if(path==='/api/camera/status')return route.fulfill({json:{running:true,present:true,frameAgeMs:10,error:''}});
   if(path==='/api/camera/calibration')return route.fulfill({json:{}});
+  // 加载地图后 App 会把定位锚定到该版本（v1 起的真实行为）。不 mock 它，
+  // 这条“所有 API 必须被明确 mock”的守卫就会误报。
+  if(path==='/api/localization/map')return route.fulfill({json:{anchored:true,mapId:route.request().postDataJSON()?.mapId??maps[0]!.id}});
+  // 切换地图后 App 会轮询定位是否已重新锚定（真实行为）。
+  if(path==='/api/localization/scope')return route.fulfill({json:{phase:'anchored'}});
   if(path==='/api/boards')return route.fulfill({json:boards});
   if(path==='/api/routes')return route.fulfill({json:[]});
   if(path==='/api/maps')return route.fulfill({json:maps.map(map=>({id:map.id,name:map.name,version:1}))});
@@ -48,13 +53,35 @@ async function mock(page:Page,{scan=false,maps=[field(),field('other-distance-ma
    if(route.request().method()==='DELETE'){const record=records.get(id);records.delete(id);return route.fulfill({json:{name:record?.name}});}
    const record=records.get(id);if(record)return route.fulfill({json:record});
   }
-  if(path.startsWith('/api/maps/')){const map=maps.find(m=>m.id===path.split('/').at(-1));if(map)return route.fulfill({json:{map,version:1}});}
+  // v15 起页面会加载二维码现场别名（只影响显示）；旧 mock 没覆盖，会被“所有 API 必须被明确 mock”判失败。
+  if(path.endsWith('/tag-aliases'))return route.fulfill({json:{aliases:[]}});
+  if(path.startsWith('/api/maps/')){
+   const id=path.split('/').at(-1)!;
+   const map=maps.find(m=>m.id===id);if(map)return route.fulfill({json:{map,version:1}});
+   // 扫描记录对应的地图：尚未保存时后端就是 404，前端据此显示“未保存地图”。
+   if(id.startsWith('scan-'))return route.fulfill({status:404,json:{error:'地图不存在'}});
+  }
   observed.unexpected.push(path);return route.fulfill({status:404,json:{error:'Unexpected mocked API: '+path}});
  });
  await page.goto('/');
+ // 窄屏下右侧栏被 EditorShell 的响应式布局强制折叠（<1200px）；真实可用的方式是
+ // 先切「右栏浮动」再展开，否则展开会被响应式规则立即折回。这里只按真实 UI 操作，
+ // 不改任何断言；宽屏时该按钮不存在，保持原流程。
+ const expandRight=page.getByTestId('editor-shell-expand-right');
+ let floatedRight=false;
+ if(await expandRight.count()&&await expandRight.first().isVisible()){
+  const floatToggle=page.getByRole('button',{name:'右栏浮动或停靠'});
+  if(await floatToggle.count()&&await floatToggle.first().isVisible()){await floatToggle.first().click();floatedRight=true;}
+  // 浮动模式会自动解除折叠（usePanelLayout setRightFloating），无需再点“展开右栏”。
+ }
  await page.getByTestId('advanced-diagnostics').locator('summary').first().click();
  await expect(page.locator('[data-sensor="preview"]')).toContainText('在线（预览画面）');
  await page.getByTestId('advanced-diagnostics').locator('summary').first().click();
+ // 收起浮动右栏，恢复窄屏默认画布区域，避免遮挡后面的测距交互。
+ if(floatedRight){
+  const collapseRight=page.getByTestId('editor-shell-collapse-right-inline');
+  if(await collapseRight.count()&&await collapseRight.first().isVisible())await collapseRight.first().click();
+ }
  if(scan)await expect(page.getByTestId('capture-state').locator('>span')).toHaveText('已保存');
  else {await page.locator('.sidebar').getByRole('button',{name:'开始导航',exact:true}).click();await expect(page.getByLabel('导航地图')).toHaveValue(maps[0]!.id);}
  await expect(page.getByTestId('map-canvas')).toBeVisible();

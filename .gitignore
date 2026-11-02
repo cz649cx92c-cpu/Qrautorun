@@ -15,3 +15,16 @@ log/
 python_deps/
 test-results/
 # Keep web/frontend/dist/ tracked for ready-to-serve frontend assets.
+
+# 本地调试/迁移临时脚本（不属于产品代码）
+_sync_*.py
+_sync_*.sh
+_*.mjs
+tests/browser/probe*.spec.ts
+tests/browser/dump.spec.ts
+tests/browser/geo375.spec.ts
+*.config.mjs
+verify-print.mjs
+probe_panel.mjs
+maps/*.bak-pre-v5
+maps/*.before-b032

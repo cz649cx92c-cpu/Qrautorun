@@ -56,16 +56,61 @@ export function deleteSurvey(store:Store,id:string){
   return {deleted:true,id:row.id,name:row.name,sampleCount:samples,deletedMaps,deletedVersions,deletedRoutes,deletedTasks};
  })();
 }
-export function getSurvey(store:Store,id:string){
+/**
+ * 界面详情里内联返回的运动记录条数上限。
+ *
+ * 取 2000 条（单条约 250 B，合计约 500 KB）足够界面画轨迹/看最近状态，
+ * 又不至于让响应体失控。线上真实事故：一条 collecting 会话累积了 251 万条 / 665 MB，
+ * 全量读取 + 全量序列化撞 V8 字符串上限，29 秒后 400，期间 Node 事件循环被占满，
+ * 整站接口「假死」。
+ *
+ * **重要边界**：这个上限只用于「界面摘要」。任何**安全校验**（区间模式建图）
+ * 必须走 `full` 模式读全量记录，绝不能只校验尾部——`validateMotionSegments`
+ * 依赖完整时间序列找换挡点（`handoffs` 用 `records.indexOf` 和前后切片），
+ * 只看尾部会把早期异常放行成「校验通过」。这是安全语义，不是性能优化。
+ */
+export const MOTION_DETAIL_LIMIT=2000;
+
+/**
+ * 读取扫描记录。
+ *
+ * @param mode
+ *  - `'summary'`（默认，给界面）：只带最近 MOTION_DETAIL_LIMIT 条运动记录，
+ *    响应里用 `motionTruncated`/`motionNotice` 明确标注「这不是完整历史」，
+ *    并且**不提供可用于验收的 motionValidation**（置 `complete:false`）。
+ *  - `'full'`（给建图/校验等完整消费者）：读全量记录，`motionValidation` 才是
+ *    覆盖整个采集过程的结论。
+ *
+ * 仍未实现的部分：完整历史的**分页读取端点**。`motionNotice` 只承诺
+ * 「完整历史需另行提供」，不承诺已经能分页取回——不要把它当成已有能力。
+ */
+export function getSurvey(store:Store,id:string,mode:'summary'|'full'='summary'){
  const s=store.db.prepare('SELECT * FROM survey_sessions WHERE id=?').get(id) as {id:string,name:string,created:string,state:string,anchors:string,result:string,boards:string}|undefined;
  if(!s)throw Object.assign(new Error('扫描记录不存在'),{statusCode:404});
  const rows=store.db.prepare('SELECT body FROM survey_samples WHERE session_id=? ORDER BY stamp').all(id) as {body:string}[];
- const samples=rows.map(r=>JSON.parse(r.body)),counts:Record<string,number>={},visibility:Record<string,{visible:number,total:number,memberIds:number[]}>={};
+ const samples=rows.map(r=>JSON.parse(r.body)),counts:Record<string,number>={},visibility:Record<string,{visible:number;total:number;memberIds:number[]}>={};
  const boards=groupsSchema.parse(JSON.parse(s.boards));
  for(const sample of samples)for(const tag of sample.tags){counts[tag.id]=(counts[tag.id]??0)+1;const board=boards.find(b=>b.referenceId===tag.id);if(board)visibility[board.id]={visible:tag.visibleCount??0,total:board.members.length,memberIds:tag.memberIds??[]};}
- const motionRecords=(store.db.prepare('SELECT body FROM survey_motion WHERE session_id=? ORDER BY stamp').all(id) as {body:string}[]).map(r=>JSON.parse(r.body));
- const motionValidation=validateMotionSegments(samples,motionRecords);
- return {...s,motionRecords,motionValidation,boards,anchors:JSON.parse(s.anchors),result:s.result?JSON.parse(s.result):null,samples,counts,visibility,captureQuality:samples.some(p=>p.quality==='draft')?'draft':'verified'};
+ const motionTotal=(store.db.prepare('SELECT COUNT(*) AS count FROM survey_motion WHERE session_id=?').get(id) as {count:number}).count;
+ const selectMotion=(limit:number|null)=>limit===null
+  ?(store.db.prepare('SELECT body FROM survey_motion WHERE session_id=? ORDER BY stamp').all(id) as {body:string}[])
+  :(store.db.prepare('SELECT body FROM survey_motion WHERE session_id=? ORDER BY stamp DESC LIMIT ?').all(id,limit) as {body:string}[]).reverse();
+ const motionRecords=selectMotion(mode==='full'?null:MOTION_DETAIL_LIMIT).map(r=>JSON.parse(r.body));
+ const motionTruncated=motionTotal>motionRecords.length;
+ // 只有 full 模式才给出「可用于验收」的校验结论。
+ // summary 模式下即使记录没被截断，也不对外承诺它覆盖了完整过程，
+ // 避免把「界面能看」误当成「安全校验通过」。
+ const motionValidation=validateMotionSegments(samples,mode==='full'?motionRecords:motionRecords);
+ const validationComplete=mode==='full'&&!motionTruncated;
+ const motionNotice=mode==='full'
+  ?undefined
+  :(motionTruncated?`界面摘要只包含最近 ${motionRecords.length} 条运动记录（共 ${motionTotal} 条）；完整历史尚未提供分页读取，请勿以此作为验收依据`
+    :`界面摘要包含全部 ${motionTotal} 条运动记录，但摘要模式的校验结论不用于验收`);
+ return {...s,motionRecords,motionTotal,motionTruncated,
+  ...(motionNotice?{motionNotice}:{}),
+  motionValidation:{...motionValidation,complete:validationComplete,mode},
+  boards,anchors:JSON.parse(s.anchors),result:s.result?JSON.parse(s.result):null,samples,counts,visibility,
+  captureQuality:samples.some(p=>p.quality==='draft')?'draft':'verified'};
 }
 export function appendSamples(store:Store,id:string,raw:unknown){
  const samples=z.array(sampleSchema).min(1).max(500).parse(raw),session=getSurvey(store,id);

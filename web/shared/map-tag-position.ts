@@ -157,7 +157,7 @@ export function previewTagPositions(source: FieldMap, edits: readonly TagPositio
     const validation = validate(parsed.data);
     for (const message of validation.errors) addReason('invalid-geometry', message);
     for (const message of validation.warnings) addNote('warning', message);
-    addNote('version-semantics', '保存将生成新的地图版本；旧版本、旧路线和旧任务的绑定保持不变');
+    addNote('version-semantics', '保存将原地覆盖当前地图版本（版本号不变）；旧路线与旧任务仍绑定该版本');
     if (result.maxDisplacementM > .05) addNote('large-displacement', `最大中心位移 ${(result.maxDisplacementM * 100).toFixed(1)} cm，请目视确认预览`, result.changedIds);
   }
   result.ready = result.reasons.length === 0 && result.changedIds.length > 0 && result.map !== null;

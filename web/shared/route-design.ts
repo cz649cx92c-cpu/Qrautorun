@@ -10,14 +10,64 @@ export function snapRoutePoint(point:Point,centers:Point[],grid=ROUTE_GRID):Poin
 // 1mm：亚毫米级的坐标差（例如两块码的中心差 0.3mm）不应被当成一次拐弯，
 // 否则会插入一个几乎重合的拐角点，使后续按拐角串联定位组时失败。
 const ALIGN_EPS=.001;
+/** 坐标写入精度：所有输出按 1e-6 m 取整，消除浮点尾差。 */
+const COORD_MICRO=1e6;
+const micro=(value:number)=>Math.round(value*COORD_MICRO)/COORD_MICRO;
+
+/**
+ * 把锚点串成正交折线。
+ *
+ * 关键点：**输出必须真正正交**，不能只是"看起来直"。
+ * 之前这里对 ≤ALIGN_EPS 的偏移既不补拐点、也不清零，于是会产出
+ * dx=0.0004 / dy=1.2 这种"近竖直"的斜段；后端按 1e-6 判定就报
+ * 「第 N 段不是正交线段」。所以这里改成：
+ *   1) 小偏差直接吸附到上一段的轴上（清零，而不是保留）；
+ *   2) 输出坐标按 1e-6 取整，保证前后端口径一致。
+ */
 export function orthogonalRoute(anchors:Point[]):Point[] {
  const points:Point[]=[];
- const append=(p:Point)=>{if(!points.length||distance(points.at(-1)!,p)>ALIGN_EPS)points.push({...p});};
- for(const p of anchors){const previous=points.at(-1);
-  if(previous&&Math.abs(p.x-previous.x)>ALIGN_EPS&&Math.abs(p.y-previous.y)>ALIGN_EPS){
-  append(Math.abs(p.x-previous.x)>=Math.abs(p.y-previous.y)?{x:p.x,y:previous.y}:{x:previous.x,y:p.y});
- }append(p);}
+ const push=(p:Point)=>{
+  const snapped={x:micro(p.x),y:micro(p.y)};
+  const last=points.at(-1);
+  if(!last||distance(last,snapped)>ALIGN_EPS)points.push(snapped);
+ };
+ for(const raw of anchors){
+  const point={x:micro(raw.x),y:micro(raw.y)};
+  const previous=points.at(-1);
+  if(!previous){push(point);continue;}
+  const dx=Math.abs(point.x-previous.x),dy=Math.abs(point.y-previous.y);
+  // 落在同一轴附近：吸附到该轴，保证严格水平/垂直（不产生亚毫米斜段）。
+  if(dx<=ALIGN_EPS&&dy<=ALIGN_EPS)continue;
+  if(dy<=ALIGN_EPS){push({x:point.x,y:previous.y});continue;}
+  if(dx<=ALIGN_EPS){push({x:previous.x,y:point.y});continue;}
+  // 真正的斜向移动：按主轴补一个拐角，两段都是严格正交。
+  push(dx>=dy?{x:point.x,y:previous.y}:{x:previous.x,y:point.y});
+  push(point);
+ }
  return points;
+}
+
+/**
+ * 断言并修正一条已经是"逐点折线"的路径，使其每段严格正交。
+ * 用于保存前的最后一道自检：任何 |dx| 与 |dy| 同时 > 1e-6 的段都会被
+ * 补上拐点，而不是被后端拒绝。返回修正后的点集与被修正的段数。
+ */
+export function enforceOrthogonal(points:Point[]):{points:Point[];repaired:number} {
+ const out:Point[]=[];
+ let repaired=0;
+ for(const raw of points){
+  const point={x:micro(raw.x),y:micro(raw.y)};
+  const previous=out.at(-1);
+  if(!previous){out.push(point);continue;}
+  const dx=Math.abs(point.x-previous.x),dy=Math.abs(point.y-previous.y);
+  if(dx<=ALIGN_EPS&&dy<=ALIGN_EPS)continue;
+  if(dy<=ALIGN_EPS){out.push({x:point.x,y:previous.y});continue;}
+  if(dx<=ALIGN_EPS){out.push({x:previous.x,y:point.y});continue;}
+  repaired++;
+  out.push(dx>=dy?{x:point.x,y:previous.y}:{x:previous.x,y:point.y});
+  out.push(point);
+ }
+ return {points:out,repaired};
 }
 // Promote visible automatic corners to editable waypoints when loading a route.
 export function routeCorners(points:Point[]):Point[] {
@@ -33,7 +83,16 @@ export function routeCorners(points:Point[]):Point[] {
 // Editing acquisition and runtime endpoint tolerances are separate. Only exact
 // centers on a continuous orthogonal QR-to-QR chain become execution endpoints.
 export const ROUTE_GROUP_CAPTURE=.10;
+// 两个容差必须分开，不能混用：
+// 1) AXIS_EPS：纯数值比较容差（进度区间开闭、端点是否重合），保持极小。
 const AXIS_EPS=1e-8;
+// 2) COLLINEAR_EPS：判定"两个定位码是否落在同一水平/竖直轴线上"。
+//    这是**测量噪声容差**，不是安全门：现场实测同一标称列内的 x 抖动
+//    可达 5.4e-5 m（浮点与扫描尾差），用 1e-8 会把本该直线串联的相邻码
+//    判成不共线，导致「可直线串联的定位组不足两个」。取 2 mm，比噪声大
+//    一个量级以上，又远小于任何真实斜线偏移（厘米级）。
+//    端点捕获半径 ROUTE_GROUP_CAPTURE=0.10 m 保持不变，那是安全门。
+const COLLINEAR_EPS=2e-3;
 export type RouteGroup=Point&{id:number};
 export type RouteVisit=RouteGroup&{progress:number,error:number};
 export type SkippedRouteGroup=RouteGroup&{distanceM:number};
@@ -83,7 +142,7 @@ export function chainRouteGroups(input:Point[],centers:RouteGroup[]){
  const straight=(a:Hit,b:Hit)=>{
   const dx=b.x-a.x,dy=b.y-a.y;
   if(a.id===b.id||b.progress-a.progress<AXIS_EPS||Math.hypot(dx,dy)<.001)return false;
-  const horizontal=Math.abs(dy)<=AXIS_EPS,vertical=Math.abs(dx)<=AXIS_EPS;
+  const horizontal=Math.abs(dy)<=COLLINEAR_EPS,vertical=Math.abs(dx)<=COLLINEAR_EPS;
   if(!horizontal&&!vertical)return false;
   if(b.progress-a.progress>distance(a,b)+4*ROUTE_GROUP_CAPTURE+AXIS_EPS)return false;
   const drawnDelta=horizontal?b.projected.x-a.projected.x:b.projected.y-a.projected.y;
@@ -122,11 +181,11 @@ export function chainRouteGroups(input:Point[],centers:RouteGroup[]){
  // becoming its own correction boundary.
  const expanded:RouteVisit[]=[];
  for(let i=1;i<nodes.length;i++){
-  const a=nodes[i-1]!,b=nodes[i]!,horizontal=Math.abs(a.y-b.y)<=AXIS_EPS;
+  const a=nodes[i-1]!,b=nodes[i]!,horizontal=Math.abs(a.y-b.y)<=COLLINEAR_EPS;
   if(!expanded.length)expanded.push(a);
   const delta=horizontal?b.x-a.x:b.y-a.y;
   const middle=centers.map(tag=>({tag,fraction:((horizontal?tag.x:tag.y)-(horizontal?a.x:a.y))/delta}))
-   .filter(({tag,fraction})=>fraction>AXIS_EPS&&fraction<1-AXIS_EPS&&Math.abs(horizontal?tag.y-a.y:tag.x-a.x)<=AXIS_EPS)
+   .filter(({tag,fraction})=>fraction>AXIS_EPS&&fraction<1-AXIS_EPS&&Math.abs(horizontal?tag.y-a.y:tag.x-a.x)<=COLLINEAR_EPS)
    .sort((p,q)=>p.fraction-q.fraction||p.tag.id-q.tag.id);
   for(const {tag,fraction} of middle)expanded.push({...tag,progress:a.progress+(b.progress-a.progress)*fraction,error:0});
   expanded.push(b);

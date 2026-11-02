@@ -37,7 +37,9 @@ function currentFor(tag:{id:number,x:number,y:number,angle:number}):TagPositionE
 function applyField(axis:'x'|'y'|'angle',raw:string){
  if(!active.value||!selected.value||props.disabled)return;
  const value=Number(raw);
- if(!Number.isFinite(value)){error.value='请输入有限数值';return;}
+ // 输入过程中的 "0."、"-"、"" 都是合法的中间态：静默忽略，绝不报错。
+ // 以前用 @change 提交，敲完字没失焦就不算改动，保存按钮一直是灰的。
+ if(!Number.isFinite(value))return;
  const tag=selected.value,cur=currentFor(tag),next={...cur,[axis]:value};
  if(same(cur,next))return;
  error.value='';commit({...edits.value,[tag.id]:next});
@@ -73,15 +75,21 @@ async function save(){
   const response=await fetch(`/api/maps/${encodeURIComponent(props.map.id)}/tag-positions`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({baseVersion:props.version,tags:Object.values(edits.value)})});
   const result=await response.json();
   if(!response.ok)throw Object.assign(new Error(result.error??'保存新地图版本失败'),{status:response.status});
-  const success=`已保存为地图版本 v${result.version}`;
-  deactivate();message.value=success;emit('applied',result);
+  // 不退出调整：现场要连着挪好几个码，保存后立刻能在画布上看到新坐标。
+  // 基准换成新版本地图，草稿清空，选区保留。
+  base.value=result.map??props.map;
+  edits.value={};history.value=[];
+  message.value=`已保存到地图 v${result.version}（原地更新）`;
+  emit('preview-map',null);emit('applied',result);
  }catch(reason){
   error.value=reason instanceof Error&&'status' in reason&&Number((reason as {status?:number}).status)===409?'地图版本已变化，未保存任何改动；请重新加载最新版本后再调整':reason instanceof Error?reason.message:String(reason);
  }finally{busy.value=false;}
 }
 // Editing state can never survive switching the loaded map/version: a stale draft
 // must not be applied to another base version.
-watch([()=>props.map.id,()=>props.version],()=>{if(active.value)deactivate();});
+// 地图 id 变了才必须退出（草稿属于另一张图）；版本号变化只是基准更新。
+watch(()=>props.map.id,()=>{if(active.value)deactivate();});
+watch(()=>props.map,(map)=>{if(active.value&&map.id===props.map.id)base.value=map;},{deep:false});
 watch(()=>props.disabled,disabled=>{if(disabled&&active.value)deactivate();});
 onBeforeUnmount(()=>{if(active.value){active.value=false;emit('preview-map',null);emit('editing',false);}});
 function moveTags(ids:number[],dx:number,dy:number){
@@ -92,28 +100,28 @@ function moveTags(ids:number[],dx:number,dy:number){
  const cur=currentFor(tag);
  commit({...edits.value,[id]:{...cur,x:Math.round((cur.x+dx)*1e6)/1e6,y:Math.round((cur.y+dy)*1e6)/1e6}});
 }
-defineExpose({selectTag,moveTags,reset:deactivate});
+defineExpose({selectTag,moveTags,reset:deactivate,activate,isActive:()=>active.value});
 </script>
 
 <template>
- <div v-if="map.routeMode==='map-only'" class="tag-position" data-testid="tag-position-panel" :data-map-version="version">
+ <div v-if="map.routeMode==='map-only'" class="tag-position" data-testid="tag-position-panel" :data-map-version="version" :data-active="active?'1':'0'">
   <div class="tag-position-head"><strong><Crosshair :size="15"/> 调整二维码位置</strong><span class="tag-position-version">基准版本 v{{version}}</span></div>
-  <p class="tag-position-disclaimer" data-testid="tag-position-disclaimer">{{TAG_POSITION_DISCLAIMER}}保存后旧版本、旧路线和旧任务保持不变，不会自动迁移。</p>
+  <p class="tag-position-disclaimer" data-testid="tag-position-disclaimer">{{TAG_POSITION_DISCLAIMER}}保存是<b>原地覆盖当前版本</b>（版本号不变），不会堆出新版本；旧路线与旧任务仍绑定这一版。</p>
   <div class="tag-position-actions">
    <Button v-if="!active" size="sm" variant="outline" :disabled="disabled||busy" data-testid="tag-position-toggle" @click.prevent="activate">开始调整点位</Button>
    <template v-else>
     <Button size="sm" variant="ghost" :disabled="busy" data-testid="tag-position-exit" @click.prevent="deactivate">退出调整</Button>
     <Button size="sm" variant="outline" :disabled="busy||!history.length" data-testid="tag-position-undo" @click.prevent="undo"><Undo2 :size="14"/>撤销</Button>
     <Button size="sm" variant="outline" :disabled="busy||!editList.length" data-testid="tag-position-reset" @click.prevent="restoreInitial"><RotateCcw :size="14"/>恢复初始位置</Button>
-    <Button size="sm" :disabled="busy||disabled||!preview?.ready" data-testid="tag-position-save" @click.prevent="save"><Save :size="14"/>{{busy?'正在保存…':'保存为新地图版本'}}</Button>
+    <Button size="sm" :disabled="busy||disabled||!preview?.ready" data-testid="tag-position-save" @click.prevent="save"><Save :size="14"/>{{busy?'正在保存…':'保存到当前地图 v'+version}}</Button>
    </template>
   </div>
   <template v-if="active">
    <label class="tag-position-select">定位码<select :value="selectedTagId??''" :disabled="busy" data-testid="tag-position-select" @change="selectTag(($event.target as HTMLSelectElement).value===''?null:Number(($event.target as HTMLSelectElement).value))"><option value="">请选择二维码</option><option v-for="tag in orderedTags" :key="tag.id" :value="tag.id">{{tagPositionLabel(tag)}}{{tag.groupId?' · 整组中心':' · 独立码'}}</option></select></label>
    <div v-if="selected&&current" class="tag-position-fields" data-testid="tag-position-fields">
-    <label>中心 X / m<input type="number" step="0.001" :value="current.x" :disabled="busy" data-testid="tag-position-x" @change="applyField('x',($event.target as HTMLInputElement).value)"/></label>
-    <label>中心 Y / m<input type="number" step="0.001" :value="current.y" :disabled="busy" data-testid="tag-position-y" @change="applyField('y',($event.target as HTMLInputElement).value)"/></label>
-    <label>朝向 / °<input type="number" step="0.1" :value="current.angle" :disabled="busy" data-testid="tag-position-angle" @change="applyField('angle',($event.target as HTMLInputElement).value)"/></label>
+    <label>中心 X / m<input type="number" step="0.001" :value="current.x" :disabled="busy" data-testid="tag-position-x" @input="applyField('x',($event.target as HTMLInputElement).value)"/></label>
+    <label>中心 Y / m<input type="number" step="0.001" :value="current.y" :disabled="busy" data-testid="tag-position-y" @input="applyField('y',($event.target as HTMLInputElement).value)"/></label>
+    <label>朝向 / °<input type="number" step="0.1" :value="current.angle" :disabled="busy" data-testid="tag-position-angle" @input="applyField('angle',($event.target as HTMLInputElement).value)"/></label>
    </div>
    <p class="tag-position-hint">画布上直接拖动选中的二维码即可；整组定位板只移动组中心，成员按原布局刚性跟随（朝向输入会刚性旋转整组）。</p>
    <div v-if="error" class="tag-position-alert error" role="alert" data-testid="tag-position-error"><AlertTriangle :size="15"/>{{error}}</div>

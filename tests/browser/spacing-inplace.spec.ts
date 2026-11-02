@@ -28,8 +28,9 @@ test('选中后自动带出当前间距，保存按钮不再灰',async({page})=>
  await boot(page);
  for(const id of refs){await page.getByTestId('map-spacing-add').selectOption(String(id));await page.waitForTimeout(200);}
  const val=await page.getByTestId('map-spacing-target').inputValue();
- expect(val,'应自动填入当前间距').not.toBe('');
- expect(Number(val)).toBeCloseTo(0.53,2);
+ expect(val,'应自动填入当前间距（厘米）').not.toBe('');
+ expect(Number(val)).toBeCloseTo(53.2,1);
+ await expect(page.getByTestId('map-spacing-target-m')).toContainText('0.532 m');
  await expect(page.getByTestId('map-spacing-save')).toBeEnabled();
 });
 
@@ -42,7 +43,7 @@ test('保存是原地更新：版本号不变，按钮文案写明当前版本',
  await boot(page);
  for(const id of refs){await page.getByTestId('map-spacing-add').selectOption(String(id));await page.waitForTimeout(200);}
  await expect(page.getByTestId('map-spacing-save')).toContainText('保存到当前地图 v8');
- await page.getByTestId('map-spacing-target').fill('0.55');
+ await page.getByTestId('map-spacing-target').fill('55');
  await page.waitForTimeout(300);
  await page.getByTestId('map-spacing-save').click();
  await expect.poll(()=>body?.targetM).toBe(0.55);

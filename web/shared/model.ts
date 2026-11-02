@@ -18,7 +18,9 @@ export const motionSegmentSchema=z.object({id:z.string().min(1).max(80),fromId:z
 // 仍由 config/navigation.yaml 与底盘反馈决定。
 export const vehicleFootprintM = {length:0.46,width:0.36} as const;
 export const mapSchema = z.object({schemaVersion:z.literal(1),id:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/),name:z.string().min(1).max(100),frame:z.literal('map'),family:z.literal('tag36h11'),source:z.enum(['design','survey']),coordinateStatus:z.enum(['draft','reviewed']).default('draft'),captureQuality:z.enum(['verified','draft']).optional(),routeMode:z.enum(['rows','waypoints','map-only']).optional(),motionSegments:z.array(motionSegmentSchema).min(1).max(100).optional(),rows:z.array(rowSchema).max(100),tags:z.array(tagSchema).max(587),groups:groupsSchema.optional(),order:z.array(z.string()).max(100),zone:z.array(pointSchema).length(4),vehicle:z.object({width:z.number().min(0.1).max(1),length:z.number().min(0.2).max(3),margin:z.number().min(0.01).max(0.1)}),notes:z.string().max(2000).default('')}).superRefine((map,ctx)=>{
- if(map.routeMode==='map-only'&&(map.rows.length||map.order.length||map.motionSegments||map.tags.length===0||map.tags.some(t=>t.rowId||t.rules.length)))ctx.addIssue({code:z.ZodIssueCode.custom,message:'定位码地图需要有效点位且不能包含导航路径或动作'});
+ // 允许"空点位草稿"：现场先在图上新建二维码再逐步铺满，不能因为还没有点就拒绝保存。
+ // 但定位码地图仍不得包含导航路径/行/动作，且真正导航会在 /api/navigation/start 与 mapApproval 处被拦。
+ if(map.routeMode==='map-only'&&(map.rows.length||map.order.length||map.motionSegments||map.tags.some(t=>t.rowId||t.rules.length)))ctx.addIssue({code:z.ZodIssueCode.custom,message:'定位码地图不能包含导航路径或动作'});
  if(map.motionSegments){
   if(map.routeMode!=='waypoints'||map.rows.length!==1)ctx.addIssue({code:z.ZodIssueCode.custom,message:'区间路线必须是一条办公室路径'});
   const ids=new Set<string>();
@@ -74,7 +76,8 @@ function segmentDistance(p:Point,a:Point,b:Point) {const d=distance(a,b)**2; con
 export function validate(map:FieldMap):{errors:string[],warnings:string[]} {
  const errors:string[]=[],warnings:string[]=[]; const ids=new Set<number>(), rows=new Set<string>();
  if(map.routeMode==='map-only'){
-  if(map.tags.length===0)errors.push('定位码地图没有有效点位');
+  // 空点位只作为草稿提示：建图阶段允许从零开始铺码。
+  if(map.tags.length===0)warnings.push('地图尚无二维码点位：请先在地图上新建二维码后再编辑路径');
   const area=map.zone.reduce((a,p,i)=>{const q=map.zone[(i+1)%map.zone.length]!;return a+p.x*q.y-q.x*p.y;},0);
   if(Math.abs(area)<1e-8)errors.push('地图显示范围不能退化为零面积');
  }else if(!map.rows.length) errors.push('地图至少需要一条作物行');

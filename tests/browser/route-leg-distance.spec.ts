@@ -69,7 +69,8 @@ test('路径步骤「距离/m」可编辑：改路段距离后路径点随之重
  await expect(first).toHaveValue(/0\.9/);
  const panelText=await page.getByTestId('route-steps-popover').innerText();
  expect(panelText).not.toContain('X ');
- await expect(page.getByTestId('tag-position-panel')).toHaveCount(0);
+ // 位置调整面板常驻在工具列里，但路径编辑期间绝不能处于编辑态。
+ await expect(page.getByTestId('tag-position-panel')).toHaveAttribute('data-active','0');
  await page.getByRole('button',{name:'保存路径',exact:true}).click();
  await expect.poll(()=>body?.points?.length).toBeGreaterThan(1);
  const pts=body.points.map((p:any)=>({x:Number(p.x.toFixed(3)),y:Number(p.y.toFixed(3))}));

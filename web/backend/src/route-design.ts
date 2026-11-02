@@ -9,7 +9,11 @@ export const routeDesignSchema=z.object({
  points:z.array(pointSchema).min(2).max(501),bodyYawDeg:z.number().finite().min(-180).max(180),initialHeadingRad:z.number().finite().min(-Math.PI).max(Math.PI).nullable().optional(),routeId:z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/).optional(),routeName:z.string().trim().min(1).max(100).optional(),saveAs:z.boolean().default(false),routeUpdated:z.string().datetime().optional(),distanceModel:z.literal('center-euclidean').default('center-euclidean'),spacingOverrides:z.array(z.object({fromId:z.number().int().min(0).max(586),toId:z.number().int().min(0).max(586),occurrence:z.number().int().positive().default(1),targetM:z.number().finite().min(.08).max(50)})).max(100).optional()
 }).extend({segmentModes:z.array(segmentChoiceSchema).max(100).optional()}).strict();
 const wrap=(a:number)=>Math.atan2(Math.sin(a),Math.cos(a));
-const EPS=1e-8;
+// 正交判定容差：与坐标写库精度一致（全部坐标按 1e-6 m 取整）。
+// 前端 orthogonalRoute/enforceOrthogonal 已保证输出严格正交，
+// 这里留 1e-6 只是为了容纳 JSON 往返的浮点尾差；真实斜线的
+// dx、dy 都是厘米级以上，1e-6 仍然拦得住，不是放宽安全门。
+const EPS=1e-6;
 
 export function validateSpacingOverrides(source:FieldMap, overrides:any[]){ const ids=new Set(source.tags.map(t=>t.id)); const seen=new Set<string>(); for(const o of overrides??[]){ if(!ids.has(o.fromId)||!ids.has(o.toId)||o.fromId===o.toId)throw new Error('间距二维码必须存在且不同'); const k=`${o.fromId}>${o.toId}#${o.occurrence??1}`; if(seen.has(k))throw new Error('重复间距覆盖必须指定不同 occurrence'); seen.add(k); const d=Math.hypot((source.tags.find(t=>t.id===o.toId)!.x-source.tags.find(t=>t.id===o.fromId)!.x),(source.tags.find(t=>t.id===o.toId)!.y-source.tags.find(t=>t.id===o.fromId)!.y)); if(d<.08||o.targetM<.08)throw new Error('二维码物理间距不得小于8厘米'); } return true; }
 
@@ -18,9 +22,28 @@ export function compileDesignedRoute(source:FieldMap,input:Point[],bodyYawDeg:nu
  if(input.length<2||input.length>501)throw new Error('路径需要 2–501 个控制点');
  const raw=input.map(p=>pointSchema.parse(p));
  validateSpacingOverrides(source,spacingOverrides);
- // Route-level distance overrides move only the selected endpoint along its existing
- // segment axis; map tag centres remain immutable.
- for(const ov of spacingOverrides??[]){ const idx=raw.findIndex(p=>p.x===source.tags.find(t=>t.id===ov.toId)?.x&&p.y===source.tags.find(t=>t.id===ov.toId)?.y); const from=source.tags.find(t=>t.id===ov.fromId),to=source.tags.find(t=>t.id===ov.toId); if(idx>=0&&from&&to){const d=Math.hypot(to.x-from.x,to.y-from.y);if(d<.08)throw new Error('相邻二维码物理间距不足8厘米'); const ux=(to.x-from.x)/d,uy=(to.y-from.y)/d;raw[idx]={x:from.x+ux*ov.targetM,y:from.y+uy*ov.targetM};}}
+ // 间距覆盖：只沿该段**既有轴向**移动终点（水平改 x / 竖直改 y）。
+ // 绝不能沿"两码心连线方向"移动——实测码心连线本身带 5e-5 量级的横向抖动，
+ // 沿它移动会把终点推出轴向，随即被下面的正交判定拒绝（v15 的真实 bug）。
+ // 目标值仍是"两码中心距离"：轴向分量 = targetM，横向偏差保持原样，
+ // 因此真实中心距与 targetM 的差在 1e-10 量级，可忽略。
+ // 终点匹配用 1e-4 容差（同列实测抖动最大 5.4e-5，最小码距 8e-2，1e-4 居中）；
+ // 匹配不到就明确报错，不再静默丢弃（否则用户填的间距会被无声忽略）。
+ const MATCH_EPS=1e-4;
+ for(const ov of spacingOverrides??[]){
+  const from=source.tags.find(t=>t.id===ov.fromId),to=source.tags.find(t=>t.id===ov.toId);
+  if(!from||!to)continue;
+  const idx=raw.findIndex(p=>Math.abs(p.x-to.x)<=MATCH_EPS&&Math.abs(p.y-to.y)<=MATCH_EPS);
+  if(idx<0)throw new Error(`间距覆盖的终点 Q${ov.toId} 不在当前路径上（路径点已改动，请重新选择该段）`);
+  const dx=to.x-from.x,dy=to.y-from.y;
+  if(Math.hypot(dx,dy)<.08)throw new Error('相邻二维码物理间距不足8厘米');
+  if(Math.abs(dy)<=Math.abs(dx)){
+   // 水平段：按 x 轴向移动，保持 y 不变（y 的残余抖动留给后面的吸轴处理）
+   raw[idx]={x:from.x+Math.sign(dx||1)*ov.targetM,y:raw[idx]!.y};
+  }else{
+   raw[idx]={x:raw[idx]!.x,y:from.y+Math.sign(dy||1)*ov.targetM};
+  }
+ }
 
  for(let i=1;i<raw.length;i++){
   const a=raw[i-1]!,b=raw[i]!;

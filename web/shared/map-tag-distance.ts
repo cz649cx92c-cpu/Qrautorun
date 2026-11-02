@@ -24,7 +24,17 @@ export interface MetreTriple {m: number; cm: number; mm: number}
 /** Default collinearity tolerance: 2 cm, i.e. roughly one printed board radius. */
 export const LINE_TOLERANCE_M = 0.02;
 /** Hard minimum centre-to-centre pitch: 8 cm. */
-export const MIN_TAG_DISTANCE_M = 0.08;
+// 最小中心间距必须与 validate() 的重叠判定同源，否则"批量铺码"会被自家校验判成压盖。
+// validate() 用 ((k_i*size_i)+(k_j*size_j))/2，k=1（组中心）/1.25（独立码）。
+// 两个独立 80mm 码 → 1.25*0.08 = 0.10 m。这里按最常见的独立码给出下限，
+// 同时导出 minCenterGapM() 让调用方按实际 size 精确计算。
+export const TAG_OVERLAP_FACTOR_GROUP = 1;
+export const TAG_OVERLAP_FACTOR_SOLO = 1.25;
+export const MIN_TAG_DISTANCE_M = (TAG_OVERLAP_FACTOR_SOLO * 0.08);
+export function minCenterGapM(sizeA: number, sizeB: number, groupA = false, groupB = false): number {
+ return ((groupA ? TAG_OVERLAP_FACTOR_GROUP : TAG_OVERLAP_FACTOR_SOLO) * sizeA
+  + (groupB ? TAG_OVERLAP_FACTOR_GROUP : TAG_OVERLAP_FACTOR_SOLO) * sizeB) / 2;
+}
 export const TAG_DISTANCE_DISCLAIMER = '二维码间距调整为人工修正，不代表外部实测精度已验收。';
 
 const micro = (value: number) => Math.round(value * 1e6) / 1e6;
@@ -333,7 +343,7 @@ export function previewTagDistance(source: FieldMap, request: TagDistanceRequest
       addReason(message.includes('重叠') ? 'overlap' : 'invalid-geometry', message, issueIds(message));
     }
     for (const message of validation.warnings) addNote('warning', message);
-    addNote('version-semantics', '保存将生成新的地图版本；旧版本、旧路线和旧任务的绑定保持不变');
+    addNote('version-semantics', '保存将原地覆盖当前地图版本（版本号不变）；旧路线与旧任务仍绑定该版本');
     if (result.maxDisplacementM > .05) {
       addNote('large-displacement', `最大中心位移 ${(result.maxDisplacementM * 100).toFixed(1)} cm，请目视确认预览`, result.changedIds);
     }
@@ -565,7 +575,7 @@ export function previewEqualSpacing(source: FieldMap, request: EqualSpacingReque
       addReason(message.includes('重叠') ? 'overlap' : 'invalid-geometry', message, issueIds(message));
     }
     for (const message of validation.warnings) addNote('warning', message);
-    addNote('version-semantics', '保存将生成新的地图版本；旧版本、旧路线和旧任务的绑定保持不变');
+    addNote('version-semantics', '保存将原地覆盖当前地图版本（版本号不变）；旧路线与旧任务仍绑定该版本');
     if (result.maxDisplacementM > .05) {
       addNote('large-displacement', `最大中心位移 ${(result.maxDisplacementM * 100).toFixed(1)} cm，请目视确认预览`, result.changedIds);
     }

@@ -50,7 +50,11 @@ button.rounded-lg{border-radius:6px;font-size:13px;font-weight:500;box-shadow:no
 .app-shell.is-route-editing .page-heading p,.app-shell.is-route-editing .global-task{display:none}
 .app-shell.is-route-editing .editor-body{flex:1;min-height:0;flex-wrap:nowrap}
 .app-shell.is-route-editing .canvas-section{position:relative;flex:1;min-height:0;height:100%;overflow:hidden}
-.app-shell.is-route-editing .canvas-section>.canvas-toolbar,.app-shell.is-route-editing .canvas-section>.legend{display:none}
+.app-shell.is-route-editing .canvas-section>.legend{display:none}
+/* 路径编辑态仍要保留面板布局工具条：底部「路径步骤」栏正是这时候需要收起/展开的。
+   其余工具按钮在编辑态由 route-editor 自己的动作行提供，所以只隐藏它们。 */
+.app-shell.is-route-editing .canvas-section>.canvas-toolbar{display:flex;padding:0;min-height:0;background:transparent;gap:0}
+.app-shell.is-route-editing .canvas-section>.canvas-toolbar>*:not(.editor-layout-tools){display:none}
 .app-shell.is-route-editing .route-editor{position:static;height:52px;max-height:none;flex:0 0 52px;padding:8px;overflow:visible}
 .app-shell.is-route-editing .route-editor-actions{display:flex;align-items:center;flex-wrap:nowrap;gap:6px;height:36px}
 .app-shell.is-route-editing .route-editor-actions button{flex-shrink:0;padding:0 9px;min-height:32px}
@@ -61,7 +65,7 @@ button.rounded-lg{border-radius:6px;font-size:13px;font-weight:500;box-shadow:no
 .app-shell.is-route-editing .route-waypoints{flex-wrap:wrap;flex-direction:column;overflow:visible;max-height:none}
 .app-shell.is-route-editing .route-skipped-groups{overflow:visible;max-height:none}
 .app-shell.is-route-editing .route-more-content{display:block}.app-shell.is-route-editing .route-more-actions{flex-wrap:wrap;margin:8px 0 0}
-.route-toast{position:absolute;z-index:15;left:12px;bottom:36px;max-width:calc(100% - 24px);padding:6px 10px;border:1px solid #bbf7d0;border-radius:6px;background:#f0fdf4;color:#15803d;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+.route-toast{position:static;z-index:auto;left:auto;bottom:auto;width:100%;max-width:100%;box-sizing:border-box;margin:2px 0 0;padding:5px 9px;border:1px solid #bbf7d0;border-radius:6px;background:#f0fdf4;color:#15803d;font-size:11px;line-height:1.5;white-space:normal;overflow:visible;text-overflow:clip;pointer-events:none}
 .route-toast-error{border-color:#fecaca;background:#fef2f2;color:#b91c1c}
 .app-shell.is-route-editing .route-editor-actions button[aria-pressed="true"]{color:white;background:var(--accent);border-color:var(--accent)}
 @media(max-width:760px){
@@ -121,13 +125,16 @@ button.rounded-lg{border-radius:6px;font-size:13px;font-weight:500;box-shadow:no
 }
 /* Route steps popover: anchor to the editing canvas, not the trigger flow box. */
 .app-shell.is-route-editing .route-steps-entry{position:static;z-index:30}
-.app-shell.is-route-editing .route-steps-popover{position:fixed;z-index:80;left:auto;right:12px;top:auto;bottom:12px;width:min(760px,calc(100vw - 24px));max-height:min(70dvh,560px);overflow:hidden}
+/* 路径步骤：停靠在底部面板内部（不再 fixed 浮在视口右下角）。
+   高度由 App.vue 的 routeStepsDockHeight 内联控制，用户可拖分隔条调整；
+   这里只保证「不脱离文档流、不遮挡画布与触发器」。 */
+.app-shell.is-route-editing .route-steps-popover{position:static;z-index:auto;left:auto;right:auto;top:auto;bottom:auto;width:auto;max-width:none;overflow:hidden}
 .app-shell.is-route-editing .route-steps-popover .route-commands-scroll{min-height:0;overflow:auto;overscroll-behavior:contain}
 .app-shell.is-route-editing .route-steps-popover .route-commands-head{flex-shrink:0}
 @media(max-width:940px){.app-shell.is-route-editing .route-steps-popover{right:12px;bottom:12px;width:min(640px,calc(100vw - 24px));max-height:min(62dvh,480px)}}
 @media(max-width:760px){.app-shell.is-route-editing .route-steps-popover{left:12px;right:12px;bottom:12px;top:auto;width:auto;max-height:min(56dvh,420px);border-radius:10px}.app-shell.is-route-editing .route-steps-popover .route-commands-scroll{max-height:none}.app-shell.is-route-editing .route-steps-close{position:relative;z-index:2}}
 /* Route steps popover affordances: constrained native resize and visible grip. */
-.app-shell.is-route-editing .route-steps-popover{min-width:280px;min-height:160px;max-width:calc(100vw - 24px);max-height:min(70dvh,560px);cursor:default;overscroll-behavior:contain}
+.app-shell.is-route-editing .route-steps-popover{min-width:0;min-height:0;max-width:none;max-height:none;cursor:default;overscroll-behavior:contain}
 .app-shell.is-route-editing .route-steps-popover .route-commands-head:first-child{cursor:move;user-select:none}
 .app-shell.is-route-editing .route-steps-popover .route-commands-scroll{flex:1 1 auto;min-height:0;min-width:0;overflow:auto;scrollbar-gutter:stable}
 @media(max-width:760px){.app-shell.is-route-editing .route-steps-popover{min-width:0;min-height:160px;max-width:calc(100vw - 24px)}.app-shell.is-route-editing .route-steps-popover .route-commands-scroll{flex:1 1 auto;min-height:0}}

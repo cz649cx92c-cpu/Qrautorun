@@ -66,7 +66,8 @@ test('路径编辑二维码间距：相邻两码中心距离可读可改，保�
  await expect(panel).toContainText('中心欧氏距离');
  await expect(panel).toContainText('cm');
  await expect(panel).toContainText('mm');
- await expect(page.getByTestId('tag-position-panel')).toHaveCount(0);
+ // 位置调整面板常驻在工具列里，但路径编辑期间绝不能处于编辑态。
+ await expect(page.getByTestId('tag-position-panel')).toHaveAttribute('data-active','0');
  await panel.getByLabel('目标距离（米）').fill('1.5');
  await panel.getByRole('button',{name:'预览间距'}).click();
  await expect(page.getByTestId('route-distance-preview')).toContainText('1.500');

@@ -36,7 +36,7 @@ test('保存后保持调整模式，间距与标注立即变成新值',async({pa
  // 保存前：约 53 cm（自动填值会取整到厘米，因此不写死 53.2）
  const before=await page.getByTestId('map-spacing-gaps').innerText();
  expect(before).toMatch(/53(\.\d)? cm/);
- await page.getByTestId('map-spacing-target').fill('0.55');
+ await page.getByTestId('map-spacing-target').fill('55');
  await page.waitForTimeout(250);
  await page.getByTestId('map-spacing-save').click();
  await page.waitForTimeout(1500);
