@@ -183,7 +183,7 @@ class Tracker:
         self.previous_speed = value
         return value
 
-    def forward(self, pose, points, target, dt, profile=None, cross_override=None, stop_delay=0.):
+    def forward(self, pose, points, target, dt, profile=None, cross_override=None, stop_delay=0., anchor_lookahead=None):
         cross, tangent, remaining, end_distance, curvature = geometry(pose, points, include_curvature=True)
         # 横向反馈只允许一个来源：QR 失联时由调用方给入 DR 预测 cross，避免 fused/DR 两套叠加。
         cross_steer = cross if cross_override is None else cross_override
@@ -192,7 +192,14 @@ class Tracker:
         target, acceleration, braking = recorded_speed_plan(pose, points, target, trial, self.acceleration, self.braking, stop_delay)
         v = self.limit(target, remaining, dt, acceleration, braking, stop_delay)
         # 前进：航向与车体侧偏都用负反馈。
-        yaw_rate = v*curvature - 1.8*heading_error - 1.5*cross_steer
+        if anchor_lookahead is None:
+            yaw_rate = v*curvature - 1.8*heading_error - 1.5*cross_steer
+        else:
+            # Bounded travel-heading reference: approach the anchored route
+            # smoothly instead of balancing cross error against near-zero yaw.
+            reference = max(-math.radians(6.), min(math.radians(6.),
+                            -math.atan2(cross_steer, max(.25, anchor_lookahead))))
+            yaw_rate = v*curvature - 1.8*wrap(heading_error-reference)
         # Bound the actual body turn command before applying a slew limit.
         # A QR position correction must not become an instantaneous steering step.
         bound = min(trial['maxYawRate'],abs(v)*trial['maxCurvature']) if trial else min(.25,abs(v)*.6)
@@ -204,7 +211,7 @@ class Tracker:
         self.previous_forward_yaw_rate = yaw_rate
         return Command(vx=v,yaw_rate=yaw_rate), cross, heading_error, remaining, end_distance
 
-    def reverse(self, pose, reverse_points, target, dt, profile=None, stop_delay=0.):
+    def reverse(self, pose, reverse_points, target, dt, profile=None, stop_delay=0., cross_override=None, anchor_lookahead=None):
         cross, travel_tangent, remaining, end_distance, curvature = geometry(pose, reverse_points, include_curvature=True)
         body_target = wrap(travel_tangent + math.pi)
         heading_error = wrap(pose.yaw - body_target)
@@ -213,7 +220,13 @@ class Tracker:
         speed = self.limit(target, remaining, dt, acceleration, braking, stop_delay)
         # Both cross and curvature follow the reversed travel direction. Body
         # yaw stays aligned with the original forward route, without a U-turn.
-        desired = speed*curvature - 1.8*heading_error - 1.5*cross
+        cross_steer = cross if cross_override is None else cross_override
+        if anchor_lookahead is None:
+            desired = speed*curvature - 1.8*heading_error - 1.5*cross_steer
+        else:
+            reference = max(-math.radians(6.), min(math.radians(6.),
+                            -math.atan2(cross_steer, max(.25, anchor_lookahead))))
+            desired = speed*curvature - 1.8*wrap(heading_error-reference)
         bound = min(trial['maxYawRate'],speed*trial['maxCurvature']) if trial else min(.25,speed*.6)
         desired = max(-bound,min(bound,desired))
         step = (trial['yawAcceleration'] if trial else .15)*max(0.,min(.1,dt))

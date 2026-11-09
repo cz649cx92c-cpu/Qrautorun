@@ -1,0 +1,42 @@
+{
+  "sourceRun": "run-20261109T145742",
+  "kind": "open_loop_recorded_pose_command_check_not_closed_loop_accuracy",
+  "segments": [
+    {
+      "seg": 2,
+      "samples": 166,
+      "maxYawRate": 0.048,
+      "boundsPassed": true
+    },
+    {
+      "seg": 3,
+      "samples": 163,
+      "maxYawRate": 0.047091655946959986,
+      "boundsPassed": true
+    },
+    {
+      "seg": 4,
+      "samples": 170,
+      "maxYawRate": 0.0349197014556478,
+      "boundsPassed": true
+    },
+    {
+      "seg": 9,
+      "samples": 174,
+      "maxYawRate": 0.048,
+      "boundsPassed": true
+    },
+    {
+      "seg": 10,
+      "samples": 163,
+      "maxYawRate": 0.048,
+      "boundsPassed": true
+    },
+    {
+      "seg": 11,
+      "samples": 168,
+      "maxYawRate": 0.048,
+      "boundsPassed": true
+    }
+  ]
+}

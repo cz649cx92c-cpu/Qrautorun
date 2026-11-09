@@ -627,6 +627,8 @@ class GreenhouseNode(Node):
                     'predictedCross': st.get('crossM'), 'staleS': st.get('staleS'),
                     'yawSourceOk': st.get('yawSourceOk'),
                     'yawSourceReason': st.get('yawSourceReason'),
+                    'steeringSource': (getattr(ex,'exit_info',None) or {}).get('steeringSource'),
+                    'anchorLookaheadM': (getattr(ex,'exit_info',None) or {}).get('anchorLookaheadM'),
                     'anchorValid': st.get('anchor_valid'),
                     'anchorRejectReason': st.get('anchor_reject_reason'),
                     'corrections': st.get('corrections'),

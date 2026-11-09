@@ -190,17 +190,22 @@ class SegmentExecutor:
         n = self.segments[nxt]
         if n.get('mode') == 'crab' or n.get('direction') == 'lateral':
             return 'lateral'
-        if n.get('direction') == 'reverse':
-            return 'reverse'
-        # 同向直行优先：两段都是 4t4d forward 且车头方向连续（含 ±180 环绕等价）。
-        # 不能因为 next 带 turn_forward 就判 turn——真实路线里同向段也可能带该 strategy。
+        # Same-direction 4T4D travel may pass through in either direction.
+        # Check this BEFORE classifying reverse: reverse -> reverse is not a gear reversal.
         if (cur.get('mode') == '4t4d' and n.get('mode') == '4t4d'
-                and cur.get('direction') == 'forward' and n.get('direction') == 'forward'):
+                and cur.get('direction') in ('forward', 'reverse')
+                and cur.get('direction') == n.get('direction')):
             cur_yaw = cur.get('bodyYaw')
             nxt_yaw = n.get('bodyYaw')
+            cp, np = cur['points'], n['points']
+            cur_travel = math.atan2(cp[-1]['y']-cp[0]['y'], cp[-1]['x']-cp[0]['x'])
+            nxt_travel = math.atan2(np[-1]['y']-np[0]['y'], np[-1]['x']-np[0]['x'])
             if cur_yaw is not None and nxt_yaw is not None:
-                if abs(wrap(nxt_yaw - cur_yaw)) <= math.radians(20.):
+                if (abs(wrap(nxt_yaw-cur_yaw)) <= math.radians(20.)
+                        and abs(wrap(nxt_travel-cur_travel)) <= math.radians(20.)):
                     return 'same_straight'
+        if n.get('direction') == 'reverse':
+            return 'reverse'
         if n.get('strategy') == TURN_STRATEGY:
             return 'turn'
         return 'turn'
@@ -956,6 +961,9 @@ class SegmentExecutor:
         if not ok:
             state['anchor_reject_reason']=why
             return False
+        if not _finite(anchor.get('sigma')) or float(anchor['sigma']) > self.dr_rebase_max_sigma():
+            state['anchor_reject_reason']='sigmaRejected'
+            return False
         pose_now,prop_ok,prop_why=propagate_anchor(anchor,loco)
         if not prop_ok:
             state['anchor_reject_reason']=prop_why
@@ -1037,6 +1045,10 @@ class SegmentExecutor:
             mono=state.get('qr_qualified_mono')
             stale_s=now-float(mono) if _finite(mono) else now-float(state['stamp_time'])
             state['staleS']=round(stale_s,3);state['qrLastQualifiedAgeS']=round(stale_s,3)
+        # Rebase changes pred in this tick. Never steer from the pre-rebase cross.
+        pred=Pose(state['pred']['x'],state['pred']['y'],state['pred']['yaw'])
+        dr_cross,_,_,_=geometry(pred,self.segment['points'])
+        state['crossM']=dr_cross;state['predictedPose']=dict(state['pred'])
         raw_fresh=isinstance(raw,dict) and _finite(raw.get('recvMono')) and 0<=now-float(raw['recvMono'])<=.4
         accepted_recent=_finite(state.get('qr_qualified_mono')) and now-float(state['qr_qualified_mono'])<=.4
         state['qrRawFresh']=bool(raw_fresh)
@@ -1073,6 +1085,10 @@ class SegmentExecutor:
         # try_rebase 已给出明确决策（skip_low_quality/rebased/diverged...）时保留之
         if not rebased:
             state['last_decision']='predict' if stale_s>self.dr_min_stale_s() else 'qr_track'
+        # Trusted, accepted anchors are actionable immediately, not only after
+        # the QR becomes stale. Rejected/raw observations never enable this path.
+        if state.get('anchor_reject_reason') not in ('mapMismatch','versionMismatch','epochMismatch','sigmaRejected'):
+            self.steer_ref_update(state,dr_cross)
         trigger=self.dr_trigger();hard=float(m.config['max_cross_track_m'])
         s=self.segment
         ep=state['steerEpisode']
@@ -1157,7 +1173,7 @@ class SegmentExecutor:
         a,b=points[-2:];length=math.hypot(b['x']-a['x'],b['y']-a['y']);past=((pose.x-b['x'])*(b['x']-a['x'])+(pose.y-b['y'])*(b['y']-a['y']))/length
         kind=self.next_action_kind()
         if kind=='same_straight' and remaining<=.03:
-            # 连续同向直行：过码不停车，直接推进到下一段并保持 4T4D forward。
+            # 连续同向直行：过码不停车，直接推进到下一段并保持原有 4T4D 行进方向。
             # 不重置 DR/steer episode、不重复起点门禁、不发零指令。
             self.pass_log=getattr(self,'pass_log',[])
             self.pass_log.append({'t':round(time.time(),3),'seg':self.index+1,
@@ -1176,9 +1192,18 @@ class SegmentExecutor:
             # 从 0.075 掉到 0.005、实车 fb.vx 一度 -0.03 m/s；这里把过码前的
             # 实际指令速度带过边界，其余安全门（5cm 硬门/模式匹配/DR）不变。
             carry_speed=float(getattr(self.m.tracker,'previous_speed',0.) or 0.)
-            self.phase='MOVE';self.m.transition('FORWARD')
+            carry_yaw=float(getattr(self.m.tracker,'previous_forward_yaw_rate',0.) or 0.)
+            self.phase='MOVE';self.m.transition('REVERSE' if self.segment['direction']=='reverse' else 'FORWARD')
             self.m.tracker.previous_speed=carry_speed
-            return self.move_command(pose,fb,observations,dt)
+            self.m.tracker.previous_forward_yaw_rate=carry_yaw
+            # Same line/direction: keep the qualified anchor and local yaw basis.
+            # dr_update reprojects pred onto the new segment on the next command.
+            if self.dr_state is not None:
+                self.dr_state['segment_index']=self.index
+                self.dr_state['steerRefSegment']=self.index
+            # This feedback interval was already integrated above. Reproject
+            # and generate the new-segment command without integrating it twice.
+            return self.move_command(pose,fb,observations,0.)
         # 末段动态制动闭环：停车类动作不再在 30mm 处直接把 vx 切零，而是由 Tracker
         # 用与规划完全相同的制动度量（含指令时延）把 vx 连续降到接近 0；进入
         # END_STOP 的距离由同一度量决定，残余误差如实记录，不伪造 10mm 精度。
@@ -1262,27 +1287,28 @@ class SegmentExecutor:
         scale=max(1.,abs(cross)/.025,abs(angle)/heading_limit);target*=max(.25,1./scale)
         st=self.dr_state
         cross_override=None
-        ep=(st or {}).get('steerEpisode') or {}
-        if (s['direction']=='forward' and st is not None and st.get('anchor_valid')
-                and st.get('steerRefValid') and not st.get('needs_anchor')
-                and st.get('yawSourceOk',True) and ep.get('active')
+        anchor_lookahead=None
+        if (st is not None and st.get('anchor_valid') and st.get('steerRefValid')
+                and not st.get('needs_anchor') and st.get('yawSourceOk',True)
                 and st.get('steerRefSegment')==self.index
                 and _finite(st.get('steerRefM'))
-                and float(st.get('staleS',0.))>=self.dr_min_stale_s()
+                and st.get('last_decision') not in ('qr_visible_rejected','diverged','disabled')
+                and st.get('anchor_reject_reason') not in ('mapMismatch','versionMismatch','epochMismatch','sigmaRejected')
                 and time.monotonic()-float(st.get('steerRefMono') or 0.)<=.5):
-            st['steerBiasM']=float(st['steerRefM'])
-            # QR 失联期间：DR 预测 cross 是唯一横向反馈来源；位姿/剩余距离仍用实测融合位姿。
             cross_override=float(st['steerRefM'])
-            self.exit_info['steeringSource']='predicted_cross_4t4d'
+            anchor_lookahead=.35
+            self.exit_info['steeringSource']='accepted_anchor_lookahead_4t4d'
             self.exit_info['steerCrossM']=round(cross_override,4)
+            self.exit_info['anchorLookaheadM']=anchor_lookahead
         else:
             self.exit_info['steeringSource']='fused_4t4d'
         command=(m.tracker.reverse(pose,points,target,dt,profile=s.get('executionProfile'),
-                                   stop_delay=self.endpoint_brake_delay())[0]
+                                   stop_delay=self.endpoint_brake_delay(),
+                                   cross_override=cross_override,anchor_lookahead=anchor_lookahead)[0]
                  if s['direction']=='reverse' else
                  m.tracker.forward(pose,points,target,dt,profile=s.get('executionProfile'),
                                    cross_override=cross_override,
-                                   stop_delay=self.endpoint_brake_delay())[0])
+                                   stop_delay=self.endpoint_brake_delay(),anchor_lookahead=anchor_lookahead)[0])
         # A 4T4D interval only ever translates along the body x axis. Forcing the
         # mode/vy here means a lateral body velocity can never be passed off as
         # forward progress, whatever the tracker returns.

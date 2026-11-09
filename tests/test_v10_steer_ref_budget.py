@@ -112,8 +112,10 @@ class SteerRefEpisode(unittest.TestCase):
         st = self.st()
         st['steerRefSegment'] = self.m.segment_executor.index - 1
         self.h.tick(self.m, self.pose, vy=.03)
-        self.assertEqual(self.m.segment_executor.exit_info.get('steeringSource'), 'fused_4t4d',
-                         '换段后旧 ref 不得消费')
+        self.assertEqual(st['steerRefSegment'], self.m.segment_executor.index,
+                         '必须先按当前路径重投影，不能消费旧段参考')
+        self.assertEqual(self.m.segment_executor.exit_info.get('steeringSource'),
+                         'accepted_anchor_lookahead_4t4d')
 
     def test_reanchor_clears_episode(self):
         self.drive(6, .03)
@@ -122,7 +124,9 @@ class SteerRefEpisode(unittest.TestCase):
         ep = self.st()['steerEpisode']
         self.assertFalse(ep['active'], '新 accepted 锚必须清旧 episode')
         self.assertIn(ep['reason'], ('reanchor', 'anchored'))
-        self.assertFalse(self.st().get('steerRefValid'))
+        self.assertTrue(self.st().get('steerRefValid'), 'accepted 锚应立即刷新纠偏参考')
+        self.assertEqual(self.m.segment_executor.exit_info.get('steeringSource'),
+                         'accepted_anchor_lookahead_4t4d')
 
     def test_distance_accumulates_along_vx(self):
         self.drive(10, .03, vx=.08)
@@ -130,15 +134,14 @@ class SteerRefEpisode(unittest.TestCase):
         self.assertGreater(ep['distance'], .01, '4T4D episode 必须累计沿行进距离')
         self.assertLessEqual(ep['distance'], .08 * .05 * 12 + .01)
 
-    def test_distance_limit_ends_episode_and_no_override(self):
+    def test_forward_distance_budget_rearms_without_disabling_tracking(self):
         self.m.config['dr_steer_distance_m'] = .01
         self.drive(10, .03)
-        ep = self.st()['steerEpisode']
-        self.assertFalse(ep['active'])
-        self.assertEqual(ep['reason'], 'distance')
-        self.assertFalse(self.st().get('steerRefValid'))
-        cmd = self.h.tick(self.m, self.pose, vy=.03, anchor=False)
-        self.assertEqual(self.m.segment_executor.exit_info.get('steeringSource'), 'fused_4t4d')
+        self.assertNotEqual(self.m.state, 'FAULT')
+        self.assertFalse(self.st()['steerEpisode'].get('blocked'))
+        self.assertTrue(self.st().get('steerRefValid'))
+        self.assertEqual(self.m.segment_executor.exit_info.get('steeringSource'),
+                         'accepted_anchor_lookahead_4t4d')
 
     def test_completed_after_consecutive_convergence(self):
         self.drive(6, .03)
