@@ -14,8 +14,11 @@
   },
   "configurationSha256": {
     "camera_calibration.json": "f2e49deea4dfdb52c46267e9f60c63a925bd1937738b9ff2f5e629a4fe4799a4",
-    "camera_extrinsics.json": "4b0797026f071b5e3cd055d201a2cc2374b3d12cc5fd8a24230d9f3c497c3b9e",
-    "camera_preview.json": "cf7bb7e51849bd21c8d836185fda3c53788187167dacd672f16cd4ebec12095e"
+    "camera_extrinsics.json": "62c4d546455fa35e8b5c3daafef45d26d96ba16cc32eb7c3c38cea0d82c0e9ac",
+    "camera_preview.json": "d084a4467d3f20db1c1513663d8de0083fafb548225809e1e6d542a921402e2e"
+  },
+  "configurationCaptureSha256": {
+    "camera_preview.json": "7b44432d2d6aab07e499c06da44a7408dc5f22d01ec0329315cdcc91ef46152d"
   },
   "runs": [
     {
