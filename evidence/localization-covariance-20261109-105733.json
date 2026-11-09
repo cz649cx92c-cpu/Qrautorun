@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "method": "stationary_repeatability",
+  "measures": "repeatability",
+  "absoluteAccuracyVerified": false,
+  "absoluteAccuracyNote": "静止采集只能测重复性；绝对精度需已知坐标标定场或全站仪实测。",
+  "measuredAt": "2026-11-09T10:57:33+08:00",
+  "durationSeconds": 60.0,
+  "localization": {
+    "state": "FORMAL",
+    "source": "synchronized_qr",
+    "mapId": "design-6ee9ba81",
+    "mapVersion": 1,
+    "localEpoch": "249fd661687641cf98b908b18effab88",
+    "captureTimestampVerified": true,
+    "reportedPositionSigmaM": 0.0006999821263734946,
+    "positionLimitM": 0.03
+  },
+  "frames": 1753,
+  "mean": {
+    "xM": 0.004590861990409212,
+    "yM": 1.636318763297149,
+    "yawDeg": -89.23962523250532
+  },
+  "repeatability": {
+    "xStdMm": 0.0006990227849906959,
+    "yStdMm": 0.0007206438348422632,
+    "yawStdDeg": 0.06815270397337767,
+    "xPeakToPeakMm": 0.0027498388421040923,
+    "yPeakToPeakMm": 0.002971675610696778,
+    "yawPeakToPeakDeg": 0.26342617346991426,
+    "radialRmsMm": 0.0010039723057098313,
+    "radialP95Mm": 0.0019027591452524062
+  },
+  "rawObservations": {
+    "B096": {
+      "frames": 877,
+      "repeatability": {
+        "xStdMm": 0.008550296601881158,
+        "yStdMm": 0.007069221744063148,
+        "yawStdDeg": 0.015149188192603125,
+        "xPeakToPeakMm": 0.05725131144353711,
+        "yPeakToPeakMm": 0.047187527597837564
+      },
+      "reportedSigma": {
+        "positionMm": 12.88123910881778,
+        "angleDeg": 1.4760812716682332
+      },
+      "reprojectionPx": {
+        "mean": 0.3349889349438245,
+        "max": 0.5110112256487915
+      }
+    }
+  }
+}

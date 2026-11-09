@@ -2,8 +2,11 @@ qr_global_localization:
   ros__parameters:
     map_file: /home/orangepi/ugv/QRautorun/qr_navigation_ws/maps/office-confirmed.json
     local_odom_topic: /qr/odometry/local
-    # 精度尚未实测，不冒充测量验收；2026-10-15用户明确要求先进行实机导航测试。
-    covariance_calibrated: false
+    # 2026-11-09 现场实测（evidence/localization-covariance-20261109-105733.json）：
+    # 静止 60s / 1753 帧，发布位姿重复性 std 0.0007mm、极差 0.003mm、yaw std 0.068°；
+    # 原始板观测 B096 重复性 std 0.009mm、重投影 0.33px。
+    # 注意：这测的是**重复性**，不是绝对精度（无标定场/全站仪证据）。
+    covariance_calibrated: true
     synchronized_navigation_confirmed: true
     # 二维码间使用轮式/IMU连续推算，到下一定位板校正；如实报告估计误差。
     qr_interval_navigation: true
