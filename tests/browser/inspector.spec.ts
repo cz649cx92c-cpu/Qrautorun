@@ -1,111 +1,134 @@
-import { test, expect } from '@playwright/test';
-import { readFileSync, mkdirSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import {test,expect,type Page} from '@playwright/test';
+import {readFileSync} from 'node:fs';
+import type {FieldMap,Point} from '../../web/shared/model';
+import {topologyFromSegments,topologySummary} from '../../web/shared/route-topology';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const snap = JSON.parse(readFileSync(path.join(__dirname, 'fixtures', 'real-map-route.snapshot.json'), 'utf8'));
-const MAP = snap.map, MAP_ID: string = snap.mapId, VERSION: number = snap.mapVersion;
+// 只读旧路径快照：真实生产数据「手动铺码图-10300759 v1 + 办公室（33 点 / 32 段）」，
+// 通过 mock 接口注入浏览器，不写任何生产数据、不触发导航指令。
+const snap=JSON.parse(readFileSync(new URL('./fixtures/office-route-ui2.snapshot.json',import.meta.url),'utf8')) as {
+ map:FieldMap;version:number;route:{routeId:string;mapId:string;name:string;mapVersion:number;mapDigest:string;points:Point[];motionSegments:{id:string;fromId:number;toId:number;mode:string;direction:string;strategy?:string|null;points:Point[]}[];bodyYawDeg:number;initialHeadingRad:number|null;distanceModel:string;spacingOverrides:unknown[];created:string;updated:string};
+};
+const map=snap.map;
+const route={...snap.route,points:snap.route.points.filter(p=>!snap.map.tags.filter(t=>[300,32].includes(t.id)).some(t=>Math.hypot(t.x-p.x,t.y-p.y)<0.01))};
+const storedCount=route.points.length; // 33
+const storedSegments=route.motionSegments.length; // 32
+const path:Point[]=route.motionSegments.length?[route.motionSegments[0]!.points[0]!,...route.motionSegments.flatMap(s=>s.points.slice(1))]:route.points;
+const routeSnapshot={...route,route,map:{...map,routeMode:'waypoints' as const,rows:[{id:'route-1',name:route.name,width:.6,exitDistance:.8,start:path[0]!,points:path.slice(1)}],order:['route-1'],motionSegments:route.motionSegments,tags:map.tags.map(t=>({...t,rowId:'route-1'}))},version:1,acceptance:null};
+const task={id:'task-office',name:'办公室任务',mapId:map.id,mapVersion:1,routeId:route.routeId,rowOrder:[],enabled:true,forwardSpeed:8,reverseSpeed:6,lateralSpeed:5,endWaitSeconds:2};
+// 旧路径也有拓扑：与后端同源（shared 纯函数）从 motionSegments 还原，而不是给空拓扑。
+const topoRestore=topologyFromSegments(route.motionSegments);
+const topoCenters=map.tags.map(t=>({tagId:t.id,groupId:t.groupId??'',x:t.x,y:t.y}));
+const topologyResponse={routeId:route.routeId,mapId:route.mapId,mapVersion:route.mapVersion,stored:false,topology:topoRestore.topology,summary:topologySummary(topoRestore.topology,topoCenters),issues:topoRestore.issues,strategyChoices:[],disclaimer:''};
 
-test('路点属性面板：标签与数值分两列，且能真正收起', async ({ page }) => {
-  const writes: string[] = [];
-  await page.route('**/api/**', async r => {
-    const req = r.request(); const p = new URL(req.url()).pathname; const m = req.method().toUpperCase();
-    if (['POST','PUT','PATCH','DELETE'].includes(m)) { writes.push(`${m} ${p}`); return r.fulfill({ json: { ok: true, mocked: true } }); }
-    if (p === '/api/maps') return r.fulfill({ json: [{ id: MAP_ID, name: MAP.name, version: VERSION }] });
-    if (p === `/api/maps/${MAP_ID}`) return r.fulfill({ json: { map: MAP, version: VERSION, acceptance: { kind: null, digestValid: false, accepted: false } } });
-    if (p === `/api/maps/${MAP_ID}/tag-aliases`) return r.fulfill({ json: { mapId: MAP_ID, mapVersion: VERSION, aliases: [], disclaimer: 'x' } });
-    if (p === '/api/routes') return r.fulfill({ json: [] });
-    if (p === '/api/tasks') return r.fulfill({ json: [] });
-    if (p === '/api/surveys' || p === '/api/boards') return r.fulfill({ json: [] });
-    if (p === '/api/camera/status') return r.fulfill({ json: { running: false, present: false } });
-    if (p.includes('/localization/')) return r.fulfill({ json: { phase: 'anchored' } });
-    return r.fulfill({ json: {} });
-  });
-  await page.setViewportSize({ width: 1910, height: 925 });
-  await page.goto('/');
-  await page.waitForTimeout(900);
-  await page.locator('.sidebar').getByRole('button', { name: '开始导航', exact: true }).click();
-  await page.waitForTimeout(800);
-  await page.getByTestId('map-select').selectOption(MAP_ID, { timeout: 20000 });
-  await page.waitForTimeout(1200);
-  await page.getByTestId('nav-open-map-editor').click({ timeout: 20000 });
-  await page.waitForTimeout(2000);
-  await page.getByTestId('unified-new-route').click({ timeout: 15000 });
-  await page.waitForTimeout(2000);
-  await page.getByTestId('route-draw-tool').click({ timeout: 15000 });
-  await page.waitForTimeout(500);
+const failures=new WeakMap<Page,{errors:string[];unexpected:string[]}>();
+test.afterEach(async({page})=>{
+ const observed=failures.get(page);
+ if(observed&&(observed.errors.length||observed.unexpected.length))
+  throw new Error('浏览器异常: '+JSON.stringify(observed.errors)+' 未 mock 的 API: '+JSON.stringify(observed.unexpected));
+});
 
-  // 加两个点，使属性面板出现
-  const tagPoint = (idx: number) => page.evaluate((i) => {
-    const stage = (window as any).__stage;
-    const layer = stage.getLayers()[0];
-    const gs = layer.getChildren().filter((n: any) => (n.name() || '').startsWith('tag-') && !(n.name() || '').startsWith('tag-label-'));
-    const g = gs[i]; if (!g) return null;
-    const c = document.querySelector('[data-testid="map-canvas"]') as HTMLElement;
-    const box = c.getBoundingClientRect();
-    return { x: box.x + stage.x() + g.x() * stage.scaleX(), y: box.y + stage.y() + g.y() * stage.scaleY() };
-  }, idx);
-  const a = await tagPoint(0), b = await tagPoint(5);
-  await page.mouse.click(a!.x, a!.y); await page.waitForTimeout(500);
-  await page.mouse.click(b!.x, b!.y); await page.waitForTimeout(800);
+async function mock(page:Page){
+ const observed={errors:[] as string[],unexpected:[] as string[]};failures.set(page,observed);
+ page.on('pageerror',e=>observed.errors.push(e.message));
+ await page.routeWebSocket('**/ws',ws=>ws.send(JSON.stringify({type:'robot',status:{connected:true,state:'IDLE',running:false,paused:false,pose:null,
+  chassis:{connected:true},sensors:{camera:'位姿已计算 / 待同步',imu:'在线',odom:'在线',localization:'局部已融合 / 待标定'},
+  conditions:[{id:'execution',label:'实体执行许可',ready:false}],events:[],
+  detector:{connected:true,positionReady:true,groups:[],reason:''},mapping:{ready:true,quality:'draft',localEpoch:'ui2-origin',reason:''}}})));
+ await page.routeWebSocket('**/ws/camera',ws=>ws.send(JSON.stringify({type:'camera',name:'HBVCAM',profile:'720p',profiles:[],error:''})));
+ await page.route('**/api/**',async req=>{
+  const path=new URL(req.request().url()).pathname;
+  if(path==='/api/camera/status')return req.fulfill({json:{running:true,present:true,frameAgeMs:10,error:''}});
+  if(path==='/api/camera/calibration')return req.fulfill({json:{}});
+  if(path==='/api/localization/map')return req.fulfill({json:{anchored:true,mapId:map.id}});
+  if(path==='/api/localization/scope')return req.fulfill({json:{phase:'anchored'}});
+  if(path==='/api/boards')return req.fulfill({json:[]});
+  if(path==='/api/routes')return req.fulfill({json:[route]});
+  if(path==='/api/routes/'+route.routeId)return req.fulfill({json:routeSnapshot});
+  if(path==='/api/routes/'+route.routeId+'/topology')return req.fulfill({json:topologyResponse});
+  if(path==='/api/maps')return req.fulfill({json:[{id:map.id,name:map.name,version:1}]});
+  if(path==='/api/maps/'+map.id)return req.fulfill({json:{map,version:1}});
+  if(path==='/api/tasks')return req.fulfill({json:[task]});
+  if(path==='/api/surveys')return req.fulfill({json:[]});
+  if(path.endsWith('/tag-aliases'))return req.fulfill({json:{aliases:[]}});
+  observed.unexpected.push(path);return req.fulfill({status:404,json:{error:'Unexpected mocked API: '+path}});
+ });
+ await page.goto('/');
+}
 
-  mkdirSync('logs/inspector-shots', { recursive: true });
-  await page.screenshot({ path: 'logs/inspector-shots/01-open.png', fullPage: false });
+async function selectMapAndRoute(page:Page){
+ await page.getByRole('button',{name:'开始导航',exact:true}).click();
+ await page.getByTestId('map-select').selectOption(map.id);
+ await expect(page.getByTestId('map-canvas')).toBeVisible();
+ await page.getByTestId('route-select').selectOption({label:route.name});
+ // 本图路径列表展示存储点数（33 点）——数据链在 API 侧从未丢步骤。
+ await expect(page.getByTestId('route-manage-list').getByText(`${storedCount} 点`)).toBeVisible();
+}
 
-  // 1) 布局：dt 与 dd 必须在同一行（纵向中心接近、dd 在 dt 右侧）
-  const layout = await page.evaluate(() => {
-    const rows = Array.from(document.querySelectorAll('.route-inspector-rows > div'));
-    return rows.map(r => {
-      const dt = r.querySelector('dt')!.getBoundingClientRect();
-      const dd = r.querySelector('dd')!.getBoundingClientRect();
-      return {
-        label: r.querySelector('dt')!.textContent?.trim(),
-        dtRight: Math.round(dt.right), ddLeft: Math.round(dd.left),
-        dtTop: Math.round(dt.top), ddTop: Math.round(dd.top),
-        overlapX: Math.round(Math.min(dt.right, dd.right) - Math.max(dt.left, dd.left)),
-      };
-    });
-  });
-  console.log('INSPECTOR_ROWS ' + JSON.stringify(layout));
-  expect(layout.length, '应有属性行').toBeGreaterThan(0);
-  for (const row of layout) {
-    expect(row.ddLeft, `「${row.label}」数值必须在标签右侧，不能压在同一列`).toBeGreaterThanOrEqual(row.dtRight - 1);
-    expect(Math.abs(row.ddTop - row.dtTop), `「${row.label}」标签与数值应在同一行`).toBeLessThan(12);
-    expect(row.overlapX, `「${row.label}」标签与数值不得水平重叠`).toBeLessThanOrEqual(0);
-  }
+async function enterEditorAndOpenSteps(page:Page){
+ await page.getByTestId('nav-route-edit').click();
+ const trigger=page.getByTestId('route-steps-trigger');
+ await expect(trigger).toContainText(`路径步骤 ${storedCount}`);
+ if(await trigger.isVisible())await trigger.click();
+ const popover=page.getByTestId('route-steps-popover');
+ await expect(popover).toBeVisible();
+ return popover;
+}
 
-  // 2) 面板当前可见
-  await expect(page.getByTestId('route-inspector')).toBeVisible({ timeout: 5000 });
+/** 世界坐标（米，y 向上）→ 页面坐标：Konva 绝对变换 + 画布盒子偏移。 */
+async function worldToScreen(page:Page,worldX:number,worldY:number){
+ return await page.evaluate(([wx,wy])=>{
+  const stage=(window as unknown as {__stage?:any}).__stage;
+  const abs=stage.getAbsoluteTransform().point({x:wx*100,y:-wy*100});
+  const b=document.querySelector('[data-testid=map-canvas]')!.getBoundingClientRect();
+  return {x:b.left+abs.x,y:b.top+abs.y,sx:abs.x,sy:abs.y,box:{left:b.left,top:b.top,width:b.width,height:b.height},scale:stage.scaleX()};
+ },[worldX,worldY] as [number,number]);
+}
 
-  // 3) 点「关闭」→ 面板必须真的消失，右栏也必须收起
-  await page.getByTestId('route-inspector-close').click({ timeout: 5000 });
-  await page.waitForTimeout(700);
-  const after = await page.evaluate(() => {
-    const insp = document.querySelector('[data-testid="route-inspector"]') as HTMLElement | null;
-    const right = document.querySelector('[data-testid="editor-shell-inspector"]') as HTMLElement | null;
-    const vis = (el: HTMLElement | null) => {
-      if (!el) return false;
-      const b = el.getBoundingClientRect(); const cs = getComputedStyle(el);
-      return b.width > 0 && b.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
-    };
-    return { inspectorVisible: vis(insp), rightColumnVisible: vis(right), rightDisplay: right ? getComputedStyle(right).display : 'absent' };
-  });
-  console.log('AFTER_CLOSE ' + JSON.stringify(after));
-  await page.screenshot({ path: 'logs/inspector-shots/02-closed.png', fullPage: false });
-  expect(after.inspectorVisible, '关闭后面板必须消失').toBe(false);
-  expect(after.rightColumnVisible, `关闭后右栏必须收起（display=${after.rightDisplay}）`).toBe(false);
 
-  // 4) 再点一次路点应能重新打开（关闭不是永久禁用）
-  await page.mouse.click(a!.x, a!.y); await page.waitForTimeout(700);
-  const reopened = await page.evaluate(() => {
-    const insp = document.querySelector('[data-testid="route-inspector"]') as HTMLElement | null;
-    if (!insp) return false;
-    const b = insp.getBoundingClientRect();
-    return b.width > 0 && b.height > 0;
-  });
-  console.log('REOPENED ' + JSON.stringify({ reopened }));
-  expect(reopened, '重新选中对象后属性应再次出现').toBe(true);
-
-  expect(writes.filter(w => !w.includes('/localization/')).length, '只读不得写').toBe(0);
+for(const width of [375,1024,1280,1440,1920])test(`浮卡选择与布局 ${width}`,async({page})=>{
+ await page.setViewportSize({width,height:960});await mock(page);await selectMapAndRoute(page);
+ await page.getByTestId('nav-route-edit').click();await page.getByTestId('route-select-tool').click();
+ // Give the narrow canvas its full width, as a user can with the existing layout button.
+ if(width===375){const b=page.getByTestId('layout-toggle-left');await b.click();}
+ const canvas=page.getByTestId('map-canvas');await expect(canvas).toHaveAttribute('data-route-waypoints',String(route.points.length));
+ await expect(page.locator('.draw-hint')).toHaveCount(0);
+ await expect(page.getByTestId('editor-shell-inspector')).toHaveCount(0);
+ const card=page.getByTestId('route-inspector');await expect(card).toHaveCount(0);
+ const before=await canvas.boundingBox();
+ await page.getByRole('button',{name:'适应地图',exact:true}).click();
+ const selectTag=async(id:number)=>{
+  const tag=map.tags.find(t=>t.id===id)!;
+  await page.getByRole('button',{name:'放大地图',exact:true}).click();
+  const p=await worldToScreen(page,tag.x,tag.y);
+  const hit=await page.evaluate(({id,x,y})=>{const stage=(window as any).__stage;const b=document.querySelector('[data-testid=map-canvas]')!.getBoundingClientRect();for(const dy of [0,4,-4,8,-8,12,-12,16,-16,20,-20])for(const dx of [0,4,-4,8,-8,12,-12,16,-16,20,-20]){const node=stage.getIntersection({x:x+dx-b.x,y:y+dy-b.y});let ancestor=node;while(ancestor){if(ancestor.name()==='tag-'+id)return{x:x+dx,y:y+dy};ancestor=ancestor.getParent();}}return null;},{id,x:p.x,y:p.y});if(!hit){console.log('QR_DEBUG',p,await page.evaluate(()=>{const s=(window as any).__stage;return s.find('Group').map((n:any)=>({name:n.name(),pos:n.getAbsolutePosition()})).slice(0,25)}));throw new Error('No visible QR hot area '+id);}await page.mouse.click(hit.x,hit.y);await expect(card).toBeVisible();await expect(card).toContainText('二维码属性');
+  await expect(card.locator('dd').first()).toHaveText(String(id));await expect(card).toContainText(`${tag.x.toFixed(2)}, ${tag.y.toFixed(2)}`);
+ };
+ await selectTag(300);
+ const tagBox=await card.boundingBox();expect(tagBox!.height).toBeGreaterThan(60);expect(tagBox!.height).toBeLessThan(230);
+ await page.getByTestId('route-inspector-close').click();await expect(card).toHaveCount(0);
+ await page.getByTestId('route-properties-toggle').click();await expect(card).toBeVisible();
+ await page.getByTestId('route-inspector-close').click();
+ // Click actual waypoint handle, using its screen bounds from the rendered Konva stage.
+ const handle=await page.evaluate(()=>{
+  const stage=(window as any).__stage;const nodes=stage.find('Rect').filter((n:any)=>String(n.name()).startsWith('route-waypoint-hit-'));
+  const box=document.querySelector('[data-testid=map-canvas]')!.getBoundingClientRect();
+  return nodes.map((n:any)=>{const r=n.getClientRect();return{name:n.name(),x:box.x+r.x+r.width/2,y:box.y+r.y+r.height/2}});
+ });
+ console.log('HANDLE_NAMES',width,JSON.stringify(handle.slice(0,3)));
+ if(!handle.length)throw new Error('No actual rendered waypoint handles found');
+ await page.mouse.click(handle[0].x,handle[0].y);await expect(card).toContainText('路点属性');
+ const waypointBox=await card.boundingBox();expect(waypointBox!.height).toBeGreaterThanOrEqual(tagBox!.height);
+ await page.getByTestId('route-inspector-close').click();await selectTag(32);
+ const after=await canvas.boundingBox();expect(after!.width).toBeCloseTo(before!.width,0);
+ const layout=await page.evaluate(()=>{
+  const box=(s:string)=>{const r=document.querySelector(s)!.getBoundingClientRect();return{x:r.x,y:r.y,width:r.width,height:r.height,right:r.right,bottom:r.bottom}};
+  return {canvas:box('[data-testid=map-canvas]'),card:box('[data-testid=route-inspector]'),main:box('.editor-shell__main'),row:box('.editor-shell__row'),overflow:document.documentElement.scrollWidth>innerWidth+1};
+ });
+ expect(layout.overflow).toBe(false);expect(layout.card.x).toBeGreaterThanOrEqual(layout.canvas.x);expect(layout.card.right).toBeLessThanOrEqual(layout.canvas.right);
+ expect(layout.main.right).toBeGreaterThanOrEqual(layout.row.right-2);expect(layout.card.width).toBeLessThanOrEqual(280);expect(layout.card.bottom).toBeLessThan(layout.canvas.bottom);
+ for(const target of [page.getByTestId('route-save'),page.getByTestId('route-exit'),page.getByRole('button',{name:'放大地图',exact:true}),page.getByRole('button',{name:'缩小地图',exact:true})]){
+  await expect(target).toBeVisible();await target.scrollIntoViewIfNeeded();
+  const unobscured=await target.evaluate(el=>{const r=el.getBoundingClientRect();const stack=document.elementsFromPoint(r.x+r.width/2,r.y+r.height/2);return stack.length>0&&(el===stack[0]||el.contains(stack[0]));});expect(unobscured).toBe(true);
+ }
+ console.log('INSPECTOR_LAYOUT',width,JSON.stringify({...layout,tagHeight:tagBox!.height,waypointHeight:waypointBox!.height}));
 });

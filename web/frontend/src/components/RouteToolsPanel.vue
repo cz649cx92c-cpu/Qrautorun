@@ -56,6 +56,9 @@ const props = withDefaults(
     dense?: boolean;
     /** 路线锁：导航运行中 / 版本冲突时全部命令禁用（但仍可见，不隐藏）。 */
     locked?: boolean;
+    /** 真正的只读原因（机器人运行/版本冲突/等待指令）。busy 不算只读，
+     *  否则每保存一次都会闪一下黄色「只读」标。不传时退回 locked。 */
+    readonly?: boolean;
     /** 当前画布工具：仅用于“加点/连线”的高亮，不重复「选择」。 */
     tool?: string;
     /** 已选路点数。 */
@@ -87,10 +90,11 @@ const props = withDefaults(
     hints?: Record<string, string>;
   }>(),
   {
-    storageKey: 'qrautorun.editor.routeTools.v1',
+    storageKey: 'qrautorun.editor.routeTools.v2',
     defaultCollapsed: false,
     dense: false,
     locked: false,
+    readonly: undefined,
     tool: 'select',
     anchorCount: 0,
     lengthM: 0,
@@ -252,7 +256,7 @@ const noticeIcon = (level: RouteToolsNotice['level']) => (level === 'info' ? Inf
         <PanelLeftClose :size="15" />
       </button>
       <strong v-if="!collapsed" class="route-tools__title">路径工具</strong>
-      <span v-if="!collapsed && locked" class="route-tools__lock" data-testid="route-tools-locked" role="status" title="导航运行中或地图版本冲突，路径命令暂时只读">只读</span>
+      <span v-if="!collapsed && (readonly ?? locked)" class="route-tools__lock" data-testid="route-tools-locked" role="status" title="导航运行中或地图版本冲突，路径命令暂时只读">只读</span>
       <button
         v-if="collapsed"
         type="button"
@@ -319,27 +323,6 @@ const noticeIcon = (level: RouteToolsNotice['level']) => (level === 'info' ? Inf
           <small>{{ anchorCount }} 点</small>
         </button>
         <div v-show="isOpen('route')" class="route-tools__group-body">
-          <div class="route-tools__rows">
-            <div class="route-tools__row" data-testid="route-anchors-length"><span>路点 / 长度</span><b>{{ anchorCount }} 点 · {{ lengthText }} m</b></div>
-            <div class="route-tools__row">
-              <span>经过 / 跳过</span>
-              <span class="route-tools__badge" data-testid="route-group-badge" title="每到下一定位码纠正一次">经过 {{ visitedCount }} · 跳过 {{ skippedCount }}</span>
-            </div>
-            <label class="route-tools__row route-tools__name">
-              <span>路径名称</span>
-              <input
-                type="text"
-                data-testid="route-name-input"
-                aria-label="路径名称"
-                :value="routeName"
-                :placeholder="namePlaceholder"
-                :disabled="locked"
-                maxlength="100"
-                @input="onNameInput"
-              />
-            </label>
-          </div>
-
           <div class="route-tools__tools" role="group" aria-label="路径画布工具">
             <button type="button" class="route-tools__btn" :class="{active: tool === 'draw'}" data-testid="route-panel-draw" :aria-pressed="tool === 'draw'" aria-label="加点" :disabled="locked" @click="emitTool('draw')"><PenLine :size="14" /><span>加点</span></button>
             <button type="button" class="route-tools__btn" :class="{active: tool === 'connect'}" data-testid="route-panel-connect" :aria-pressed="tool === 'connect'" aria-label="连线" :disabled="locked" @click="emitTool('connect')"><Link2 :size="14" /><span>连线</span></button>
@@ -353,12 +336,7 @@ const noticeIcon = (level: RouteToolsNotice['level']) => (level === 'info' ? Inf
             <button type="button" class="route-tools__btn" data-testid="route-save-as" aria-label="另存为" :disabled="locked || anchorCount < 2" @click="run('save-as')"><CopyPlus :size="14" /><span>另存为</span></button>
           </div>
 
-          <details class="route-tools__hint" data-testid="route-tools-hint-route">
-            <summary>使用说明（点击展开）</summary>
-            <ul>
-              <li v-for="key in ['draw', 'connect', 'chain', 'generate', 'spacing']" :key="key">{{ hintText(key) }}</li>
-            </ul>
-          </details>
+
 
           <slot name="group-route" />
         </div>
@@ -428,8 +406,10 @@ const noticeIcon = (level: RouteToolsNotice['level']) => (level === 'info' ? Inf
 .route-tools__row>span:first-child{white-space:nowrap}
 .route-tools__row b{font:11.5px ui-monospace,SFMono-Regular,monospace;color:#334155;text-align:right;min-width:0;overflow-wrap:anywhere}
 .route-tools__badge{padding:0 6px;border:1px solid #dbeafe;border-radius:999px;background:#eff6ff;color:#1e40af;font-size:10.5px;line-height:18px;white-space:normal;text-align:right}
-.route-tools__name{flex-wrap:wrap;justify-content:flex-start}
-.route-tools__name input{flex:1 1 96px;min-width:0;height:26px;padding:2px 6px;border:1px solid var(--line,#e2e8f0);border-radius:5px;font-size:11.5px;color:#0f172a;background:#fff}
+/* Global labels use a column layout: a 96px flex-basis on the input becomes
+   vertical space, not width. Keep this field explicitly single-line and non-growing. */
+.route-tools__name{flex:0 0 auto;flex-direction:column;flex-wrap:nowrap;align-items:stretch;justify-content:flex-start;gap:4px;margin:4px 0 0;width:100%;min-width:0}
+.route-tools__name input{box-sizing:border-box;display:block;flex:0 0 auto;width:100%;max-width:100%;min-width:0;height:34px;min-height:34px;max-height:34px;margin:0;padding:6px 8px;border:1px solid var(--line,#e2e8f0);border-radius:5px;font-size:13px;line-height:20px;color:#0f172a;background:#fff}
 .route-tools__name input:disabled{background:#f8fafc;color:#94a3b8}
 .route-tools__tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;min-width:0}
 .route-tools__tools.is-secondary{grid-template-columns:repeat(2,minmax(0,1fr))}

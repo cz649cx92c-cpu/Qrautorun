@@ -1,0 +1,133 @@
+import {test,expect,type Page} from '@playwright/test';
+import {readFileSync} from 'node:fs';
+import type {FieldMap,Point} from '../../web/shared/model';
+import {topologyFromSegments,topologySummary} from '../../web/shared/route-topology';
+
+// 只读旧路径快照：真实生产数据「手动铺码图-10300759 v1 + 办公室（33 点 / 32 段）」，
+// 通过 mock 接口注入浏览器，不写任何生产数据、不触发导航指令。
+const snap=JSON.parse(readFileSync(new URL('./fixtures/office-route-ui2.snapshot.json',import.meta.url),'utf8')) as {
+ map:FieldMap;version:number;route:{routeId:string;mapId:string;name:string;mapVersion:number;mapDigest:string;points:Point[];motionSegments:{id:string;fromId:number;toId:number;mode:string;direction:string;strategy?:string|null;points:Point[]}[];bodyYawDeg:number;initialHeadingRad:number|null;distanceModel:string;spacingOverrides:unknown[];created:string;updated:string};
+};
+const map={...snap.map,routeMode:'map-only' as const};
+const route=snap.route;
+const storedCount=route.points.length; // 33
+const storedSegments=route.motionSegments.length; // 32
+const path:Point[]=route.motionSegments.length?[route.motionSegments[0]!.points[0]!,...route.motionSegments.flatMap(s=>s.points.slice(1))]:route.points;
+const routeSnapshot={...route,route,map:{...map,routeMode:'map-only' as const,rows:[{id:'route-1',name:route.name,width:.6,exitDistance:.8,start:path[0]!,points:path.slice(1)}],order:['route-1'],motionSegments:route.motionSegments,tags:map.tags.map(t=>({...t,rowId:'route-1'}))},version:1,acceptance:null};
+const task={id:'task-office',name:'办公室任务',mapId:map.id,mapVersion:1,routeId:route.routeId,rowOrder:[],enabled:true,forwardSpeed:8,reverseSpeed:6,lateralSpeed:5,endWaitSeconds:2};
+// 旧路径也有拓扑：与后端同源（shared 纯函数）从 motionSegments 还原，而不是给空拓扑。
+const topoRestore=topologyFromSegments(route.motionSegments);
+const topoCenters=map.tags.map(t=>({tagId:t.id,groupId:t.groupId??'',x:t.x,y:t.y}));
+const topologyResponse={routeId:route.routeId,mapId:route.mapId,mapVersion:route.mapVersion,stored:false,topology:topoRestore.topology,summary:topologySummary(topoRestore.topology,topoCenters),issues:topoRestore.issues,strategyChoices:[],disclaimer:''};
+
+const failures=new WeakMap<Page,{errors:string[];unexpected:string[]}>();
+test.afterEach(async({page})=>{
+ const observed=failures.get(page);
+ if(observed&&(observed.errors.length||observed.unexpected.length))
+  throw new Error('浏览器异常: '+JSON.stringify(observed.errors)+' 未 mock 的 API: '+JSON.stringify(observed.unexpected));
+});
+
+async function mock(page:Page){
+ const observed={errors:[] as string[],unexpected:[] as string[]};failures.set(page,observed);
+ page.on('pageerror',e=>observed.errors.push(e.message));
+ await page.routeWebSocket('**/ws',ws=>ws.send(JSON.stringify({type:'robot',status:{connected:true,state:'IDLE',running:false,paused:false,pose:null,
+  chassis:{connected:true},sensors:{camera:'位姿已计算 / 待同步',imu:'在线',odom:'在线',localization:'局部已融合 / 待标定'},
+  conditions:[{id:'execution',label:'实体执行许可',ready:false}],events:[],
+  detector:{connected:true,positionReady:true,groups:[],reason:''},mapping:{ready:true,quality:'draft',localEpoch:'ui2-origin',reason:''}}})));
+ await page.routeWebSocket('**/ws/camera',ws=>ws.send(JSON.stringify({type:'camera',name:'HBVCAM',profile:'720p',profiles:[],error:''})));
+ await page.route('**/api/**',async req=>{
+  const path=new URL(req.request().url()).pathname;
+  if(path==='/api/camera/status')return req.fulfill({json:{running:true,present:true,frameAgeMs:10,error:''}});
+  if(path==='/api/camera/calibration')return req.fulfill({json:{}});
+  if(path==='/api/localization/map')return req.fulfill({json:{anchored:true,mapId:map.id}});
+  if(path==='/api/localization/scope')return req.fulfill({json:{phase:'anchored'}});
+  if(path==='/api/boards')return req.fulfill({json:[]});
+  if(path==='/api/routes')return req.fulfill({json:[route]});
+  if(path==='/api/routes/'+route.routeId)return req.fulfill({json:{...routeSnapshot,map:{...map,rows:[],order:[],motionSegments:undefined}}});
+  if(path==='/api/routes/'+route.routeId+'/topology')return req.fulfill({json:topologyResponse});
+  if(path==='/api/maps')return req.fulfill({json:[{id:map.id,name:map.name,version:1}]});
+  if(path==='/api/maps/'+map.id)return req.fulfill({json:{map,version:1}});
+  if(path==='/api/tasks')return req.fulfill({json:[task]});
+  if(path==='/api/surveys')return req.fulfill({json:[]});
+  if(path.endsWith('/tag-aliases'))return req.fulfill({json:{aliases:[]}});
+  observed.unexpected.push(path);return req.fulfill({status:404,json:{error:'Unexpected mocked API: '+path}});
+ });
+ await page.goto('/');
+}
+
+async function selectMapAndRoute(page:Page){
+ await page.getByRole('button',{name:'开始导航',exact:true}).click();
+ await page.getByTestId('map-select').selectOption(map.id);
+ await expect(page.getByTestId('map-canvas')).toBeVisible();
+ await page.getByTestId('route-select').selectOption({label:route.name});
+ // 本图路径列表展示存储点数（33 点）——数据链在 API 侧从未丢步骤。
+ await expect(page.getByTestId('route-manage-list').getByText(`${storedCount} 点`)).toBeVisible();
+}
+
+async function enterEditorAndOpenSteps(page:Page){
+ await page.getByTestId('nav-route-edit').click();
+ const trigger=page.getByTestId('route-steps-trigger');
+ await expect(trigger).toContainText(`路径步骤 ${storedCount}`);
+ if(await trigger.isVisible())await trigger.click();
+ const popover=page.getByTestId('route-steps-popover');
+ await expect(popover).toBeVisible();
+ return popover;
+}
+
+
+for(const width of [375,1024,1280,1440,1920])test(`铺码布局交互 ${width}`,async({page})=>{
+ await page.setViewportSize({width,height:960});await mock(page);await selectMapAndRoute(page);
+ await page.getByTestId('nav-route-edit').click();
+ if(await page.getByTestId('editor-shell-expand-left').isVisible())await page.getByTestId('editor-shell-expand-left').click();
+ if(await page.getByTestId('route-tools-expand').isVisible())await page.getByTestId('route-tools-expand').click();
+ await expect(page.getByTestId('route-tools-hint-route')).toHaveCount(0);
+ await expect(page.getByTestId('route-name-input')).toHaveCSS('height','34px');
+ const tags=page.getByTestId('route-tools-group-toggle-tags');if(await tags.getAttribute('aria-expanded')==='false')await tags.click();
+ await page.getByTestId('map-tool-single').click();
+ const panel=page.getByTestId('map-tag-create');await expect(panel).toHaveAttribute('data-active','1');
+ const report=[];
+ for(const mode of ['single','grid','line']){
+  await page.getByTestId('map-tag-create-mode-'+mode).click();
+  const form=page.getByTestId('map-tag-create-'+mode+'-form');await expect(form).toBeVisible();
+  if(mode==='single'){
+   await page.getByTestId('map-tag-create-single-x').fill('0');await page.getByTestId('map-tag-create-single-y').fill('2.3');
+   await expect(page.getByTestId('map-tag-create-error')).toBeVisible();
+   await expect(page.getByTestId('map-tag-create-error')).not.toContainText('请先处理');
+   await expect(page.getByTestId('map-tag-create-save')).toBeDisabled();
+   await expect(page.getByTestId('map-tag-create-preview-span')).toHaveCount(0);
+   await page.getByTestId('map-tag-create-single-x').fill('0.3');await page.getByTestId('map-tag-create-single-y').fill('0.275');
+  }else if(mode==='grid'){
+   await page.getByTestId('map-tag-create-grid-origin-x').fill('0.3');await page.getByTestId('map-tag-create-grid-origin-y').fill('0.275');
+   await page.getByTestId('map-tag-create-grid-cols').fill('1');await page.getByTestId('map-tag-create-grid-rows').fill('1');
+  }else{
+   await page.getByTestId('map-tag-create-line-x').fill('0.3');await page.getByTestId('map-tag-create-line-y').fill('0.275');
+   await page.getByTestId('map-tag-create-line-count').fill('1');
+  }
+  console.log('FORM_STATE',width,mode,await panel.textContent());
+  await expect(page.getByTestId('map-tag-create-save')).toBeEnabled();
+  await page.getByTestId('map-tag-create-refresh-preview').click();
+  await expect(panel).not.toContainText('MIN_CREATION_DISTANCE_M');
+  await expect(page.getByTestId('map-tag-create-safety')).toBeVisible();
+  await expect(page.getByTestId('map-tag-create-safety')).toContainText('禁止实体导航');
+  await panel.locator('.tag-create-head').scrollIntoViewIfNeeded();
+  const heading=await panel.locator('.tag-create-head strong').evaluate(el=>{const r=el.getBoundingClientRect();return {width:r.width,height:r.height,client:el.clientWidth,scroll:el.scrollWidth,x:r.x,right:r.right,overflow:getComputedStyle(el).overflow};});
+  expect(heading.width).toBeGreaterThan(20);expect(heading.height).toBeGreaterThan(0);expect(heading.scroll).toBeLessThanOrEqual(heading.client+1);expect(heading.x).toBeGreaterThanOrEqual(0);expect(heading.right).toBeLessThanOrEqual(width);expect(heading.overflow).not.toBe('hidden');
+  const metrics=await panel.evaluate(el=>{
+   const box=(n:Element)=>{const r=n.getBoundingClientRect();return{x:r.x,y:r.y,width:r.width,height:r.height,right:r.right}};
+   const p=box(el);const fields=[...el.querySelectorAll('.tag-create-grid input,.tag-create-grid select')].map(n=>({...box(n),font:getComputedStyle(n).fontSize,flex:getComputedStyle(n).flex}));
+   const buttons=[...el.querySelectorAll('.tag-create-modes button')].map(box);
+   const labels=[...el.querySelectorAll('.tag-create-grid label')].map(n=>({ ...box(n),overflow:getComputedStyle(n).overflow,scrollWidth:n.scrollWidth,clientWidth:n.clientWidth}));
+   return{panel:p,fields,buttons,labels,pageOverflow:document.documentElement.scrollWidth>innerWidth+1};
+  });
+  expect(metrics.pageOverflow).toBe(false);
+  for(const f of metrics.fields){expect(f.height).toBe(34);expect(f.width).toBeGreaterThan(20);expect(f.x).toBeGreaterThanOrEqual(metrics.panel.x);expect(f.right).toBeLessThanOrEqual(metrics.panel.right+1);}
+  expect(new Set(metrics.buttons.map(b=>Math.round(b.y))).size).toBe(1);
+  expect(Math.max(...metrics.buttons.map(b=>b.width))-Math.min(...metrics.buttons.map(b=>b.width))).toBeLessThan(1);
+  for(const l of metrics.labels){expect(l.scrollWidth).toBeLessThanOrEqual(l.clientWidth+1);expect(l.overflow).not.toBe('hidden');}
+  for(const id of ['map-tag-create-save','map-tag-create-exit']){const b=page.getByTestId(id);await b.scrollIntoViewIfNeeded();await expect(b).toBeVisible();const r=await b.boundingBox();expect(r!.x).toBeGreaterThanOrEqual(0);expect(r!.x+r!.width).toBeLessThanOrEqual(width+1);}
+  report.push({mode,panelWidth:metrics.panel.width,inputWidths:metrics.fields.map(f=>f.width),inputHeight:34,modeWidth:metrics.buttons[0].width,pageOverflow:metrics.pageOverflow});
+ }
+ await page.getByTestId('map-tag-create-exit').click();
+ await expect(page.getByTestId('route-save')).toBeVisible();await expect(page.getByTestId('route-exit')).toBeVisible();
+ console.log('ACCESSORY_LAYOUT',width,JSON.stringify(report));
+});

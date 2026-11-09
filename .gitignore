@@ -28,3 +28,12 @@ verify-print.mjs
 probe_panel.mjs
 maps/*.bak-pre-v5
 maps/*.before-b032
+
+# 会话产物：部署回滚备份、迁移残留与临时诊断脚本（不属于产品代码）
+_backup_*/
+migrated/
+C:/
+_patch_*.py
+_probe_*.py
+_test_*.py
+tests/browser/_tmp_*

@@ -6,6 +6,19 @@ import Button from './ui/Button.vue';
 import {AlertTriangle,CheckCircle2,Plus,Save,Trash2,Table2,Undo2} from 'lucide-vue-next';
 
 const props=defineProps<{map:FieldMap;version:number;disabled?:boolean;aliases?:{tagId:number;name:string}[]}>();
+// 定位组几何：后端新字段可选；旧地图缺字段时按 legacy 方形（rows=cols=gridSize，
+// widthMm=heightMm=sizeMm）回退，不把方板文案套到矩形板上。
+type GroupGeometry={gridSize:number;sizeMm:number;rows?:number;cols?:number;widthMm?:number;heightMm?:number;members?:readonly unknown[]};
+const countOf=(value:number|undefined,fallback:number)=>Number.isFinite(value)&&(value as number)>=1?Math.round(value as number):fallback;
+const mmText=(value:number)=>Number.isInteger(value)?String(value):value.toFixed(1);
+function groupGeometrySpec(group:GroupGeometry):string{
+ const rows=countOf(group.rows,countOf(group.gridSize,1)),cols=countOf(group.cols,countOf(group.gridSize,1));
+ const width=Number.isFinite(group.widthMm)?group.widthMm as number:group.sizeMm;
+ const height=Number.isFinite(group.heightMm)?group.heightMm as number:group.sizeMm;
+ const count=group.members?.length??rows*cols;
+ const tileW=(width-(cols-1)*2)/cols,tileH=(height-(rows-1)*2)/rows,single=Math.min(tileW,tileH)/1.25;
+ return `${count} 码 · 列×行 ${cols}×${rows} · 整组 ${mmText(width)}×${mmText(height)} mm · 单码 ${single.toFixed(1)} mm`;
+}
 const emit=defineEmits<{
  'preview-map':[map:FieldMap|null];
  editing:[active:boolean];
@@ -45,6 +58,12 @@ function saveAliases(){
 }
 
 const source=computed(()=>base.value??props.map);
+const groupById=computed(()=>{
+ const byId=new Map<string,GroupGeometry>();
+ for(const group of source.value.groups??[])byId.set(group.id,group as unknown as GroupGeometry);
+ return byId;
+});
+const groupSpec=(groupId:string)=>groupById.value.has(groupId)?groupGeometrySpec(groupById.value.get(groupId)!):'';
 const tags=computed(()=>[...source.value.tags].sort((a,b)=>a.id-b.id));
 const draftById=computed(()=>new Map(draft.value.map(edit=>[edit.id,edit])));
 const editFor=(id:number):TagUpdateEdit=>draftById.value.get(id)??{id};
@@ -162,7 +181,7 @@ onBeforeUnmount(()=>{if(active.value){active.value=false;emit('preview-map',null
       <td><input type="number" step="0.001" :value="editFor(tag.id).y??tag.y" :disabled="busy||deleting" :data-testid="'map-tag-y-'+tag.id" @click.stop @input.stop="setField(tag.id,'y',($event.target as HTMLInputElement).value)"/></td>
       <td><input type="number" step="0.1" :value="editFor(tag.id).angle??tag.angle" :disabled="busy||deleting" :data-testid="'map-tag-angle-'+tag.id" @click.stop @input.stop="setField(tag.id,'angle',($event.target as HTMLInputElement).value)"/></td>
       <td><input type="number" step="0.01" min="0.02" max="0.18" :value="editFor(tag.id).size??tag.size" :disabled="busy||deleting" :data-testid="'map-tag-size-'+tag.id" @click.stop @input.stop="setField(tag.id,'size',($event.target as HTMLInputElement).value)"/></td>
-      <td class="tag-table-group">{{tag.groupId??'—'}}</td>
+      <td class="tag-table-group"><span>{{tag.groupId??'—'}}</span><small v-if="tag.groupId&&groupSpec(tag.groupId)">{{groupSpec(tag.groupId)}}</small></td>
       <td><Button size="sm" variant="ghost" :disabled="busy||deleting" :data-testid="'map-tag-del-'+tag.id" :aria-label="'删除 Q'+tag.id" @click.stop="removeTag(tag.id)"><Trash2 :size="13"/></Button></td>
      </tr>
      <tr v-if="!tags.length"><td colspan="8" class="tag-table-empty">地图上还没有二维码；先在「批量新建 / 铺码」里加码。</td></tr>
@@ -204,7 +223,9 @@ onBeforeUnmount(()=>{if(active.value){active.value=false;emit('preview-map',null
 .tag-table-grid input.tag-alias-input{width:104px;text-align:left}
 .tag-table-grid input{width:74px;padding:2px 5px;border:1px solid #d7dee7;border-radius:5px;font:inherit;text-align:right;font-variant-numeric:tabular-nums}
 .tag-table-grid input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgb(37 99 235 / 12%)}
-.tag-table-group{color:var(--muted);font-size:10.5px;white-space:nowrap}
+.tag-table-group{color:var(--muted);font-size:10.5px;white-space:normal;max-width:190px}
+.tag-table-group span{display:block}
+.tag-table-group small{display:block;color:#94a3b8;font-size:9.5px;line-height:1.35;overflow-wrap:anywhere}
 .tag-table-empty{color:var(--muted);text-align:center;padding:14px 6px}
 .tag-table-diff{padding:5px 8px;border-radius:6px;background:#eff6ff;color:#1d4ed8;font-size:11.5px;line-height:1.6}
 .tag-table-blocked{padding:5px 8px;border-radius:6px;background:#fef2f2;color:#b91c1c;font-size:11.5px}

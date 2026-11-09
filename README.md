@@ -1,11 +1,55 @@
 # QR 导航控制台
 
-> **当前分支：`v10`**（最新代码在 `v10`，基于 `v9`；已推送远端 `refs/heads/v10`）
-> 基线：`v9`（`b1bcf33`）· v10 相对 v9 修复 DR 三项预测源缺陷，见下方「v10 改动」；v9 的「仅新增后台诊断日志」内容保留为历史
-> `main` 分支停留在 v2 代码基线，**不包含**本分支的任何功能。要使用本版本请切到 `v10`。
-> 分支最新 SHA 见 `git log -1`；v10 尚未验证项见「v10 改动」第 8 节，历史缺口见「v9 改动」第 7 节。
+> **当前分支：`v17`**（最新代码在 `v17`，基于 `v16` / `a680fa8`；已推送远端 `refs/heads/v17`）
+> v17 相对 v16 的改动见下方「v17 改动」；v16 及更早版本的说明保留为历史。
+> `main` 分支停留在 v2 代码基线，**不包含**本分支的任何功能。要使用本版本请切到 `v17`。
+> 分支最新 SHA 见 `git log -1`。
 
 基于 AprilTag 多码定位板的现场扫描建图、正交路线设计与导航控制工程。前端 Vue 3 + TypeScript + Konva，Web 服务 Fastify，导航执行 ROS 2 / Python。
+
+## v17 改动（相对 `v16` / `a680fa8`）— 2026-11-09（分支 `v17`）
+
+覆盖 2026-11-05 至 11-08 现场联调成果：矩形定位板规格、素材库拖入落点精确化、框选批量操作、批量改组规格、「开始导航」只读化。全部改动均通过真实 Chromium 回归（隔离构建 78/78、线上 68/68）与 `vue-tsc` / `tsc` 零错误后部署验证。
+
+### 1. 矩形定位板（码组）规格
+- 码组支持矩形布局 `rows/cols/widthMm/heightMm`；旧字段 `gridSize/sizeMm` 兼容（`gridSize=max(rows,cols)`、`sizeMm=max(widthMm,heightMm)`）。白缝固定 2 mm，单码边长 `min(tileW,tileH)/1.25`，`tileW=(宽−(列−1)×2)/列`。
+- `POST /api/maps/:id/groups/:gid/spec`：单组改行×列/整组宽高/起始编号，按 `referenceId` 连续重建 members 并同步组中心 size，整图一次校验一次保存。
+- 打印链路（preview.svg / PDF / 单码补打）与 ROS 端 `board_geometry.validate_boards`、`same_board_layout` 同步矩形化（含旧数据缺字段时的有效值回退）。
+
+### 2. 批量改组规格（2×2 → 3×3 / 4×4 一键完成）
+- 新增 `POST /api/maps/:id/groups/spec-batch`：`{baseVersion, rows, cols, groupIds?, widthMm?, heightMm?}`；`groupIds` 省略＝这张图的全部定位组；保持各组整组宽高不变、按 `referenceId` 重建 members；运行中/版本冲突照旧拒绝。
+- 前端入口（唯一）：路径编辑顶部工具栏「定位组 N×N」下拉——列数/行数、「全部 N 个定位组」勾选、`批量改为 N×N（K 组）`；未勾「全部」时只作用于框选到的定位组中心。
+- 对象浮窗「码组规格」卡保留「全部定位组应用」（按当前行×列/整组尺寸一次改完整图）。
+
+### 3. 素材库拖入落点精确化
+- 单个加码：落点＝新建点坐标；阵列：以落点为中心生成（origin=落点−(列−1)·横距/2 …）；直线：起点＝指针首次进入画布的点（不再误用画布外的素材库起点）。
+- 拖动过程中锁定指针世界坐标（`worldX/worldY`），松手后的布局变化不再影响落库位置；落点误差 ≤2 mm、渲染位置 ≤6 px（回归实测）。
+- 连续拖入不丢失：`beginToolDrag` 不再被保存中的 busy 拦截；`dropCreate` 等待写锁释放后落库。
+
+### 4. 拖入/保存引发的画布漂移修复
+- `route-toast` 提示条由文档流改为画布浮层：此前它出现时把画布顶矮 ~30 px，ResizeObserver 按「内容中心不动」重定位后整体漂移 ~15 px，表现为「拖进去的点不在松手位置」。
+- ResizeObserver 对 ≤16 px 的微小尺寸变化只更新尺寸、不重算 stage.position。
+
+### 5. 框选批量条（box-batch-bar）
+- 停靠画布右上角（画布内 `absolute; top/right:10px`），不再遮挡顶部工具栏（更多/保存路径/退出）与地图中心。
+- 去除全部说明性文字，只保留标签、数值与按钮。
+- 批量改规格：默认值＝选中码当前尺寸；只提交真正变化的 id；一个都不用改时提示「选中的二维码已经是 X mm，无需修改」，不再触发服务端 400（「没有可保存的改动」）。
+- 路径编辑里框选多码：全部高亮 + 批量条（水平/垂直对齐、批量改规格、重排为阵列、批量删除、两点距离、等间距）。
+
+### 6. 「开始导航」页只读
+- 非路径编辑：画布不可拖点、不可框选（MapCanvas 框选起始条件加 `props.editable`）、批量条不出现。
+- 对象浮窗只读：X/Y/朝向输入禁用，「二维码规格 / 码组规格 / 拖入实例参数 / 删除」不渲染；`patchDraftObject / mapCanvasMove / onCanvasBoxSelect` 增加编辑态守卫。所有修改一律进「路径编辑」。
+
+### 7. 其他交互修复
+- 选中高亮：`props.selected` 变化只重刷真实 Konva 节点样式（fill/stroke/label），不重建几何——修复「选中无高亮」「拖动后弹回原位」。
+- 路径编辑里二维码可拖动保存；对象浮窗参数（行列/间距/规格）在路径编辑可见可改。
+- 「只读」黄标只在机器人运行 / 等待指令确认 / 正交草稿时显示；保存中的 busy 不再闪现。
+- `mapTool` TDZ 声明顺序修复（此前开发环境整页空白）。
+- MapCanvas 暴露 `clientToWorld / screenOfTag / tagStyle` 只读调试口，供回归与浮窗定位使用。
+
+### 8. 测试与部署
+- `tests/browser/` 新增/更新：dropfix、palanche、selhighlight、rectarray、pointedit、pointedit2、real5fix、groupspec、multisel、sixfix、pdfrect、topoflicker、insight、fix48、fix50、livebatchgroup（真实后端）等；隔离构建 78/78 通过，部署后线上 68/68 通过。
+- 部署形态：`web/frontend/dist/` 随库提交（当前引用 `assets/index-BenuhDQb.js` 与 `assets/index-_khPp127.css`），树莓派上 `node --import tsx web/backend/src/server.ts` 直接服务。
 
 ## v10 改动（相对 `v9` / `b1bcf33`）— 2026-10-26（已推送 `refs/heads/v10`）
 

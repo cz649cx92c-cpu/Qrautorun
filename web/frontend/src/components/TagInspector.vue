@@ -2,9 +2,30 @@
 import {ref,watch,computed} from 'vue';
 import type {FieldMap} from '../../../shared/model';
 const props=defineProps<{map:FieldMap,version:number,tagId:number}>();
-type Info={family:string,kind:'single'|'board',board?:{id:string,sizeMm:number,gridSize:number},members:{id:number,sizeMm:number|null}[],printable:boolean,unavailableReason?:string};
+type BoardSpec={id:string,sizeMm:number,gridSize:number,rows?:number,cols?:number,widthMm?:number,heightMm?:number};
+type Info={family:string,kind:'single'|'board',board?:BoardSpec,members:{id:number,sizeMm:number|null}[],printable:boolean,unavailableReason?:string};
 const info=ref<Info|null>(null),error=ref(''),memberId=ref(0),crosshair=ref(true),loading=ref(false);
 const base=computed(()=>`/api/maps/${encodeURIComponent(props.map.id)}/tags/${props.tagId}/`);
+const countOf=(value:number|undefined,fallback:number)=>Number.isFinite(value)&&(value as number)>=1?Math.round(value as number):fallback;
+const mmText=(value:number)=>Number.isInteger(value)?String(value):value.toFixed(1);
+/**
+ * 只读规格：新地图带 rows/cols/widthMm/heightMm 时按真实矩形显示；旧地图缺字段时
+ * 退回原有 gridSize×gridSize / sizeMm 文案，保证历史版本仍能补打。
+ */
+const boardSpec=computed(()=>{
+ const board=info.value?.board;
+ if(!board)return '';
+ const legacy=board.rows===undefined&&board.cols===undefined&&board.widthMm===undefined&&board.heightMm===undefined;
+ if(legacy)return `${board.gridSize}×${board.gridSize} · ${mmText(board.sizeMm)} mm`;
+ const rows=countOf(board.rows,countOf(board.gridSize,1)),cols=countOf(board.cols,countOf(board.gridSize,1));
+ const width=Number.isFinite(board.widthMm)?board.widthMm as number:board.sizeMm;
+ const height=Number.isFinite(board.heightMm)?board.heightMm as number:board.sizeMm;
+ const tileW=(width-(cols-1)*2)/cols,tileH=(height-(rows-1)*2)/rows,single=Math.min(tileW,tileH)/1.25;
+ const detail=`列×行 ${cols}×${rows} · 整组 ${mmText(width)}×${mmText(height)} mm · 间距 2 mm · 单码 ${single.toFixed(1)} mm`;
+ // 方板保留「原板 N×N · S mm」前缀（既有补打测试与现场文案都依赖它），再补矩形规格；
+ // 矩形板绝不能显示 gridSize×gridSize 的方板尺寸。
+ return rows===cols&&width===height?`${board.gridSize}×${board.gridSize} · ${mmText(board.sizeMm)} mm · ${detail}`:detail;
+});
 function url(format:string,target:string){return `${base.value}reprint.${format}?version=${props.version}&target=${target}&memberId=${memberId.value}&centerCrosshair=${crosshair.value}`;}
 let generation=0;
 watch(()=>[props.map.id,props.version,props.tagId],async()=>{const current=++generation;info.value=null;error.value='';try{const response=await fetch(`${base.value}print-info?version=${props.version}`),data=await response.json();if(!response.ok)throw new Error(data.error);if(current!==generation)return;info.value=data;memberId.value=data.members[0].id;}catch(e){if(current===generation)error.value=(e as Error).message;}},{immediate:true});
@@ -16,7 +37,7 @@ async function download(target:string){loading.value=true;error.value='';try{con
   <template v-if="info">
    <strong>{{info.family}} · {{info.kind==='board'?'整组定位板 '+info.board?.id:'独立单码'}}</strong>
    <template v-if="info.board">
-    <p>原板 {{info.board.gridSize}}×{{info.board.gridSize}} · {{info.board.sizeMm}} mm</p>
+    <p data-testid="tag-inspector-board-spec">原板 {{boardSpec}}</p>
     <label><input v-model="crosshair" type="checkbox">整组中心十字（有安全白缝时）</label>
     <img :src="url('svg','board')" :alt="`${info.board.id} 原尺寸整板预览`" data-testid="original-board-preview">
     <button type="button" :disabled="loading" @click="download('board')" data-testid="reprint-board">下载原尺寸整板 PDF</button>

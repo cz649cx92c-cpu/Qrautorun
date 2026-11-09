@@ -252,6 +252,9 @@ defineExpose({closeMore});
 
     <span class="re-tb__spacer" aria-hidden="true" />
 
+    <!-- 业务扩展位：App 在这里注入「定位组批量改 行×列」这类与路径命令无关的批量控件 -->
+    <slot name="extra" />
+
     <div class="re-tb__group re-tb__actions" role="group" aria-label="路径命令">
       <details ref="more" class="re-tb__more" data-testid="route-more" @toggle="onMoreToggle">
         <summary class="re-tb__more-summary" :aria-label="moreLabel" :title="moreLabel + '：低频路径命令'">

@@ -5,14 +5,15 @@ import type {FieldMap,Point} from '../../../shared/model';
 import {exitPoint,heading,distance,orderedTagsById,vehicleFootprintM} from '../../../shared/model';
 import {orthogonalRoute,snapRoutePoint,chainRouteGroups,routeGroupCenters} from '../../../shared/route-design';
 import {orderMotionSegmentsByChain} from '../../../shared/route';
+import {minCenterGapM,MIN_TAG_DISTANCE_M} from '../../../shared/map-tag-distance';
 import {planStrategies,choicesFromSegments,degrees,type SegmentPlan} from '../../../shared/segment-strategy';
 import {normalizeRect,pointsInRect,applyBoxSelection,type SelectionPoint} from '../composables/useCanvasSelection';
 import {IDLE_LINK,beginLink,previewLink,cancelLink,resolveLink,previewSegment,type LinkState} from '../composables/useCanvasLinks';
 import {computeFitBounds,fitTransform,planLabels,estimateLabelWidth,DEFAULT_PADDING_RATIO,type FitMode,type LabelCandidate,type LabelPlan,type PlacedLabel} from '../composables/useCanvasFit';
-import {Plus,Minus,Scan,MousePointer2} from 'lucide-vue-next';
+import {Plus,Minus,Scan} from 'lucide-vue-next';
 import Button from './ui/Button.vue';
 const props=defineProps<{map:FieldMap,selected:number[],rowId:string,tool:string,editable:boolean,drawing:Point[],panEnabled?:boolean,measurement?:number[],vehicle?:{x:number,y:number,yaw:number},trail?:Point[],routeAnchors?:Point[],routeSelected?:number,routeGroupIds?:number[],routeSkippedGroups?:{id:number,distanceM:number}[],routeName?:string,segmentPlans?:SegmentPlan[],selectedSegment?:string,initialHeading?:number,drawMode?:boolean,spacingMode?:boolean,spacingLine?:number[],spacingGaps?:{fromId:number;toId:number;m:number}[],ghostTags?:{x:number;y:number;id?:number}[],tagEditing?:boolean,panMode?:'pan'|'select',modeLabel?:string,tagAliases?:Map<number,string>,fitMode?:'tags-and-route'|'whole-map',fitRequest?:number}>();
-const emit=defineEmits<{select:[id:number,multi:boolean],inspect:[id:number],segmentSelect:[key:string],row:[id:string],blank:[point:Point],move:[ids:number[],dx:number,dy:number],point:[rowId:string,index:number,point:Point],zone:[index:number,point:Point],designSelect:[index:number],designMove:[index:number,point:Point],heading:[value:number],ghostMove:[index:number,point:Point],tagDetail:[id:number],gapEdit:[payload:{fromId:number;toId:number;m:number;x:number;y:number}],gapHover:[payload:{fromId:number;toId:number}|null],boxSelect:[ids:number[]],connect:[payload:{fromId:number;toId:number}],linkRejected:[payload:{code:string;message:string}]}>();
+const emit=defineEmits<{select:[id:number,multi:boolean],inspect:[id:number],segmentSelect:[key:string],row:[id:string],blank:[point:Point],move:[ids:number[],dx:number,dy:number],point:[rowId:string,index:number,point:Point],zone:[index:number,point:Point],designSelect:[index:number],designMove:[index:number,point:Point],heading:[value:number],ghostMove:[index:number,point:Point],tagDetail:[id:number],gapEdit:[payload:{fromId:number;toId:number;m:number;x:number;y:number}],gapHover:[payload:{fromId:number;toId:number}|null],boxSelect:[ids:number[]],connect:[payload:{fromId:number;toId:number}],linkRejected:[payload:{code:string;message:string}],'snap-blocked':[payload:{message:string}]}>();
 const container=ref<HTMLDivElement>();let stage:Konva.Stage;let layer:Konva.Layer;let overlayLayer:Konva.Layer;let observer:ResizeObserver;let isMounted=false;const coordinate=ref('X 0.00 · Y 0.00 m'),zoom=ref(100);
 // Live telemetry (vehicle/trail) lives on a persistent overlay layer. The static layer below it
 // owns every interactive node (QR groups, waypoint/handle/heading knobs) and is only rebuilt for
@@ -22,8 +23,8 @@ let staticBuilds=0,overlayUpdates=0;
 const px=(p:Point)=>[p.x*100,-p.y*100];
 /** 板组编号相对板中心的固定纵向间距（屏幕像素）。 */
 const LABEL_GAP_PX=14;
-/** 段动作标签开始显示的缩放阈值：低于此值只显示选中段，避免与 B 编号叠字。 */
-const SEGMENT_LABEL_MIN_SCALE=0.9;
+// 段动作标签（步骤·4T4D 前进/倒车/平移）不再按缩放阈值常驻显示：
+// 常态只保留路线/方向箭头/定位组/机器人，详情通过选中或悬停该段按需查看。
 // B 编号在极低缩放下不再强制显示：路线经过的板被标为 priority=3（永不隐藏），
 // 但 12 段路线会同时强制十几块板，0.45 以下屏幕上必然互压。
 // 低于该阈值时让板编号退回「能放下才显示」（选中项仍强制），与段标签同一分层规则。
@@ -71,6 +72,9 @@ const canvasMode=ref<CanvasMode>('select');
 // 框选矩形一律用**地图坐标（米）**记录，不能用 stage 的绝对屏幕像素：
 // 命中判定拿的是二维码中心（米），两者混用会让框选永远命中 0 个。
 let boxOrigin:{x:number;y:number}|null=null,boxCurrent:{x:number;y:number}|null=null,boxActive=false;
+// 本次指针手势是否始于「画布空白处按下」的框选候选。stage 收不到 mouseup 时（在画布外松手、
+// 窗口失焦、系统手势取消），靠它让 window/document 级兜底知道「现在有一个框选手势没收尾」。
+let boxGestureOpen=false;
 // null = 还没框选过（区别于「框了但没命中」，后者是 0）。
 const boxCount=ref<number|null>(null);
 // 当前悬停的码：只用于标签优先级（悬停的编号必须清晰可见），不参与命中判定。
@@ -80,9 +84,31 @@ const linkPointer=ref<{x:number;y:number}|null>(null);
 function tagCenters(){const centers=new Map<number,{x:number;y:number}>();for(const tag of props.map.tags)centers.set(tag.id,{x:tag.x,y:tag.y});return centers;}
 function selectionPoints():SelectionPoint[]{return props.map.tags.map(tag=>({id:tag.id,x:tag.x,y:tag.y}));}
 function clearBox(){
- boxOrigin=null;boxCurrent=null;boxActive=false;
- if(stage){const existing=stage.findOne('#box-select-rect');existing?.destroy();layer?.batchDraw();}
+ boxOrigin=null;boxCurrent=null;boxActive=false;boxGestureOpen=false;
+ // 用 find 而不是 findOne：拖动过程中若图层被重建过一次，画布上可能不止一份残留矩形。
+ // 无论框选手势从哪条路径收尾，这里都保证节点被销毁、状态被复位。
+ if(!stage)return;
+ for(const node of stage.find<Konva.Rect>('#box-select-rect'))node.destroy();
+ layer?.batchDraw();
 }
+/**
+ * 结束一次框选手势。commit=true 才按当前矩形提交选中（只有真的拖出了矩形才 emit，
+ * 与旧实现语义一致）；无论走哪条分支都会执行 clearBox，矩形不会留在画布上。
+ */
+function endBoxDrag(commit:boolean){
+ if(commit&&boxActive&&boxOrigin&&boxCurrent){
+  const rect=normalizeRect(boxOrigin,boxCurrent);
+  const hit=pointsInRect(selectionPoints(),rect);
+  boxCount.value=hit.length;
+  if(container.value)container.value.dataset.canvasBoxSelectCount=String(hit.length);
+  emit('boxSelect',applyBoxSelection(props.selected,hit,false));
+  swallowNextClick=true;
+ }
+ clearBox();
+}
+function boxGesturePending(){return boxGestureOpen||boxOrigin!==null||boxCurrent!==null||boxActive||!!stage?.findOne('#box-select-rect');}
+/** 兜底收尾：只清理视觉框，不提交选中（「哪些 id 被发出」的语义保持完全不变）。 */
+function endBoxGestureQuietly(){if(boxGesturePending())endBoxDrag(false);}
 function drawBox(){
  if(!boxOrigin||!boxCurrent||!stage)return;
  const rect=normalizeRect(boxOrigin,boxCurrent);
@@ -178,10 +204,152 @@ let pressMoved=false;                           // 本次按下移动过（含�
 // 下一次按下时会复位，所以松手后立刻点选不会受影响。
 let swallowNextClick=false;
 function consumeClickGuard(){const guard=swallowNextClick;swallowNextClick=false;return guard;}
-function resetPointerState(){spaceHeld=false;middleHeld=false;suppressDesignClick=false;pressOrigin=null;panOrigin=null;panActive=false;panMoved=false;pressMoved=false;swallowNextClick=false;container.value?.classList.remove('is-dragging');refreshMode();}
+// Konva 只把 mouseup/pointerup 绑在 stage 的 canvas 元素上：在画布外松手、切到别的应用、
+// 系统手势取消时 stage 收不到事件，框选矩形就会一直留在画布上（本次修的缺陷）。
+// 下面这些 window/document 级监听是兜底：它们只做「收尾清理」，绝不提交选中，
+// 因此「哪些 id 被 emit」的语义与旧实现完全一致（旧实现同样不会在画布外松手时选中）。
+// 注册在冒泡阶段（capture:false）：画布内的正常松手仍由 stage 的 mouseup 先提交，
+// 走到这里时状态已清空，是幂等的 no-op。
+// 窗口级释放只作为兜底：Konva 的 stage mouseup 需要先拿到这次释放去提交框选，
+// 所以延后到本轮事件派发结束再清理；stage 已处理过就不会再有遗留状态。
+let releaseFallbackTimer:ReturnType<typeof setTimeout>|undefined;
+function onWindowRelease(){
+ if(releaseFallbackTimer)clearTimeout(releaseFallbackTimer);
+ releaseFallbackTimer=setTimeout(()=>{
+  releaseFallbackTimer=undefined;
+  // 只有 stage 确实没收到释放（框还开着）时才兜底清理。
+  if(boxGesturePending())endBoxGestureQuietly();
+ },0);
+}
+function onWindowPointerCancel(){if(boxGesturePending())endBoxGestureQuietly();}
+function onWindowMouseOut(e:MouseEvent){if(!e.relatedTarget&&boxGesturePending())endBoxGestureQuietly();}
+function onDocumentVisibility(){if(document.visibilityState==='hidden')endBoxGestureQuietly();}
+function bindBoxReleaseFallbacks(){
+ window.addEventListener('mouseup',onWindowRelease);
+ window.addEventListener('pointerup',onWindowRelease);
+ window.addEventListener('touchend',onWindowRelease);
+ window.addEventListener('pointercancel',onWindowPointerCancel);
+ window.addEventListener('mouseout',onWindowMouseOut);
+ document.addEventListener('visibilitychange',onDocumentVisibility);
+}
+function unbindBoxReleaseFallbacks(){
+ window.removeEventListener('mouseup',onWindowRelease);
+ window.removeEventListener('pointerup',onWindowRelease);
+ window.removeEventListener('touchend',onWindowRelease);
+ window.removeEventListener('pointercancel',onWindowPointerCancel);
+ window.removeEventListener('mouseout',onWindowMouseOut);
+ document.removeEventListener('visibilitychange',onDocumentVisibility);
+}
+function resetPointerState(){spaceHeld=false;middleHeld=false;suppressDesignClick=false;pressOrigin=null;panOrigin=null;panActive=false;panMoved=false;pressMoved=false;swallowNextClick=false;container.value?.classList.remove('is-dragging');container.value?.removeAttribute('data-canvas-panning');clearAlignGuides();snapBlockedThisGesture=false;container.value?.setAttribute('data-canvas-snap','');container.value?.setAttribute('data-canvas-snap-blocked','');endBoxGestureQuietly();refreshMode();}
+// ===== 多选拖动：虚线对齐参考 + 自动吸附 =====
+// 拖动中实时画出与邻近点的 X/Y 对齐虚线，并在容差内吸附，落点精确共线。
+type MapTag=FieldMap['tags'][number];
+type AlignGuide={axis:'x'|'y';x1:number;y1:number;x2:number;y2:number};
+type SnapResult={dxPx:number;dyPx:number;guides:AlignGuide[];snappedX:boolean;snappedY:boolean;blocked:boolean;reason:string|null;message:string};
+let alignNodes:Konva.Line[]=[];let dragOrigin:{x:number;y:number}|null=null;let dragSelection:number[]=[];
+// 一次拖动手势最多上报一条 snap-blocked（在 dragstart 复位）。
+let snapBlockedThisGesture=false;
+function clearAlignGuides(){
+ for(const node of alignNodes){node.destroy();}
+ alignNodes=[];
+ overlayLayer?.batchDraw();
+}
+/** 对齐参考线：画在 overlayLayer（该层同样跟随 stage 的缩放/平移，坐标用世界像素）。
+ *  X 吸附 → 竖线（x 固定）；Y 吸附 → 横线（y 固定）。±40 屏幕 px 换算成世界像素。 */
+function drawAlignGuides(guides:AlignGuide[]):void{
+ if(!stage||!overlayLayer)return;
+ const scale=stage.scaleX()||1;
+ const wanted=new Map<'x'|'y',AlignGuide>();
+ for(const guide of guides)wanted.set(guide.axis,guide);
+ alignNodes=alignNodes.filter(node=>{
+  const axis=node.getAttr('align-axis') as 'x'|'y'|undefined;
+  if(axis&&wanted.has(axis))return true;
+  node.destroy();
+  return false;
+ });
+ for(const [axis,guide] of wanted){
+  let node=alignNodes.find(item=>item.getAttr('align-axis')===axis);
+  if(!node){
+   node=new Konva.Line({name:axis==='x'?'align-guide-x':'align-guide-y',listening:false,stroke:'#2563a6',strokeWidth:1/scale,dash:[6/scale,4/scale],perfectDrawEnabled:false});
+   node.setAttr('align-axis',axis);
+   overlayLayer.add(node);
+   alignNodes.push(node);
+  }
+  node.setAttrs({strokeWidth:1/scale,dash:[6/scale,4/scale]});
+  node.points([guide.x1,guide.y1,guide.x2,guide.y2]);
+ }
+ overlayLayer.batchDraw();
+}
+/** 计算吸附后的增量：以**实际被拖动的那个节点**的绝对 px 位置为准，
+ *  与其余未参与本次拖动的点比较 X/Y，容差内取最近的共线位置。
+ *  容差用屏幕像素（随缩放放大），保证缩得越小越容易吸附。
+ *  A2：吸附后的中心距若小于 minCenterGapM()+0.01，就拒绝吸附（绝不移动其他码）。 */
+function snapDrag(nodeX:number,nodeY:number,originX:number,originY:number,selfIds:number[],draggedId:number):SnapResult{
+ const scale=stage.scaleX()||1;
+ // 节点坐标是世界像素（米×100），不随缩放变化；容差要先把屏幕像素换算成世界像素。
+ const tolPx=Math.min(Math.max(10/scale,8),30); // 10 屏幕 px 起步、8 cm 下限，最多 30 cm 防缩得很小时过黏
+ const pxPerM=100;
+ const others=props.map.tags.filter(t=>!selfIds.includes(t.id));
+ const dragged=props.map.tags.find(t=>t.id===draggedId);
+ const tagSize=(tag:MapTag)=>Number.isFinite(tag.size)&&tag.size>0?tag.size:MIN_TAG_DISTANCE_M;
+ const sizeA=dragged?tagSize(dragged):MIN_TAG_DISTANCE_M;
+ const groupA=!!dragged?.groupId;
+ let bestX:number|null=null,bestY:number|null=null,bestXTag:MapTag|null=null,bestYTag:MapTag|null=null;
+ for(const t of others){
+  const otherPx={x:t.x*pxPerM,y:-t.y*pxPerM};
+  const dx=Math.abs(otherPx.x-nodeX),dy=Math.abs(otherPx.y-nodeY);
+  if(dx<=tolPx&&(bestX===null||dx<Math.abs(bestX-nodeX))){bestX=otherPx.x;bestXTag=t;}
+  if(dy<=tolPx&&(bestY===null||dy<Math.abs(bestY-nodeY))){bestY=otherPx.y;bestYTag=t;}
+ }
+ // 最小中心距守卫：先把候选落点换算回米，再和吸附目标 / 其余码逐一比较。
+ const overlapAt=(worldX:number,worldY:number)=>{
+  const point={x:worldX/pxPerM,y:-worldY/pxPerM};
+  const ordered:MapTag[]=[];
+  if(bestXTag)ordered.push(bestXTag);
+  if(bestYTag&&bestYTag!==bestXTag)ordered.push(bestYTag);
+  for(const tag of others)if(!ordered.includes(tag))ordered.push(tag);
+  for(const tag of ordered){
+   const minGap=minCenterGapM(sizeA,tagSize(tag),groupA,!!tag.groupId);
+   if(Math.hypot(tag.x-point.x,tag.y-point.y)<minGap+0.01)return {tag,minGap};
+  }
+  return null;
+ };
+ let blocked=false,blockTag:MapTag|null=null,blockMinGap=0;
+ if(bestX!==null||bestY!==null){
+  const overlap=overlapAt(bestX??nodeX,bestY??nodeY);
+  if(overlap){
+   blocked=true;blockTag=overlap.tag;blockMinGap=overlap.minGap;
+   if(bestX!==null&&bestY!==null){
+    // 两轴同时吸附：拒绝修正量更小的那一轴，另一轴保留。
+    if(Math.abs(bestX-nodeX)<=Math.abs(bestY-nodeY)){bestX=null;bestXTag=null;}
+    else{bestY=null;bestYTag=null;}
+   }else if(bestX!==null){bestX=null;bestXTag=null;}
+   else{bestY=null;bestYTag=null;}
+  }
+ }
+ const finalX=bestX??nodeX,finalY=bestY??nodeY;
+ const guides:AlignGuide[]=[];
+ // X 吸附：竖线，跨两个节点的 y ± 40 屏幕 px；Y 吸附：横线，跨两个节点的 x ± 40 屏幕 px。
+ if(bestX!==null&&bestXTag){
+  const targetY=-bestXTag.y*pxPerM;
+  guides.push({axis:'x',x1:bestX,y1:Math.min(finalY,targetY)-40/scale,x2:bestX,y2:Math.max(finalY,targetY)+40/scale});
+ }
+ if(bestY!==null&&bestYTag){
+  const targetX=bestYTag.x*pxPerM;
+  guides.push({axis:'y',x1:Math.min(finalX,targetX)-40/scale,y1:bestY,x2:Math.max(finalX,targetX)+40/scale,y2:bestY});
+ }
+ return {
+  dxPx:finalX-originX,dyPx:finalY-originY,guides,
+  snappedX:bestX!==null,snappedY:bestY!==null,
+  blocked,reason:blocked?'min-center-gap':null,
+  message:blocked&&blockTag?`吸附会与 Q${String(blockTag.id).padStart(3,'0')} 重合（最小中心距 ${blockMinGap.toFixed(2)} m），已拒绝吸附`:'',
+ };
+}
 function redraw() {
  // Font readiness and queued resize callbacks can run after Konva destroys its stage.
  if(!isMounted||!layer||layer.getStage()!==stage)return;layer.destroyChildren();
+ // 图层重建时不允许残留上一手势的对齐参考线（dragend 之外的兜底）。
+ clearAlignGuides();
  const bounds=stage.getRelativePointerPosition();void bounds;
  const scale=stage.scaleX(),minX=-stage.x()/scale/100,maxX=(stage.width()-stage.x())/scale/100,minY=-(stage.height()-stage.y())/scale/100,maxY=stage.y()/scale/100;
  // 标记尺寸阻尼跟随缩放：屏幕目标 = base * scale^0.4，并夹在 [minPx, base*1.5]。
@@ -197,7 +365,7 @@ function redraw() {
  props.map.zone.forEach((p,i)=>{if(props.editable&&props.tool==='zone'){const [x,y]=px(p);const handle=new Konva.Circle({x,y,radius:6/scale,fill:'#2563a6',stroke:'white',strokeWidth:2/scale,draggable:true});handle.on('dragend',()=>emit('zone',i,{x:handle.x()/100,y:-handle.y()/100}));layer.add(handle);}});
  for(const row of props.map.rows) {
   const office=props.map.routeMode==='waypoints',route=office?[exitPoint(row),...row.points]:row.points;
-  const line=new Konva.Line({points:route.flatMap(px),stroke:row.id===props.rowId?'#c9d0d7':'#eef1f4',strokeWidth:office?8/scale:row.width*100,lineCap:'butt',hitStrokeWidth:row.width*100});line.on('click tap',()=>{if(props.tool==='select')emit('row',row.id);else if(props.editable&&props.tool!=='measure')emit('blank',pointer());});layer.add(line);
+  const line=new Konva.Line({points:route.flatMap(px),stroke:row.id===props.rowId?'#c9d0d7':'#eef1f4',strokeWidth:office?8/scale:row.width*100,lineCap:'butt',hitStrokeWidth:row.width*100});line.on('click tap',()=>{if(props.tool==='select')emit('row',row.id);});layer.add(line);
   layer.add(new Konva.Line({points:route.flatMap(px),stroke:row.id===props.rowId?'#2563a6':'#727d88',strokeWidth:1.8/scale,dash:[6/scale,4/scale],listening:false}));
   const e=exitPoint(row);if(!office)layer.add(new Konva.Line({points:[...px(e),...px(row.points[0]!)],stroke:'#2563a6',strokeWidth:2/scale,dash:[5/scale,4/scale],listening:false}));
   const mid=row.points[Math.floor(row.points.length/2)]!;layer.add(new Konva.Text({fontFamily:"QR Sans, QR CJK, sans-serif",x:mid.x*100+12/scale,y:-mid.y*100-26/scale,text:row.name,fontSize:16/scale,fill:'#56616d',listening:false}));
@@ -230,8 +398,7 @@ function redraw() {
   layer.add(segLine);
   // 层级规则（label 分层，不移动任何点位/路线）：
   //   1) B 组编号：常态可见（板中心，见上方 groupAnchor）。
-  //   2) 段动作/方向标签：只在 scale>=SEGMENT_LABEL_MIN_SCALE 或该段被选中时显示，
-  //      避免缩小后一堆「1·4T4D 前进」叠在画布中间。
+  //   2) 段动作/方向标签：常态隐藏，仅选中/悬停该段时显示（按需查看详情）。
   //   3) 路点序号、箭头/车图标：始终绘制，但受各自尺寸/缩放约束。
  }
  // The live trail is drawn on the overlay layer by drawOverlay(), never rebuilt with the map.
@@ -384,7 +551,10 @@ function redraw() {
    const mid=segmentMidpoint.get(segment.id);
    if(!mid)continue;
    const placed=segLabelPlacement.get(-(i+1));
-   const wantVisible=scale>=SEGMENT_LABEL_MIN_SCALE||props.selectedSegment===mid.key;
+   // 常态不显示段动作标签（步骤编号/4T4D 前进/倒车/平移）：地图只保留
+   // 路线、方向箭头、定位二维码/组与机器人。详情按需查看——选中该段
+   // （重建时置 visible）或悬停该段线（mouseenter 动态点亮，见 segLine）。
+   const wantVisible=props.selectedSegment===mid.key;
    const text=(i+1)+' · '+(segment.mode==='crab'?'平移':segment.direction==='reverse'?'4T4D 倒车':'4T4D 前进');
    // 框中心 → 左边界：减去半个标签宽度（屏幕 px 换算回 world px）。
    const nodeX=placed?((placed.sx-stage.x())/scale-(segLabelWidth/2)/scale):(mid.x*100+8/scale);
@@ -407,12 +577,17 @@ function redraw() {
 // 「加点」态（drawMode）下 tag 绝不拖动：拖动会置 pressMoved/swallowNextClick，
 // 把 click 吞掉 → 同一个码点第二次加不进路点（A→B→A 只能到 A→B）。
 // 这与提示条「方块可拖动」并不冲突：要拖动请用「选择」/「调整点位」。
-const tagDraggable=props.editable&&!props.drawMode&&!!(props.tagEditing||props.spacingMode||props.tool==='select');
-  const group=new Konva.Group({name:'tag-'+t.id,x,y,draggable:tagDraggable});
+// 平移工具（panMode/tool==='pan' 或 canvasMode==='pan'）下点必须不可拖动：
+// 否则按住点会挪点而不是平移画布。
+// 路径编辑（route-design）里也可以拖动二维码：手绘/补码地图经常边画路径边调点位。
+// drawMode（加点）仍然禁止拖动，否则会吞掉点击、导致同一个码第二次加不进路点。
+const tagDraggable=props.editable&&!props.drawMode&&props.tool!=='pan'
+ &&(!!(props.tagEditing||props.spacingMode||props.tool==='select')||props.tool==='route-design');
+  const group=new Konva.Group({id:'tag-node-'+t.id,name:'tag-'+t.id,x,y,draggable:tagDraggable,listening:true,perfectDrawEnabled:false});
   const skipped=props.tool==='route-design'&&props.routeSkippedGroups?.some(tag=>tag.id===t.id);
-  const size=ms(t.size*100,5);group.add(new Konva.Rect({x:-size/2,y:-size/2,width:size,height:size,cornerRadius:ms(2,1.2),fill:skipped?'#d97706':selected?'#2563a6':t.kind==='end'?'#2563a6':'#39444f',stroke:selected?'#c9d0d7':'white',strokeWidth:ms(2,1)}));
+  const size=ms(t.size*100,5);group.add(new Konva.Rect({name:'tag-body-'+t.id,x:-size/2,y:-size/2,width:size,height:size,cornerRadius:ms(2,1.2),fill:skipped?'#d97706':selected?'#2563a6':t.kind==='end'?'#2563a6':'#39444f',stroke:selected?'#c9d0d7':'white',strokeWidth:ms(2,1)}));
    // 热区：任何工具下都至少 32px 等效点击面积（缩得越小热区越大），点选不会因为码画得小而点不中。
-   {const hit=Math.max(size,32/scale);group.add(new Konva.Rect({x:-hit/2,y:-hit/2,width:hit,height:hit,fill:'transparent',listening:true}));}
+   {const hit=Math.max(size,32/scale);group.add(new Konva.Rect({name:'tag-hit-'+t.id,x:-hit/2,y:-hit/2,width:hit,height:hit,fill:'rgba(0,0,0,0.001)',strokeWidth:0,listening:true,perfectDrawEnabled:false}));}
    if(props.tool==='route-design'){group.setAttr('aria-label',`二维码 Q${String(t.id).padStart(3,'0')}${t.groupId?`，定位组 ${t.groupId}`:''}${props.tagAliases?.get(t.id)?`，现场名称 ${props.tagAliases.get(t.id)}`:''}`);}
   // 编辑路径时只标注与路线相关的码（途经/偏离/选中），其余码不写名字：
   // 码密时满屏 B1xx 会盖住路径本身。扫描/导航页仍全部标注。
@@ -475,7 +650,7 @@ const tagDraggable=props.editable&&!props.drawMode&&!!(props.tagEditing||props.s
   group.on('click tap',e=>{
    e.cancelBubble=true;
    // 平移/拖动后的尾随 click、或处于平移模式时，二维码既不被选中也不追加路点。
-   if(consumeClickGuard()||pressMoved)return;
+   if(consumeClickGuard())return;
    // 平移态（空格/中键/平移工具）下单击二维码不选中、也不追加路点。
    if(canvasMode.value==='pan')return;
    // 连线工具：码的点击必须在这里接住。tag 组自己 cancelBubble，
@@ -487,7 +662,8 @@ const tagDraggable=props.editable&&!props.drawMode&&!!(props.tagEditing||props.s
    if(props.tool!=='route-design'){emit('select',t.id,!!e.evt.shiftKey);return;}
    // 路径编辑：只有「加点」态才追加路点（允许同一码重复经过，如 B064→B080→B016→B080）。
    if(props.drawMode&&props.editable){
-    flushPendingClick();emit('inspect',t.id);emit('blank',{x:t.x,y:t.y});return;
+    // 点中码只切换选中，不能再发 blank（那会被父组件当成空点击，立刻清掉刚选中的）。
+    flushPendingClick();emit('inspect',t.id);return;
    }
    // 只读查看：同一码第二次点击视为双击，显示该码详情。
    if(!props.editable&&pendingClick&&pendingClick.tagId===t.id){
@@ -508,12 +684,100 @@ const tagDraggable=props.editable&&!props.drawMode&&!!(props.tagEditing||props.s
    hoveredTagId.value=null;
    labelNode.visible(!!placement);labelNode.opacity(props.tool==='route-design'&&!selected&&!skipped?.55:1);layer.batchDraw();
   });
-  group.on('dragstart',()=>{suppressDesignClick=true;pressMoved=true;container.value?.setAttribute('data-tag-dragging','1');});
-  group.on('dragend',()=>{pressMoved=true;swallowNextClick=true;container.value?.removeAttribute('data-tag-dragging');
+  let dragKind:'multi'|'single'='single';
+  group.on('dragstart',()=>{
+   suppressDesignClick=true;pressMoved=true;
+   container.value?.setAttribute('data-tag-dragging','1');
+   // A3：新手势复位吸附遥测；上一手势的对齐参考线绝不留到这一次拖动。
+   snapBlockedThisGesture=false;
+   container.value?.setAttribute('data-canvas-snap','');
+   container.value?.setAttribute('data-canvas-snap-blocked','');
+   clearAlignGuides();
+   dragKind=selected&&props.selected.length>1?'multi':'single';
+   // 多选：整批一起挪，先记下起点，由 dragmove 统一平移所有选中节点。
+   dragSelection=dragKind==='multi'?[...props.selected]:[t.id];
+   dragOrigin={x:group.x(),y:group.y()};
+   if(dragKind==='multi'){
+    for(const id of dragSelection){
+     if(id===t.id)continue;
+     const node=layer.findOne('#tag-node-'+id) as Konva.Group|undefined;
+     node?.setAttr('dragStartX',node.x());node?.setAttr('dragStartY',node.y());
+    }
+   }
+  });
+  group.on('dragmove',()=>{
+   if(!dragOrigin)return;
+   const snapped=snapDrag(group.x(),group.y(),dragOrigin.x,dragOrigin.y,dragSelection,t.id);
+   // 吸附：把被拖动节点钉到共线位置，其余选中节点跟随同样的增量。
+   group.x(dragOrigin.x+snapped.dxPx);
+   group.y(dragOrigin.y+snapped.dyPx);
+   if(dragKind==='multi'){
+    for(const id of dragSelection){
+     if(id===t.id)continue;
+     const node=layer.findOne('#tag-node-'+id) as Konva.Group|undefined;
+     if(!node)continue;
+     node.x((node.getAttr('dragStartX')??node.x())+snapped.dxPx);
+     node.y((node.getAttr('dragStartY')??node.y())+snapped.dyPx);
+    }
+   }
+   drawAlignGuides(snapped.guides);
+   // A3：当前吸附轴实时写回容器属性（被拒绝的轴不计入）。
+   container.value?.setAttribute('data-canvas-snap',snapped.snappedX&&snapped.snappedY?'xy':snapped.snappedX?'x':snapped.snappedY?'y':'');
+   // 每次手势只上报第一条拒绝（dragstart 已复位），绝不逐帧 emit。
+   if(snapped.blocked&&!snapBlockedThisGesture){
+    snapBlockedThisGesture=true;
+    container.value?.setAttribute('data-canvas-snap-blocked','1');
+    emit('snap-blocked',{message:snapped.message});
+   }
+  });
+  group.on('dragend',()=>{pressMoved=true;container.value?.removeAttribute('data-tag-dragging');
+   clearAlignGuides();
+   snapBlockedThisGesture=false;
+   container.value?.setAttribute('data-canvas-snap','');
+   container.value?.setAttribute('data-canvas-snap-blocked','');
+   // 提交前的最小中心距硬门：拖动结束时若落点与任何未参与本次拖动的码重叠，
+   // 把整批沿“对方 → 本点”方向推到安全距离之外。吸附本身已经被拒绝过，
+   // 这里兜住“用户直接把点拖到另一个点上”的情况，绝不让两个码落成同一点。
+   let pushedOut=false;
+   for(let pass=0;pass<3;pass++){
+    const selfTag=props.map.tags.find(item=>item.id===t.id);
+    const selfSize=selfTag&&Number.isFinite(selfTag.size)&&selfTag.size>0?selfTag.size:MIN_TAG_DISTANCE_M;
+    let hit:MapTag|null=null;let need=0;
+    let gx=group.x()/100,gy=-group.y()/100;
+    for(const other of props.map.tags){
+     if(dragSelection.includes(other.id))continue;
+     const otherSize=Number.isFinite(other.size)&&other.size>0?other.size:MIN_TAG_DISTANCE_M;
+     const minGap=Math.max(minCenterGapM(selfSize,otherSize,!!selfTag?.groupId,!!other.groupId),MIN_TAG_DISTANCE_M)+0.005;
+     if(Math.hypot(other.x-gx,other.y-gy)<minGap){hit=other;need=minGap;break;}
+    }
+    if(!hit)break;
+    gx=group.x()/100;gy=-group.y()/100;
+    let ux=gx-hit.x,uy=gy-hit.y;
+    let len=Math.hypot(ux,uy);
+    if(len<1e-9){ux=1;uy=0;len=1;}
+    const tx=hit.x+(ux/len)*need,ty=hit.y+(uy/len)*need;
+    const ddx=(tx-gx)*100,ddy=-(ty-gy)*100;
+    group.x(group.x()+ddx);group.y(group.y()+ddy);
+    if(dragKind==='multi'){
+     for(const id of dragSelection){
+      if(id===t.id)continue;
+      const node=layer.findOne('#tag-node-'+id) as Konva.Group|undefined;
+      if(node){node.x(node.x()+ddx);node.y(node.y()+ddy);}
+     }
+    }
+    pushedOut=true;
+   }
+   if(pushedOut){
+    container.value?.setAttribute('data-canvas-snap-blocked','1');
+    emit('snap-blocked',{message:'落点会与相邻二维码重合，已按最小中心距自动让开'});
+   }
    const dx=(group.x()-x!)/100,dy=-(group.y()-y!)/100;
+   dragOrigin=null;
    // 位移为 0 说明只是点了一下：不要制造一条空的撤销记录。
-   if(Math.abs(dx)<1e-9&&Math.abs(dy)<1e-9)return;
-   emit('move',selected?props.selected:[t.id],dx,dy);});layer.add(group);
+   if(Math.abs(dx)<1e-9&&Math.abs(dy)<1e-9){pressMoved=false;return;}
+   emit('move',dragKind==='multi'?dragSelection:[t.id],dx,dy);
+   // 松手后的尾随 click 允许选中这个被移动的点（不再吞掉下一次点击）。
+   pressMoved=false;});layer.add(group);
  }
  // ===== 段点击热区（导航视图专用）=====
  // 段线本身在 tag group 之前绘制，tag 的 32/scale 热区会盖住它；
@@ -528,9 +792,13 @@ const tagDraggable=props.editable&&!props.drawMode&&!!(props.tagEditing||props.s
    const occurrence=stored.slice(0,i).filter(x=>x.fromId===segment.fromId&&x.toId===segment.toId).length;
    const hitLine=new Konva.Line({name:'segment-hit-'+segment.id,points:segment.points.flatMap(px),stroke:'transparent',strokeWidth:0,hitStrokeWidth:22/scale,listening:true});
    hitLine.on('click tap',e=>{e.cancelBubble=true;emit('segmentSelect',pair+'#'+occurrence);});
-   hitLine.on('mouseenter',()=>{if(container.value)container.value.style.cursor='pointer';});
-   hitLine.on('mouseleave',()=>{if(container.value)container.value.style.cursor='';});
+   // 悬停查看详情：段动作标签常态隐藏，悬停该段热区时临时点亮对应标签，
+   // 移开即熄灭（选中的段除外——它的标签由重建时的 visible 语义负责）。
+   // 热区层画在 tag 之后，是真正接到指针的一层；段线本身在 tag 之下接不到。
+   hitLine.on('mouseenter',()=>{if(container.value)container.value.style.cursor='pointer';const label=layer.findOne(`.segment-label-${segment.id}`);if(label&&!label.visible())label.visible(true);layer.batchDraw();});
+   hitLine.on('mouseleave',()=>{if(container.value)container.value.style.cursor='';const label=layer.findOne(`.segment-label-${segment.id}`);if(label&&props.selectedSegment!==pair+'#'+occurrence&&label.visible())label.visible(false);layer.batchDraw();});
    layer.add(hitLine);
+   hitLine.moveToBottom();
   }
  }
  if(props.tool==='route-design'){
@@ -762,6 +1030,10 @@ onMounted(()=>{
  stage=new Konva.Stage({container:container.value!,width:container.value!.clientWidth,height:container.value!.clientHeight,draggable:false});
  exposeStageForTests(stage);
  layer=new Konva.Layer();overlayLayer=new Konva.Layer();stage.add(layer);stage.add(overlayLayer);isMounted=true;refreshMode();
+ // A3：吸附遥测属性一开始就存在（空值），回归脚本无需等待第一次拖动。
+ container.value?.setAttribute('data-canvas-snap','');
+ container.value?.setAttribute('data-canvas-snap-blocked','');
+ (window as any).__mapCanvasApi={screenOfTag,worldToClient,clientToWorld,tagStyle};
  stage.on('wheel',e=>{e.evt.preventDefault();e.evt.stopPropagation();if(e.evt.ctrlKey||e.evt.metaKey)scaleBy(e.evt.deltaY>0?0.9:1.1,stage.getPointerPosition()!);});
  // 平移绝不抢在指针真正移动之前发生：单击任何时候都不翻译 stage，也不进入 pan 状态。
  // 只有 canvasMode==='pan'|'measure'（tool==='pan' / 空格 / 中键 / measure / 路径编辑的平移工具）
@@ -792,16 +1064,19 @@ onMounted(()=>{
   if(linkState.value.phase!=='idle')return;
   // 选择态 + 空白处按下 → 候选框选。真正的框要等移动超过阈值才画，
   // 否则每次单击都会闪一个零尺寸矩形。
-  if(mode==='select'&&e.target===(stage as unknown as Konva.Node)&&left&&pointerAtPress){
+  // 框选是编辑动作：非编辑态（例如「开始导航」只读查看）不允许拖出选择框。
+ if(mode==='select'&&props.editable&&e.target===(stage as unknown as Konva.Node)&&left&&pointerAtPress){
    boxOrigin=pointer();
    boxCurrent={...boxOrigin};
    boxActive=false;
+   boxGestureOpen=true;
    return;
   }
   if(mode!=='pan'&&mode!=='measure')return;
   // 可拖动节点（二维码/路点）自己处理拖拽，不能同时平移画布。
   const target=e.target as unknown as {draggable?:()=>boolean};
-  if(e.target!==(stage as unknown as Konva.Node)&&target.draggable?.())return;
+  // 平移态：即使按在二维码上也应该平移画布，不能因为它是可拖动节点就提前返回。
+  if(mode!=='pan'&&e.target!==(stage as unknown as Konva.Node)&&target.draggable?.())return;
   if(middle)evt.preventDefault?.();
   const p=stage.getPointerPosition()!;
   panOrigin={x:p.x,y:p.y};
@@ -838,18 +1113,10 @@ onMounted(()=>{
  });
  stage.on('mouseup touchend touchcancel',()=>{
   if(panActive){panMoved=true;swallowNextClick=true;}
-  // 提交框选：只在真的拖出了矩形时 emit，并立刻清掉视觉框。
-  if(boxActive&&boxOrigin&&boxCurrent){
-   const rect=normalizeRect(boxOrigin,boxCurrent);
-   const hit=pointsInRect(selectionPoints(),rect);
-   boxCount.value=hit.length;
-   if(container.value)container.value.dataset.canvasBoxSelectCount=String(hit.length);
-   emit('boxSelect',applyBoxSelection(props.selected,hit,false));
-   swallowNextClick=true;
-   clearBox();
-  }else if(boxOrigin){
-   boxOrigin=null;boxCurrent=null;boxActive=false;
-  }
+  // 提交框选：只在真的拖出了矩形时 emit。旧实现把「清状态」和「销毁矩形」分在两条分支里，
+  // boxActive 为 false 而矩形节点已存在时会漏掉 destroy，矩形就留在画布上。
+  // 现在两条路径都走同一个收尾函数，矩形一定会被销毁。
+  endBoxDrag(boxActive&&boxOrigin!==null&&boxCurrent!==null);
   pressOrigin=null;panOrigin=null;panActive=false;middleHeld=false;
   container.value?.classList.remove('is-dragging');
   container.value?.removeAttribute('data-canvas-panning');
@@ -872,7 +1139,12 @@ onMounted(()=>{
   // 只有「加点」态（route-design + drawMode）或旧的 row 绘制工具才把空白单击当成新增路点；
   // 选择/调整/平移态的空白单击既不平移、也不产生路点。
   const addsOnBlank=props.tool==='route-design'?!!props.drawMode:props.tool==='row';
-  if(e.target===stage&&props.editable&&addsOnBlank&&!suppressDesignClick){flushPendingClick();emit('blank',pointer());}
+  // 点击空白永远通知父组件：加点模式用于追加路点，选择模式用于取消选中。
+  if(e.target===stage&&props.editable&&!suppressDesignClick){
+   flushPendingClick();
+   if(addsOnBlank)emit('blank',pointer());
+   else emit('blank',pointer());
+  }
  });
  // 双击兜底：即使子节点在两次点击之间被重绘销毁，也能在 stage 上命中最近的定位码
  stage.on('dblclick dbltap',()=>{
@@ -882,6 +1154,7 @@ onMounted(()=>{
   if(nearest)emit('tagDetail',nearest.id);
  });
  window.addEventListener('blur',resetPointerState);
+ bindBoxReleaseFallbacks();
  // 空格 = 显式平移意图（还需 props.panEnabled 给权限）；只改交互模式，不重绘图层。
  window.addEventListener('keydown',onKeyDown);
  window.addEventListener('keyup',onKeyUp);
@@ -894,6 +1167,16 @@ onMounted(()=>{
   const previousScale=lastScale||stage.scaleX()||1;
   lastWidth=width;lastHeight=height;
   stage.size({width,height});
+  // 尺寸变化很小时（拖入点位、提示条出现、面板微调）绝不重算 stage.position：
+  // 重算会按「内容中心不动」把整个画布平移几像素到几十像素，
+  // 用户看到的就是「拖进去的点不在松手的位置」。只更新尺寸、保持视角。
+  const shrink=Math.abs(width-previousWidth)<=16&&Math.abs(height-previousHeight)<=16;
+  if(shrink){
+   lastScale=stage.scaleX()||1;
+   redraw();
+   syncPanState();
+   return;
+  }
   // 内容中心（世界坐标）在尺寸变化前后保持不动：否则会「视角自己跑偏」。
   const worldCenterX=(previousWidth/2-stage.x())/previousScale;
   const worldCenterY=(previousHeight/2-stage.y())/previousScale;
@@ -909,7 +1192,35 @@ onMounted(()=>{
  });
  observer.observe(container.value!);fit();void document.fonts.ready.then(redraw);
 });
-watch(()=>[props.map,props.selected,props.rowId,props.drawing,props.measurement,props.routeAnchors,props.routeSelected,props.routeGroupIds,props.routeSkippedGroups,props.initialHeading,props.editable,props.segmentPlans,props.selectedSegment,props.spacingMode,props.spacingLine,props.spacingGaps,props.ghostTags,props.tagEditing,props.tagAliases],redraw,{deep:true});
+// 注意：框选/多选只改变 props.selected，几何没变。
+// 旧实现把它也当重建信号，于是「拖走一个点后再框选整组」会用父组件尚未回写的
+// 旧坐标重建节点，被拖走的点看起来弹回原位。选中态只刷新高亮，不重建几何。
+watch(()=>[props.map,props.rowId,props.drawing,props.measurement,props.routeAnchors,props.routeSelected,props.routeGroupIds,props.routeSkippedGroups,props.initialHeading,props.editable,props.segmentPlans,props.selectedSegment,props.spacingMode,props.spacingLine,props.spacingGaps,props.ghostTags,props.tagEditing,props.tagAliases],redraw,{deep:true});
+/** 选中高亮只改现有节点的样式，不重建几何。
+ *  重建会用父组件里尚未回写的旧坐标覆盖刚拖动的节点（看起来像「弹回原位」），
+ *  所以 props.selected 不在 redraw watcher 里；但只 batchDraw() 又不会重新计算
+ *  fill/stroke，结果就是「选中了却没有高亮」。这里按当前选中集合原地重刷样式。 */
+function syncTagSelection(){
+ if(!isMounted||!layer||layer.getStage()!==stage)return;
+ for(const t of props.map.tags){
+  const group=layer.findOne('#tag-node-'+t.id) as Konva.Group|null;
+  if(!group)continue;
+  const selected=props.selected.includes(t.id)||(props.tool==='route-design'&&!!props.routeGroupIds?.includes(t.id));
+  const skipped=props.tool==='route-design'&&!!props.routeSkippedGroups?.some(tag=>tag.id===t.id);
+  const body=group.findOne('.tag-body-'+t.id) as Konva.Rect|null;
+  if(body){
+   body.fill(skipped?'#d97706':selected?'#2563a6':t.kind==='end'?'#2563a6':'#39444f');
+   body.stroke(selected?'#c9d0d7':'white');
+  }
+  const label=group.findOne('.tag-label-'+t.id) as Konva.Text|null;
+  if(label){
+   label.fill(skipped?'#d97706':selected?'#2563a6':(props.tool==='route-design'?'#9aa6b2':'#56616d'));
+   label.opacity(props.tool==='route-design'&&!selected&&!skipped?0.55:1);
+  }
+ }
+ layer.batchDraw();
+}
+watch(()=>props.selected,()=>{syncTagSelection();},{deep:true});
 // Telemetry-only props never rebuild the static/interactive layer; they only refresh the overlay.
 watch(()=>[props.vehicle?.x,props.vehicle?.y,props.vehicle?.yaw],drawOverlay);
 watch(()=>props.trail,drawOverlay,{deep:true});
@@ -940,10 +1251,43 @@ watch(()=>props.tool,(tool,previous)=>{
  if(!isMounted)return;
  if(tool==='route-design'&&previous!==undefined&&previous!=='route-design')fit();
 });
-onBeforeUnmount(()=>{isMounted=false;window.removeEventListener('blur',resetPointerState);window.removeEventListener('keydown',onKeyDown);window.removeEventListener('keyup',onKeyUp);document.removeEventListener('keydown',onKeyDown);document.removeEventListener('keyup',onKeyUp);resetPointerState();observer?.disconnect();stage?.off();stage?.destroy();});
-defineExpose({fit,fitView});
+onBeforeUnmount(()=>{isMounted=false;delete (window as any).__mapCanvasApi;unbindBoxReleaseFallbacks();window.removeEventListener('blur',resetPointerState);window.removeEventListener('keydown',onKeyDown);window.removeEventListener('keyup',onKeyUp);document.removeEventListener('keydown',onKeyDown);document.removeEventListener('keyup',onKeyUp);resetPointerState();observer?.disconnect();stage?.off();stage?.destroy();});
+/** 屏幕坐标 -> 地图米坐标：供「从左侧工具拖入画布」落点换算。 */
+function clientToWorld(clientX:number,clientY:number):Point|null{
+ if(!stage||!container.value)return null;
+ const rect=container.value.getBoundingClientRect();
+ if(!rect.width||!rect.height)return null;
+ const scale=stage.scaleX()||1;
+ const sx=clientX-rect.left,sy=clientY-rect.top;
+ return {x:(sx-stage.x())/scale/100,y:-(sy-stage.y())/scale/100};
+}
+function worldToClient(point:Point){
+ if(!stage)return null;
+ const box=stage.container().getBoundingClientRect();
+ const scaleX=stage.scaleX()||1,scaleY=stage.scaleY()||1;
+ return {x:box.left+stage.x()+point.x*100*scaleX,y:box.top+stage.y()-point.y*100*scaleY};
+}
+/** 真实渲染节点的当前样式（高亮断言用；读的就是 Konva 节点本身）。 */
+function tagStyle(id:number){
+ if(!stage)return null;
+ const group=layer?.findOne('#tag-node-'+id) as Konva.Group|null;
+ if(!group)return null;
+ const body=group.findOne('.tag-body-'+id) as Konva.Rect|null;
+ const label=group.findOne('.tag-label-'+id) as Konva.Text|null;
+ return {fill:body?String(body.fill()):null,stroke:body?String(body.stroke()):null,labelFill:label?String(label.fill()):null};
+}
+/** 真实渲染节点在页面里的中心点：测试与浮窗定位都用它，不允许估算。 */
+function screenOfTag(id:number){
+ if(!stage)return null;
+ const node=layer?.findOne('#tag-node-'+id) as Konva.Group|null;
+ if(!node)return null;
+ const abs=node.getAbsolutePosition();
+ const box=stage.container().getBoundingClientRect();
+ return {x:box.left+abs.x,y:box.top+abs.y};
+}
+defineExpose({fit,fitView,clientToWorld,worldToClient,screenOfTag,tagStyle});
 </script>
-<template><div :class="['canvas-wrap',{'pan-mode':canvasMode==='pan'}]"><div ref="container" class="map-container" data-testid="map-canvas" :data-canvas-box-select-count="boxCount===null?undefined:String(boxCount)" :data-canvas-link-state="linkState.phase" :data-canvas-link-from="linkState.fromId??''" :data-canvas-fit-mode="fitMode??'tags-and-route'" :data-canvas-mode="canvasMode" :data-canvas-tool="tool" :data-canvas-editable="editable?'1':'0'" :data-canvas-draw-mode="drawMode?'1':'0'" :data-canvas-pan-enabled="panEnabled?'1':'0'" :data-canvas-tag-editing="tagEditing?'1':'0'" :data-canvas-pan-mode="panMode==='pan'?'1':panMode==='select'?'0':undefined" :data-canvas-mode-label="modeLabel" :data-canvas-selected="selected.join(',')" :data-route-selected="routeSelected??-1" :data-route-waypoints="(routeAnchors??[]).length" :data-route-group-ids="tool==='route-design'?routeGroupIds?.join(','):undefined" :data-skipped-route-group-ids="tool==='route-design'?routeSkippedGroups?.map(tag=>tag.id).join(','):undefined"/><div class="canvas-caption"><span class="dot"></span> 单位 m</div><div class="canvas-controls"><Button variant="outline" size="icon" aria-label="放大地图" @click="scaleBy(1.2)"><Plus :size="16"/></Button><Button variant="outline" size="icon" aria-label="缩小地图" @click="scaleBy(0.8)"><Minus :size="16"/></Button><Button variant="outline" size="icon" aria-label="适应地图" @click="fit"><Scan :size="16"/></Button></div><div class="canvas-footer"><span>{{coordinate}}</span><span>{{zoom}}%</span></div><div v-if="tool==='route-design'&&canvasMode!=='pan'" class="draw-hint"><MousePointer2 :size="14"/> {{drawMode?'单击追加路点 · 方块可拖动 · 组中心自动吸附':'单击选中二维码/路点 · 拖动路点调整 · 空格或中键拖动画布'}}</div><div v-if="tool==='route-design'&&canvasMode==='pan'" class="draw-hint pan-hint"><MousePointer2 :size="14"/> 平移模式：按住左键拖动地图 · 单击不改变路径</div><div v-if="tool==='row'" class="draw-hint"><MousePointer2 :size="14"/> 点击画布添加路线控制点，再点击“完成绘制”</div></div></template>
+<template><div :class="['canvas-wrap',{'pan-mode':canvasMode==='pan'}]"><div ref="container" class="map-container" data-testid="map-canvas" data-drop-surface="1" :data-canvas-box-select-count="boxCount===null?undefined:String(boxCount)" :data-canvas-link-state="linkState.phase" :data-canvas-link-from="linkState.fromId??''" :data-canvas-fit-mode="fitMode??'tags-and-route'" :data-canvas-mode="canvasMode" :data-canvas-tool="tool" :data-canvas-editable="editable?'1':'0'" :data-canvas-draw-mode="drawMode?'1':'0'" :data-canvas-pan-enabled="panEnabled?'1':'0'" :data-canvas-tag-editing="tagEditing?'1':'0'" :data-canvas-pan-mode="panMode==='pan'?'1':panMode==='select'?'0':undefined" :data-canvas-mode-label="modeLabel" :data-canvas-selected="selected.join(',')" :data-route-selected="routeSelected??-1" :data-route-waypoints="(routeAnchors??[]).length" :data-route-group-ids="tool==='route-design'?routeGroupIds?.join(','):undefined" :data-skipped-route-group-ids="tool==='route-design'?routeSkippedGroups?.map(tag=>tag.id).join(','):undefined"/><slot/><div class="canvas-caption"><span class="dot"></span> 单位 m</div><div class="canvas-controls"><Button variant="outline" size="icon" aria-label="放大地图" @click="scaleBy(1.2)"><Plus :size="16"/></Button><Button variant="outline" size="icon" aria-label="缩小地图" @click="scaleBy(0.8)"><Minus :size="16"/></Button><Button variant="outline" size="icon" aria-label="适应地图" @click="fit"><Scan :size="16"/></Button></div><div class="canvas-footer"><span>{{coordinate}}</span><span>{{zoom}}%</span></div><div v-if="tool==='row'" class="draw-hint"><MousePointer2 :size="14"/> 点击画布添加路线控制点，再点击“完成绘制”</div></div></template>
 
 <style scoped>
 .draw-hint{position:absolute;left:14px;bottom:56px;max-width:calc(100% - 90px);display:flex;align-items:center;gap:6px;padding:5px 9px;background:rgba(248,250,252,.94);border:0;border-radius:8px;box-shadow:0 1px 3px rgba(15,23,42,.07);color:var(--muted);font-size:12px;line-height:1.5;pointer-events:none}.draw-hint svg{flex-shrink:0}

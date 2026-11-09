@@ -60,6 +60,12 @@ type Numeric=string|number;
 
 const busy=ref(false),error=ref(''),message=ref('');
 const draft=ref<Draft|null>(null);
+type OperationPanel='grid'|Operation;
+// Pure data state: default 'move' open, others closed. Nothing here listens to DOM
+// events, so opening another group can never feed back into this ref.
+const operationOpen=ref<Record<OperationPanel,boolean>>({grid:false,insert:false,remove:false,move:true,equalize:false,translate:false,rotate:false,mirror:false});
+function toggleOperation(operation:OperationPanel):void{operationOpen.value={...operationOpen.value,[operation]:!operationOpen.value[operation]};}
+function isOperationOpen(operation:OperationPanel):boolean{return operationOpen.value[operation];}
 const gridSnap=ref(true),gridSize=ref<Numeric>('0.05');
 const insertIndex=ref<Numeric>(1),insertX=ref<Numeric>('0'),insertY=ref<Numeric>('0');
 const removeIndex=ref<Numeric>(0);
@@ -385,76 +391,12 @@ onBeforeUnmount(()=>{if(draft.value) emit('preview-points',null);});
 
 <template>
  <div class="rg" data-testid="route-geometry-panel" :data-route-id="routeId" :data-map-version="version">
-  <div class="rg-head">
-   <strong><Ruler :size="15"/> 路径几何</strong>
-   <span class="rg-summary" data-testid="route-geometry-summary">{{summary}}</span>
-  </div>
-  <p class="rg-hint">诊断与校验只读；每个操作先在本地预览，确认后按地图 v{{version}} 写回当前路径。</p>
   <div v-if="points.length<2" class="rg-alert warn" data-testid="route-geometry-empty"><AlertTriangle :size="14"/><span>当前路径不足两个控制点，无法做几何编辑。</span></div>
 
-  <!-- 1. 诊断 -->
-  <section class="rg-sec" data-testid="route-geometry-diagnostics">
-   <h4>
-    <Stethoscope :size="13"/> 诊断
-    <span :class="['rg-badge',diagnoseBlocked.length?'bad':'ok']" data-testid="route-geometry-diag-status">{{diagnoseBlocked.length?'无法编译':'可编译'}}</span>
-   </h4>
-   <div v-if="diagnoseBlocked.length" class="rg-alert error" role="alert" data-testid="route-geometry-diag-alert">
-    <AlertTriangle :size="14"/>
-    <div><b>编译风险</b><p v-for="(reason,index) in diagnoseBlocked" :key="'risk'+index">{{reason}}</p></div>
-   </div>
-   <dl class="rg-rows">
-    <div data-testid="route-geometry-diag-tag-to-tag"><dt>码到码段（精确）</dt><dd>{{exactLegsText}}</dd></div>
-    <div data-testid="route-geometry-diag-tag-to-tag-snapped"><dt>码到码段（吸附）</dt><dd>{{snappedLegsText}}</dd></div>
-    <div data-testid="route-geometry-diag-snapped"><dt>吸附端点</dt><dd>{{snappedText}}</dd></div>
-    <div data-testid="route-geometry-diag-unbound"><dt>未绑定端点</dt><dd :class="{bad:binding.unboundEndpoints.length}">{{unboundText}}</dd></div>
-    <div data-testid="route-geometry-diag-passed"><dt>沿途经过的码</dt><dd>{{passedText}}</dd></div>
-    <div data-testid="route-geometry-diag-unused"><dt>未使用的码</dt><dd>{{unusedText}}</dd></div>
-   </dl>
-   <div v-if="bindingWarnings.length" class="rg-list warn" data-testid="route-geometry-diag-warnings">
-    <b>诊断说明</b>
-    <p v-for="(warning,index) in bindingWarnings" :key="'bw'+index">{{warning}}</p>
-   </div>
-   <details v-if="legRows.length" class="rg-details" data-testid="route-geometry-diag-legs">
-    <summary>逐段绑定（{{legRows.length}} 段 · 捕捉半径 {{cm(binding.toleranceM)}}）</summary>
-    <div class="rg-table">
-     <div class="rg-trow head"><span>段</span><span>起 → 止</span><span>长度</span><span>类型</span></div>
-     <div v-for="row in legRows" :key="'leg'+row.index" class="rg-trow" :data-testid="'route-geometry-diag-leg-'+row.index">
-      <span>第 {{row.index+1}} 段</span><span>{{row.from}} → {{row.to}}</span><span>{{row.length}}</span><span>{{row.kind}}</span>
-     </div>
-    </div>
-   </details>
-  </section>
-
-  <!-- 2. 几何校验 -->
-  <section class="rg-sec" data-testid="route-geometry-validate">
-   <h4>
-    <ShieldCheck :size="13"/> 几何校验
-    <span :class="['rg-badge',validation.ok?'ok':'bad']" data-testid="route-geometry-validate-status">{{validation.ok?'通过':'未通过'}}</span>
-   </h4>
-   <dl class="rg-metrics" data-testid="route-geometry-validate-metrics">
-    <div><dt>控制点</dt><dd>{{points.length}}</dd></div>
-    <div><dt>总长</dt><dd>{{m3(validation.lengthM)}} m</dd></div>
-    <div><dt>最短段</dt><dd>{{validation.shortestLegM===null?'—':cm(validation.shortestLegM)}}</dd></div>
-    <div><dt>最长段</dt><dd>{{cm(validation.longestLegM)}}</dd></div>
-    <div><dt>拐点</dt><dd>{{validation.corners}}</dd></div>
-    <div><dt>自交</dt><dd>{{validation.selfIntersections.length}}</dd></div>
-    <div><dt>正交</dt><dd>{{validation.axisAligned?'是':'否'}}</dd></div>
-    <div><dt>上限</dt><dd>{{m3(validation.options.maxTotalM)}} m / {{validation.options.maxPoints}} 点</dd></div>
-   </dl>
-   <div v-if="validation.errors.length" class="rg-list bad" data-testid="route-geometry-validate-errors">
-    <b>错误（{{validation.errors.length}}）</b>
-    <p v-for="(issue,index) in validation.errors" :key="'ve'+index">{{issue.message}}</p>
-   </div>
-   <div v-if="validation.warnings.length" class="rg-list warn" data-testid="route-geometry-validate-warnings">
-    <b>警告（{{validation.warnings.length}}）</b>
-    <p v-for="(issue,index) in validation.warnings" :key="'vw'+index">{{issue.message}}</p>
-   </div>
-   <p v-if="!validation.errors.length&&!validation.warnings.length" class="rg-ok" data-testid="route-geometry-validate-clean"><CheckCircle2 :size="13"/> 正交、段长、总长、点数均满足编译要求</p>
-  </section>
-
   <!-- 3. 网格吸附 -->
-  <section class="rg-sec" data-testid="route-geometry-grid">
-   <h4><Grid3x3 :size="13"/> 网格吸附</h4>
+  <section class="rg-sec rg-fold" data-testid="route-geometry-grid" :data-open="isOperationOpen('grid')?'1':'0'">
+   <button type="button" class="rg-fold__head" data-testid="route-geometry-grid-toggle" :aria-expanded="isOperationOpen('grid')" @click="toggleOperation('grid')"><Grid3x3 :size="13"/> 网格吸附</button>
+   <div v-show="isOperationOpen('grid')" class="rg-fold__body">
    <div class="rg-line">
     <label class="rg-check"><input v-model="gridSnap" type="checkbox" :disabled="disabled" data-testid="route-geometry-grid-snap"/> 插入 / 移动时按网格取整</label>
     <label class="rg-field">网格 / 米
@@ -465,11 +407,13 @@ onBeforeUnmount(()=>{if(draft.value) emit('preview-points',null);});
      </select>
     </label>
    </div>
+   </div>
   </section>
 
   <!-- 4. 操作 -->
-  <section class="rg-op" data-testid="route-geometry-insert">
-   <h5><Plus :size="12"/> 插入路点</h5>
+  <section class="rg-op rg-fold" data-testid="route-geometry-insert" :data-open="isOperationOpen('insert')?'1':'0'">
+   <button type="button" class="rg-fold__head" data-testid="route-geometry-insert-toggle" :aria-expanded="isOperationOpen('insert')" @click="toggleOperation('insert')"><Plus :size="12"/> 插入路点</button>
+   <div v-show="isOperationOpen('insert')" class="rg-fold__body">
    <div class="rg-line">
     <label class="rg-field">位置
      <select v-model="insertIndex" :disabled="isDisabled" data-testid="route-geometry-insert-index">
@@ -484,10 +428,12 @@ onBeforeUnmount(()=>{if(draft.value) emit('preview-points',null);});
     <Button size="sm" :disabled="isDisabled||points.length<2" data-testid="route-geometry-insert-preview" @click.prevent="previewInsert">预览</Button>
     <span class="rg-tip">{{gridSnap?'预览坐标按 '+gridSize+' m 取整':'未开启网格吸附'}}</span>
    </div>
+   </div>
   </section>
 
-  <section class="rg-op" data-testid="route-geometry-remove">
-   <h5><Trash2 :size="12"/> 删除路点</h5>
+  <section class="rg-op rg-fold" data-testid="route-geometry-remove" :data-open="isOperationOpen('remove')?'1':'0'">
+   <button type="button" class="rg-fold__head" data-testid="route-geometry-remove-toggle" :aria-expanded="isOperationOpen('remove')" @click="toggleOperation('remove')"><Trash2 :size="12"/> 删除路点</button>
+   <div v-show="isOperationOpen('remove')" class="rg-fold__body">
    <div class="rg-line">
     <label class="rg-field rg-grow">索引
      <select v-model="removeIndex" :disabled="isDisabled" data-testid="route-geometry-remove-index">
@@ -496,10 +442,12 @@ onBeforeUnmount(()=>{if(draft.value) emit('preview-points',null);});
     </label>
     <Button size="sm" :disabled="isDisabled||points.length<2" data-testid="route-geometry-remove-preview" @click.prevent="previewRemove">预览</Button>
    </div>
+   </div>
   </section>
 
-  <section class="rg-op" data-testid="route-geometry-move">
-   <h5><Move :size="12"/> 移动路点（保持正交）</h5>
+  <section class="rg-op rg-fold" data-testid="route-geometry-move" :data-open="isOperationOpen('move')?'1':'0'">
+   <button type="button" class="rg-fold__head" data-testid="route-geometry-move-toggle" :aria-expanded="isOperationOpen('move')" @click="toggleOperation('move')"><Move :size="12"/> 移动路点（保持正交）</button>
+   <div v-show="isOperationOpen('move')" class="rg-fold__body">
    <div class="rg-line">
     <label class="rg-field rg-grow">索引
      <select v-model="moveIndex" :disabled="isDisabled" data-testid="route-geometry-move-index">
@@ -513,10 +461,12 @@ onBeforeUnmount(()=>{if(draft.value) emit('preview-points',null);});
     <Button size="sm" :disabled="isDisabled||points.length<2" data-testid="route-geometry-move-preview" @click.prevent="previewMove">预览</Button>
     <span class="rg-tip">偏移会让相邻段变斜时自动补拐点</span>
    </div>
+   </div>
   </section>
 
-  <section class="rg-op" data-testid="route-geometry-equalize">
-   <h5><Grid3x3 :size="12"/> 整段等间距</h5>
+  <section class="rg-op rg-fold" data-testid="route-geometry-equalize" :data-open="isOperationOpen('equalize')?'1':'0'">
+   <button type="button" class="rg-fold__head" data-testid="route-geometry-equalize-toggle" :aria-expanded="isOperationOpen('equalize')" @click="toggleOperation('equalize')"><Grid3x3 :size="12"/> 整段等间距</button>
+   <div v-show="isOperationOpen('equalize')" class="rg-fold__body">
    <div class="rg-line">
     <label class="rg-field rg-grow">起点
      <select v-model="equalizeFrom" :disabled="isDisabled" data-testid="route-geometry-equalize-from">
@@ -534,19 +484,23 @@ onBeforeUnmount(()=>{if(draft.value) emit('preview-points',null);});
     <Button size="sm" :disabled="isDisabled||points.length<2" data-testid="route-geometry-equalize-preview" @click.prevent="previewEqualize">预览</Button>
     <span class="rg-tip">只适用于一条同向直线段；含拐角或折返会被拒绝</span>
    </div>
+   </div>
   </section>
 
-  <section class="rg-op" data-testid="route-geometry-translate">
-   <h5><Move :size="12"/> 整体平移</h5>
+  <section class="rg-op rg-fold" data-testid="route-geometry-translate" :data-open="isOperationOpen('translate')?'1':'0'">
+   <button type="button" class="rg-fold__head" data-testid="route-geometry-translate-toggle" :aria-expanded="isOperationOpen('translate')" @click="toggleOperation('translate')"><Move :size="12"/> 整体平移</button>
+   <div v-show="isOperationOpen('translate')" class="rg-fold__body">
    <div class="rg-line">
     <label class="rg-field">dx（米）<input v-model="translateDx" type="number" step="0.05" :disabled="isDisabled" data-testid="route-geometry-translate-dx"/></label>
     <label class="rg-field">dy（米）<input v-model="translateDy" type="number" step="0.05" :disabled="isDisabled" data-testid="route-geometry-translate-dy"/></label>
     <Button size="sm" :disabled="isDisabled||points.length<2" data-testid="route-geometry-translate-preview" @click.prevent="previewTranslate">预览</Button>
    </div>
+   </div>
   </section>
 
-  <section class="rg-op" data-testid="route-geometry-rotate">
-   <h5><RotateCw :size="12"/> 90° 旋转</h5>
+  <section class="rg-op rg-fold" data-testid="route-geometry-rotate" :data-open="isOperationOpen('rotate')?'1':'0'">
+   <button type="button" class="rg-fold__head" data-testid="route-geometry-rotate-toggle" :aria-expanded="isOperationOpen('rotate')" @click="toggleOperation('rotate')"><RotateCw :size="12"/> 90° 旋转</button>
+   <div v-show="isOperationOpen('rotate')" class="rg-fold__body">
    <div class="rg-line">
     <label class="rg-field">中心 x（米）<input v-model="rotatePivotX" type="number" step="0.05" :disabled="isDisabled" data-testid="route-geometry-rotate-pivot-x"/></label>
     <label class="rg-field">中心 y（米）<input v-model="rotatePivotY" type="number" step="0.05" :disabled="isDisabled" data-testid="route-geometry-rotate-pivot-y"/></label>
@@ -557,10 +511,12 @@ onBeforeUnmount(()=>{if(draft.value) emit('preview-points',null);});
     <Button size="sm" :disabled="isDisabled||points.length<2" data-testid="route-geometry-rotate-ccw" @click.prevent="previewRotate(90)"><RotateCw :size="13"/> 逆时针 90°</Button>
     <span class="rg-tip">只允许 90° 整数倍；地图二维码坐标不变</span>
    </div>
+   </div>
   </section>
 
-  <section class="rg-op" data-testid="route-geometry-mirror">
-   <h5><FlipHorizontal2 :size="12"/> 镜像</h5>
+  <section class="rg-op rg-fold" data-testid="route-geometry-mirror" :data-open="isOperationOpen('mirror')?'1':'0'">
+   <button type="button" class="rg-fold__head" data-testid="route-geometry-mirror-toggle" :aria-expanded="isOperationOpen('mirror')" @click="toggleOperation('mirror')"><FlipHorizontal2 :size="12"/> 镜像</button>
+   <div v-show="isOperationOpen('mirror')" class="rg-fold__body">
    <div class="rg-line">
     <label class="rg-field">轴
      <select v-model="mirrorAxis" :disabled="isDisabled" data-testid="route-geometry-mirror-axis">
@@ -572,6 +528,7 @@ onBeforeUnmount(()=>{if(draft.value) emit('preview-points',null);});
     <Button size="sm" :disabled="isDisabled||points.length<2" data-testid="route-geometry-mirror-preview" @click.prevent="previewMirror">
      <FlipVertical2 :size="13"/> 预览
     </Button>
+   </div>
    </div>
   </section>
 
@@ -664,4 +621,15 @@ onBeforeUnmount(()=>{if(draft.value) emit('preview-points',null);});
 .rg-notes{font-size:11px;color:#475569}
 .rg-notes p{margin:2px 0}
 .rg-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+
+.rg,.rg *{box-sizing:border-box;min-width:0}
+.rg-line{gap:8px;align-items:flex-end}
+.rg-field{display:flex;flex:1 1 90px;flex-direction:column;align-items:stretch;gap:4px;margin:0;font-size:12px;white-space:normal}
+.rg-field.rg-grow{flex:1 1 140px}
+.rg-field input,.rg-field select{flex:0 0 auto;width:100%;max-width:100%;height:34px;min-height:34px;max-height:34px;margin:0;padding:6px;font-size:13px}
+.rg-check{display:flex;flex:0 1 auto;flex-direction:row;align-items:center;gap:6px;margin:0;font-size:12px;white-space:normal}
+.rg-check input[type=checkbox]{flex:0 0 16px;width:16px;height:16px;min-height:16px;max-height:16px;margin:0;padding:0}
+.rg-tip{font-size:12px;overflow-wrap:anywhere}
+
+.rg-fold{margin:0;border-top:1px solid var(--line);padding-top:7px;display:block}.rg-fold__head{display:flex;align-items:center;gap:5px;width:100%;padding:0;border:0;background:transparent;cursor:pointer;text-align:left;font-size:12px;font-weight:650;color:#334155;min-height:24px}.rg-fold__head::before{content:'›';display:inline-block;width:12px;color:#64748b;font-size:16px;line-height:1;transform:rotate(0deg)}.rg-fold[data-open='1'] .rg-fold__head::before{transform:rotate(90deg)}.rg-fold[data-open='1'] .rg-fold__head{margin-bottom:6px}.rg-fold>.rg-line{margin-top:6px}.rg-fold>.rg-tip{display:inline-block}
 </style>

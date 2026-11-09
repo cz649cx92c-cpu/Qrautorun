@@ -24,7 +24,7 @@ import {registerRouteGeometryRoutes} from './route-geometry';
 import {segmentExecutionBlockers} from '../../shared/segment-strategy';
 import {registerTagReprintRoutes} from './tag-reprint';
 import {boardOptions,boardPlan,boardRegistrationPlan,boardSvg,boardPdf,boardTables,listBoards,checkBoardRegistration,registerBoards} from './boards';
-import {boardPrintSchema} from '../../shared/boards';
+import {boardPrintSchema,boardLabel} from '../../shared/boards';
 import {CameraPreview} from './camera';
 import {CameraCalibration} from './calibration';
 import {CalibrationStore,calibrationDatabasePath,imuCalibrationFromSnapshot} from './calibration-store';
@@ -133,6 +133,25 @@ export async function createApp(database?:string) {
    return {...saved,acceptance:mapApproval(saved)};
   })();
  }
+ // 常规编辑的保存入口：默认"就在当前版本上改"，不生成 vN+1。
+ // 只有两种情况才写新版本行：
+ //   1) 这张图还没有任何版本（baseVersion 0 首次落库）——那是 v1，不是"多一个版本"；
+ //   2) 调用方显式传 newVersion:true——确实想要一份可回滚的历史版本时才用。
+ // 版本冲突（baseVersion 过期 409）、mapSchema、validate() 三道门完全沿用
+ // store.saveInPlace / store.save 的内部实现，一处都没有放宽。
+ function saveMapCurrent(map:z.infer<typeof mapSchema>,baseVersion:number,newVersion=false){
+  if(map.routeMode==='waypoints')map.coordinateStatus='reviewed';
+  return store.db.transaction(()=>{
+   const saved=newVersion||store.get(map.id)===null?store.save(map,baseVersion):store.saveInPlace(map,baseVersion);
+   if(map.routeMode==='waypoints'){
+    // 原地覆盖时版本号不变，验收行必须跟着改摘要，否则会撞 (map_id,version) 主键。
+    const evidence={kind:'office_test',version:saved.version,created:new Date().toISOString()};
+    store.db.prepare('INSERT INTO acceptances VALUES(?,?,?,?) ON CONFLICT(map_id,version) DO UPDATE SET digest=excluded.digest,body=excluded.body').run(map.id,saved.version,store.digest(saved.map),JSON.stringify(evidence));
+    log('保存办公室测试路线（无需坐标审核） '+map.id+' v'+saved.version);
+   }
+   return {...saved,acceptance:mapApproval(saved)};
+  })();
+ }
  app.setErrorHandler((err,_req,reply)=>{const error=err as Error & {statusCode?:number};reply.code(err instanceof z.ZodError?400:error.statusCode??400).send({error:error.message});});
  await app.register(websocket);
  const camera=new CameraPreview(root);
@@ -167,7 +186,10 @@ export async function createApp(database?:string) {
  app.post('/api/boards/plan',req=>boardRegistrationPlan(store,req.body));
  const boardCrosshairQuery=z.object({centerCrosshair:z.enum(['true','false']).default('true').transform(value=>value==='true')});
  app.get('/api/boards/preview.svg',(req,reply)=>{
-  const query=z.object({gridSize:z.coerce.number().int().min(1).max(6),groupSizeMm:z.coerce.number().finite().min(20).max(180),startId:z.coerce.number().int().min(0).max(586).default(0)}).merge(boardCrosshairQuery).parse(req.query);
+  // 旧参数 gridSize/groupSizeMm 可单独使用；新参数 rows/cols/widthMm/heightMm 存在时按新参数生效。
+  const query=z.object({gridSize:z.coerce.number().int().min(1).max(6).optional(),groupSizeMm:z.coerce.number().finite().min(20).max(500).optional(),startId:z.coerce.number().int().min(0).max(586).default(0),
+   rows:z.coerce.number().int().min(1).max(6).optional(),cols:z.coerce.number().int().min(1).max(6).optional(),
+   widthMm:z.coerce.number().finite().min(20).max(500).optional(),heightMm:z.coerce.number().finite().min(20).max(500).optional()}).merge(boardCrosshairQuery).parse(req.query);
   const plan=boardPlan({...query,groupCount:1});return reply.type('image/svg+xml').send(boardSvg(plan.boards[0]!,query.centerCrosshair));
  });
  app.get<{Params:{id:string}}>('/api/boards/:id.svg',(req,reply)=>{const options=boardCrosshairQuery.parse(req.query),board=listBoards(store).find(item=>item.id===req.params.id);return board?reply.type('image/svg+xml').send(boardSvg(board,options.centerCrosshair)):reply.code(404).send({error:'定位板不存在'});});
@@ -230,7 +252,15 @@ export async function createApp(database?:string) {
    return {mapId:item.map.id,removed,aliases:[]};
   })();
  });
- app.post('/api/maps',req=>{const body=z.object({map:mapSchema,baseVersion:z.number().int().nonnegative()}).parse(req.body);return saveMap(body.map,body.baseVersion);});
+ // 通用整图保存。默认语义是"就在当前版本上改"（saveMapCurrent → 原地覆盖），
+// 因为画布拖入/批量移动/改参/正交校正都属于同一张图的连续编辑，每改一次就多
+// 一个 vN 既不符合现场直觉，也会让路径/任务绑定不断失效。
+// 想在 vN 之上留一份可回滚历史时才显式传 newVersion:true。
+// 冲突门（baseVersion 过期 → 409）、mapSchema、validate()、运行中禁止写入一律照旧。
+app.post('/api/maps',req=>{
+ const body=z.object({map:mapSchema,baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false)}).parse(req.body);
+ return saveMapCurrent(body.map,body.baseVersion,body.newVersion);
+});
  // 新建空白地图（手动铺码的起点）。与 POST /api/maps 刻意分成两条路径：那条要求
  // 调用方自带完整 map + baseVersion，语义是"在某个已有版本之上保存改动"；这里
  // 服务端才是唯一决定 id / zone / vehicle 的地方，一张新图的 baseVersion 恒为 0，
@@ -388,6 +418,107 @@ app.delete<{Params:{id:string}}>('/api/maps/:id/tags',req=>{
   const saved=creationSaved(preview.map,body.baseVersion,body.newVersion);
   log('删除地图二维码 '+item.map.id+' v'+saved.version+' · '+preview.removed+' 个'+(preview.prunedGroups.length?' · 移除定位组 '+preview.prunedGroups.join('、'):''));
   return {...saved,previousVersion:item.version,created:0,deleted:preview.removed,changed:preview.removed,ids:preview.ids,tags:preview.tags,prunedGroups:preview.prunedGroups,reasons:preview.reasons,notes:preview.notes,disclaimer:TAG_CREATION_DISCLAIMER};
+ })();
+});
+// POST /api/maps/:id/groups/:groupId/spec — 改组规格（行×列 / 整组宽高 / 起始编号）
+// 用与 generateBoards 相同的几何重建 members，并同步组中心点的 size，
+// 再走 mapSchema + validate + 保存；版本冲突与运行中禁止写入照旧。
+// 默认原地覆盖当前版本（改规格是同一张图的连续编辑，不该每次多一个 vN）；
+// 只有显式传 newVersion:true 时才在 vN 之上新建 vN+1。
+// 新形状 {rows,cols,widthMm,heightMm} 与旧形状 {gridSize,sizeMm} 都接受，
+// 两者同时出现时以新字段为准；旧形状等价于 rows=cols=gridSize、width=height=sizeMm。
+const groupSpecSchema=z.object({
+ baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),
+ gridSize:z.number().int().min(1).max(6).optional(),sizeMm:z.number().finite().min(20).max(500).optional(),
+ rows:z.number().int().min(1).max(6).optional(),cols:z.number().int().min(1).max(6).optional(),
+ widthMm:z.number().finite().min(20).max(500).optional(),heightMm:z.number().finite().min(20).max(500).optional(),
+ startId:z.number().int().min(0).max(586).optional(),
+}).strict().superRefine((value,ctx)=>{
+ if((value.rows??value.gridSize)===undefined)ctx.addIssue({code:z.ZodIssueCode.custom,message:'缺少行数（rows 或旧字段 gridSize）',path:['rows']});
+ if((value.cols??value.gridSize)===undefined)ctx.addIssue({code:z.ZodIssueCode.custom,message:'缺少列数（cols 或旧字段 gridSize）',path:['cols']});
+ if((value.widthMm??value.sizeMm)===undefined)ctx.addIssue({code:z.ZodIssueCode.custom,message:'缺少整组宽（widthMm 或旧字段 sizeMm）',path:['widthMm']});
+ if((value.heightMm??value.sizeMm)===undefined)ctx.addIssue({code:z.ZodIssueCode.custom,message:'缺少整组高（heightMm 或旧字段 sizeMm）',path:['heightMm']});
+});
+app.post<{Params:{id:string;groupId:string}}>('/api/maps/:id/groups/:groupId/spec',req=>{
+ const body=groupSpecSchema.parse(req.body);
+ return store.db.transaction(()=>{
+  const item=creationGuard(req.params.id,body.baseVersion);
+  if(robot.status().running)throw Object.assign(new Error('车辆正在执行导航任务，请先停止导航再改组规格'),{statusCode:409});
+  const groups=item.map.groups??[];
+  const group=groups.find(g=>g.id===req.params.groupId);
+  if(!group)throw Object.assign(new Error(`地图 ${item.map.id} 里没有定位组 ${req.params.groupId}`),{statusCode:404});
+  const rows=(body.rows??body.gridSize)!,cols=(body.cols??body.gridSize)!;
+  const widthMm=(body.widthMm??body.sizeMm)!,heightMm=(body.heightMm??body.sizeMm)!;
+  const tileW=(widthMm-(cols-1)*2)/cols,tileH=(heightMm-(rows-1)*2)/rows;
+  const referenceId=body.startId??group.referenceId;
+  const members=Array.from({length:rows*cols},(_,index)=>{const column=index%cols,row=Math.floor(index/cols);return {id:referenceId+index,
+   x:(-widthMm/2+tileW/2+column*(tileW+2))/1000,
+   y:(heightMm/2-tileH/2-row*(tileH+2))/1000,
+   angle:0,size:Math.min(tileW,tileH)/1.25/1000};});
+  const gridSize=Math.max(rows,cols),groupSizeMm=Math.max(widthMm,heightMm);
+  const nextGroup={...group,id:boardLabel(referenceId),referenceId,gridSize,sizeMm:groupSizeMm,gapMm:2 as const,rows,cols,widthMm,heightMm,members};
+  const nextGroups=groups.map(g=>g.id===group.id?nextGroup:g);
+  const centerId=group.referenceId;
+  const nextTags=item.map.tags.map(t=>t.id===centerId?{...t,groupId:nextGroup.id,size:groupSizeMm/1000}:t);
+  const candidate={...item.map,groups:nextGroups,tags:nextTags};
+  const parsed=mapSchema.safeParse(candidate);
+  if(!parsed.success)throw Object.assign(new Error('改组规格无效：'+parsed.error.issues.map(i=>`${i.path.join('.')}：${i.message}`).join('；')),{statusCode:400});
+  const check=validate(parsed.data);
+  if(check.errors.length)throw Object.assign(new Error('改组规格未通过校验：'+check.errors.join('；')),{statusCode:400});
+  const saved=body.newVersion?saveMap(parsed.data,body.baseVersion):store.saveInPlace(parsed.data,body.baseVersion);
+  log('改组规格 '+item.map.id+' '+nextGroup.id+' · '+rows+'×'+cols+' · '+widthMm+'×'+heightMm+'mm · v'+saved.version);
+  return {...saved,previousVersion:item.version,group:nextGroup,centerId};
+ })();
+});
+// POST /api/maps/:id/groups/spec-batch — 批量改组规格
+// 现场最常见的诉求：现在全是 2×2 的定位组，要一次改成 3×3 / 4×4。
+// groupIds 缺省时作用于这张图的全部定位组；几何与单组改组规格完全一致
+// （members 按 referenceId 连续重建、组中心 size 同步），整批只保存一次。
+const groupSpecBatchSchema=z.object({
+ baseVersion:z.number().int().nonnegative(),newVersion:z.boolean().default(false),
+ groupIds:z.array(z.string().min(1).max(16)).max(100).optional(),
+ rows:z.number().int().min(1).max(6),cols:z.number().int().min(1).max(6),
+ widthMm:z.number().finite().min(20).max(500).optional(),
+ heightMm:z.number().finite().min(20).max(500).optional(),
+}).strict();
+app.post<{Params:{id:string}}>('/api/maps/:id/groups/spec-batch',req=>{
+ const body=groupSpecBatchSchema.parse(req.body);
+ return store.db.transaction(()=>{
+  const item=creationGuard(req.params.id,body.baseVersion);
+  if(robot.status().running)throw Object.assign(new Error('车辆正在执行导航任务，请先停止导航再改组规格'),{statusCode:409});
+  const groups=item.map.groups??[];
+  if(!groups.length)throw Object.assign(new Error('这张地图没有定位组：先铺码/串码生成定位组后再批量改组规格'),{statusCode:400});
+  const wanted=body.groupIds?.length?new Set(body.groupIds):null;
+  const targets=wanted?groups.filter(g=>wanted.has(g.id)):groups;
+  if(!targets.length)throw Object.assign(new Error('没有找到要改的定位组'),{statusCode:404});
+  const rows=body.rows,cols=body.cols;
+  const rebuilt=new Map<string,any>();
+  for(const group of targets){
+   const widthMm=body.widthMm??group.widthMm??group.sizeMm;
+   const heightMm=body.heightMm??group.heightMm??group.sizeMm;
+   const tileW=(widthMm-(cols-1)*2)/cols,tileH=(heightMm-(rows-1)*2)/rows;
+   const referenceId=group.referenceId;
+   const members=Array.from({length:rows*cols},(_,index)=>{const column=index%cols,row=Math.floor(index/cols);return {id:referenceId+index,
+    x:(-widthMm/2+tileW/2+column*(tileW+2))/1000,
+    y:(heightMm/2-tileH/2-row*(tileH+2))/1000,
+    angle:0,size:Math.min(tileW,tileH)/1.25/1000};});
+   const gridSize=Math.max(rows,cols),groupSizeMm=Math.max(widthMm,heightMm);
+   rebuilt.set(group.id,{...group,gridSize,sizeMm:groupSizeMm,gapMm:2 as const,rows,cols,widthMm,heightMm,members});
+  }
+  const nextGroups=groups.map(g=>rebuilt.get(g.id)??g);
+  const nextTags=item.map.tags.map(t=>{
+   const next=t.groupId?rebuilt.get(t.groupId):undefined;
+   return next?{...t,size:next.sizeMm/1000}:t;
+  });
+  const candidate={...item.map,groups:nextGroups,tags:nextTags};
+  const parsed=mapSchema.safeParse(candidate);
+  if(!parsed.success)throw Object.assign(new Error('批量改组规格无效：'+parsed.error.issues.map(i=>`${i.path.join('.')}：${i.message}`).join('；')),{statusCode:400});
+  const check=validate(parsed.data);
+  if(check.errors.length)throw Object.assign(new Error('批量改组规格未通过校验：'+check.errors.join('；')),{statusCode:400});
+  const saved=body.newVersion?saveMap(parsed.data,body.baseVersion):store.saveInPlace(parsed.data,body.baseVersion);
+  log('批量改组规格 '+item.map.id+' · '+targets.length+' 组 · '+rows+'×'+cols+' · v'+saved.version);
+  return {...saved,previousVersion:item.version,changed:targets.length,
+   groups:targets.map(g=>rebuilt.get(g.id))};
  })();
 });
 // POST /api/maps/:id/tags/update — 统一改编号/坐标/朝向/尺寸

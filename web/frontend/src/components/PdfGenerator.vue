@@ -4,11 +4,27 @@ import {Download,FileText,AlertTriangle,CheckCircle2,Printer} from 'lucide-vue-n
 import Button from './ui/Button.vue';
 
 type BoardMember={id:number;x:number;y:number;angle:number;size:number};
-type Board={id:string;referenceId:number;gridSize:number;sizeMm:number;gapMm:number;members:BoardMember[]};
-type Plan={groupCount:number;memberCount:number;pages:number;childSizeMm:number;minGroupSizeMm:number;maxGroupSizeMm:number;boards:Board[];filename:string;centerCrosshairAvailable?:boolean;centerCrosshairNote?:string;registration?:{available:boolean;message?:string;suggestedStartId?:number}};
-type GridOption={gridSize:number;minGroupSizeMm:number;maxGroupSizeMm:number;minChildSizeMm:number};
+type Board={id:string;referenceId:number;gridSize:number;sizeMm:number;gapMm:number;members:BoardMember[];rows?:number;cols?:number;widthMm?:number;heightMm?:number};
+type Plan={groupCount:number;memberCount:number;pages:number;childSizeMm:number;minGroupSizeMm:number;maxGroupSizeMm:number;rows?:number;cols?:number;widthMm?:number;heightMm?:number;minWidthMm?:number;minHeightMm?:number;boards:Board[];filename:string;centerCrosshairAvailable?:boolean;centerCrosshairNote?:string;registration?:{available:boolean;message?:string;suggestedStartId?:number}};
+type GridOption={gridSize:number;minGroupSizeMm:number;maxGroupSizeMm:number;minChildSizeMm:number;minWidthMm?:number;minHeightMm?:number};
 const emit=defineEmits<{generated:[result:Plan]}>();
-const gridOptions=ref<GridOption[]>([]),gridSize=ref(2),groupSizeMm=ref(140),groupCount=ref(3),startId=ref(0),centerCrosshair=ref(true);
+const gridOptions=ref<GridOption[]>([]),rows=ref(2),cols=ref(2),widthMm=ref(140),heightMm=ref(140),groupCount=ref(3),startId=ref(0),centerCrosshair=ref(true),groupSizeInput=ref('140');
+const MAX_MM=500,MIN_MM=20;
+
+// 旧控件保持可见：点「N × N」等价于 rows=cols=N，「整组尺寸」等价于 width=height=N。
+const gridSize=computed(()=>Math.max(Number(rows.value)||0,Number(cols.value)||0));
+const groupSizeMm=computed(()=>Math.max(Number(widthMm.value)||0,Number(heightMm.value)||0));
+function selectGrid(value:number){rows.value=value;cols.value=value;}
+function setGroupSize(event:Event){
+ const raw=(event.target as HTMLInputElement).value;groupSizeInput.value=raw;
+ const value=Number(raw);
+ if(raw!==''&&Number.isFinite(value)){widthMm.value=value;heightMm.value=value;}
+}
+watch([widthMm,heightMm],()=>{
+ const current=Number(groupSizeInput.value),width=Number(widthMm.value),height=Number(heightMm.value);
+ if(groupSizeInput.value!==''&&Number.isFinite(current)&&current===width&&current===height)return;
+ groupSizeInput.value=String(Math.max(Number.isFinite(width)?width:0,Number.isFinite(height)?height:0));
+});
 
 // 记住上次改过的生成设置（本页专用，切页/刷新后仍保留）
 const SETTINGS_KEY='qr-pdf-settings-v1';
@@ -16,36 +32,51 @@ function restoreSettings(){
  try{
   const raw=localStorage.getItem(SETTINGS_KEY);if(!raw)return;
   const saved=JSON.parse(raw) as Record<string,unknown>;
-  if(Number.isFinite(saved.gridSize as number))gridSize.value=saved.gridSize as number;
-  if(Number.isFinite(saved.groupSizeMm as number))groupSizeMm.value=saved.groupSizeMm as number;
+  const legacyGrid=Number.isFinite(saved.gridSize as number)?saved.gridSize as number:2;
+  const legacySize=Number.isFinite(saved.groupSizeMm as number)?saved.groupSizeMm as number:140;
+  rows.value=Number.isFinite(saved.rows as number)?saved.rows as number:legacyGrid;
+  cols.value=Number.isFinite(saved.cols as number)?saved.cols as number:legacyGrid;
+  widthMm.value=Number.isFinite(saved.widthMm as number)?saved.widthMm as number:legacySize;
+  heightMm.value=Number.isFinite(saved.heightMm as number)?saved.heightMm as number:legacySize;
+  groupSizeInput.value=String(Math.max(Number(widthMm.value)||0,Number(heightMm.value)||0));
   if(Number.isFinite(saved.groupCount as number))groupCount.value=saved.groupCount as number;
   if(Number.isFinite(saved.startId as number))startId.value=saved.startId as number;
   if(typeof saved.centerCrosshair==='boolean')centerCrosshair.value=saved.centerCrosshair;
  }catch{/* 隐私模式或损坏数据时静默忽略 */}
 }
 function persistSettings(){
- try{localStorage.setItem(SETTINGS_KEY,JSON.stringify({gridSize:gridSize.value,groupSizeMm:groupSizeMm.value,groupCount:groupCount.value,startId:startId.value,centerCrosshair:centerCrosshair.value}));}catch{/* 忽略 */}
+ try{localStorage.setItem(SETTINGS_KEY,JSON.stringify({gridSize:gridSize.value,groupSizeMm:groupSizeMm.value,rows:rows.value,cols:cols.value,widthMm:widthMm.value,heightMm:heightMm.value,groupCount:groupCount.value,startId:startId.value,centerCrosshair:centerCrosshair.value}));}catch{/* 忽略 */}
 }
 onMounted(restoreSettings);
-watch([gridSize,groupSizeMm,groupCount,startId,centerCrosshair],persistSettings);
+watch([rows,cols,widthMm,heightMm,groupCount,startId,centerCrosshair],persistSettings);
 const busy=ref(false),planning=ref(false),loadingOptions=ref(false),error=ref(''),message=ref(''),plan=ref<Plan|null>(null);
 const gridOption=computed(()=>gridOptions.value.find(g=>g.gridSize===gridSize.value));
-const minSizeMm=computed(()=>gridOption.value?.minGroupSizeMm??20);
-const maxSizeMm=computed(()=>gridOption.value?.maxGroupSizeMm??180);
-const memberCount=computed(()=>groupCount.value*gridSize.value*gridSize.value);
-const maxGroups=computed(()=>Math.floor((587-startId.value)/(gridSize.value*gridSize.value)));
-const endId=computed(()=>startId.value+memberCount.value-1);
+const rowCount=computed(()=>{const value=Number(rows.value);return Number.isInteger(value)&&value>=1&&value<=6?value:0;});
+const colCount=computed(()=>{const value=Number(cols.value);return Number.isInteger(value)&&value>=1&&value<=6?value:0;});
+const minWidthMm=computed(()=>colCount.value?Math.max(MIN_MM,Math.ceil(colCount.value*12.5+(colCount.value-1)*2)):MIN_MM);
+const minHeightMm=computed(()=>rowCount.value?Math.max(MIN_MM,Math.ceil(rowCount.value*12.5+(rowCount.value-1)*2)):MIN_MM);
+const minSizeMm=computed(()=>Math.max(minWidthMm.value,minHeightMm.value));
+const maxSizeMm=MAX_MM;
+const memberCount=computed(()=>Math.max(0,rowCount.value*colCount.value*(Number(groupCount.value)||0)));
+const maxGroups=computed(()=>{const per=rowCount.value*colCount.value;return per>0?Math.floor((587-(Number(startId.value)||0))/per):0;});
+const endId=computed(()=>memberCount.value?Number(startId.value)+memberCount.value-1:Number(startId.value)||0);
 const localError=computed(()=>{
- if(!gridOption.value)return '';
+ if(!gridOptions.value.length)return '';
  if(!Number.isInteger(startId.value)||startId.value<0||startId.value>586)return '起始子码编号须为 0–586';
  if(!Number.isInteger(groupCount.value)||groupCount.value<1)return '生成组数须为正整数';
+ if(!Number.isInteger(rows.value)||rows.value<1||rows.value>6)return '行数须为 1–6';
+ if(!Number.isInteger(cols.value)||cols.value<1||cols.value>6)return '列数须为 1–6';
+ if(rows.value*cols.value>36)return '行列数乘积不能超过 36';
+ if(!Number.isFinite(widthMm.value)||widthMm.value<MIN_MM||widthMm.value>MAX_MM)return '整组宽须为 20–500 mm';
+ if(!Number.isFinite(heightMm.value)||heightMm.value<MIN_MM||heightMm.value>MAX_MM)return '整组高须为 20–500 mm';
+ if(widthMm.value<minWidthMm.value)return '当前列数整组宽至少为 '+minWidthMm.value+' mm';
+ if(heightMm.value<minHeightMm.value)return '当前行数整组高至少为 '+minHeightMm.value+' mm';
  if(groupCount.value>maxGroups.value)return maxGroups.value<1?'剩余子码不足一整组':'当前起始编号最多可生成 '+maxGroups.value+' 组';
- if(!Number.isFinite(groupSizeMm.value)||groupSizeMm.value<minSizeMm.value||groupSizeMm.value>maxSizeMm.value)return '当前规格整组尺寸须为 '+minSizeMm.value+'–'+maxSizeMm.value+' mm';
  return '';
 });
-const payload=()=>({gridSize:gridSize.value,groupSizeMm:groupSizeMm.value,groupCount:groupCount.value,startId:startId.value,centerCrosshair:centerCrosshair.value});
+const payload=()=>({gridSize:gridSize.value,groupSizeMm:groupSizeMm.value,rows:rows.value,cols:cols.value,widthMm:widthMm.value,heightMm:heightMm.value,groupCount:groupCount.value,startId:startId.value,centerCrosshair:centerCrosshair.value});
 const label=(id:number)=>'Q'+String(id).padStart(3,'0');
-const previewUrl=computed(()=>'/api/boards/preview.svg?'+new URLSearchParams({gridSize:String(gridSize.value),groupSizeMm:String(groupSizeMm.value),startId:String(startId.value),centerCrosshair:String(centerCrosshair.value)}).toString());
+const previewUrl=computed(()=>'/api/boards/preview.svg?'+new URLSearchParams({gridSize:String(gridSize.value),groupSizeMm:String(groupSizeMm.value),rows:String(rows.value),cols:String(cols.value),widthMm:String(widthMm.value),heightMm:String(heightMm.value),startId:String(startId.value),centerCrosshair:String(centerCrosshair.value)}).toString());
 const firstBoard=computed(()=>plan.value?.boards[0]);
 const centerCrosshairNote=computed(()=>!centerCrosshair.value?'已关闭中心十字，定位板尺寸和静区不变':plan.value?.centerCrosshairNote??(gridSize.value%2===0?'整组中心十字全长 8 mm、线宽 0.15 mm，沿中央白缝绘制':gridSize.value+'×'+gridSize.value+' 正中心是子码，没有安全白缝，无法画中心十字；请选择 2×2、4×4 或 6×6'));
 const boardLabel=computed(()=>firstBoard.value?.id??'B'+String(startId.value).padStart(3,'0'));
@@ -64,8 +95,7 @@ async function requestPlan(){
  }catch(e){if(revision===sequence&&!closed)error.value=e instanceof Error?e.message:String(e);}
  finally{if(revision===sequence&&!closed)planning.value=false;}
 }
-watch(gridSize,()=>{if(gridOption.value&&groupSizeMm.value<minSizeMm.value)groupSizeMm.value=minSizeMm.value;});
-watch([gridSize,groupSizeMm,groupCount,startId,centerCrosshair,gridOptions],()=>{
+watch([rows,cols,widthMm,heightMm,groupCount,startId,centerCrosshair,gridOptions],()=>{
  sequence++;plan.value=null;error.value='';message.value='';planning.value=false;clearTimeout(timer);
  if(!localError.value&&gridOption.value&&!closed){planning.value=true;timer=setTimeout(()=>void requestPlan(),180);}
 },{immediate:true});
@@ -78,7 +108,8 @@ async function loadOptions(){
  finally{if(!closed)loadingOptions.value=false;}
 }
 // 浏览器打印与下载 PDF 共用同一个干净打印面：只输出二维码板主体。
-const boardPreviewSize=computed(()=>{const mm=Number(groupSizeMm.value)||0;if(!mm)return '320px';const capped=Math.min(180,Math.max(20,mm));return Math.round(560*capped/180)+'px';});
+const boardPreviewSize=computed(()=>{const mm=Math.max(Number(widthMm.value)||0,Number(heightMm.value)||0);if(!mm)return '320px';const capped=Math.min(MAX_MM,Math.max(MIN_MM,mm));return Math.round(560*capped/180)+'px';});
+const boardPreviewRatio=computed(()=>`${Math.max(1,Number(widthMm.value)||1)} / ${Math.max(1,Number(heightMm.value)||1)}`);
 function printBoard(){window.print();}
 async function download(){
  if(busy.value||localError.value||!gridOption.value)return;
@@ -106,11 +137,17 @@ onBeforeUnmount(()=>{closed=true;clearTimeout(timer);sequence++;});
  <section class="pdf-workspace">
   <div class="pdf-controls">
    <h2><FileText :size="24"/>生成设置</h2>
-   <fieldset :disabled="busy||!gridOption">
+   <fieldset :disabled="busy||!gridOptions.length">
     <legend>组内规格</legend>
-    <div class="grid-options"><button v-for="option in gridOptions" :key="option.gridSize" type="button" :class="['grid-option',{selected:gridSize===option.gridSize}]" :aria-pressed="gridSize===option.gridSize" @click="gridSize=option.gridSize">{{option.gridSize}} × {{option.gridSize}}</button></div>
-    <label>整组尺寸 / mm<input v-model.number="groupSizeMm" type="number" :min="minSizeMm" :max="maxSizeMm" step="0.1"/></label>
-    <div class="size-status">{{gridOption?minSizeMm+'–'+maxSizeMm+' mm':'正在读取规格…'}}</div>
+    <div class="grid-options"><button v-for="option in gridOptions" :key="option.gridSize" type="button" :class="['grid-option',{selected:gridSize===option.gridSize}]" :aria-pressed="gridSize===option.gridSize" @click="selectGrid(option.gridSize)">{{option.gridSize}} × {{option.gridSize}}</button></div>
+    <label>整组尺寸 / mm<input :value="groupSizeInput" type="number" :min="minSizeMm" :max="maxSizeMm" step="0.1" @input="setGroupSize"/></label>
+    <div class="size-status">{{gridOption?'宽 '+minWidthMm+'–500 mm · 高 '+minHeightMm+'–500 mm':'正在读取规格…'}}</div>
+    <div class="rect-fields">
+     <label>列数<input v-model.number="cols" data-testid="pdf-cols" type="number" min="1" max="6" step="1"/></label>
+     <label>行数<input v-model.number="rows" data-testid="pdf-rows" type="number" min="1" max="6" step="1"/></label>
+     <label>整组宽 / mm<input v-model.number="widthMm" data-testid="pdf-width" type="number" min="20" max="500" step="0.1"/></label>
+     <label>整组高 / mm<input v-model.number="heightMm" data-testid="pdf-height" type="number" min="20" max="500" step="0.1"/></label>
+    </div>
     <label>生成组数<input v-model.number="groupCount" type="number" min="1" :max="maxGroups" step="1"/></label>
     <label>起始子码编号<input v-model.number="startId" type="number" min="0" max="586" step="1"/></label>
    <label class="crosshair-option"><input v-model="centerCrosshair" type="checkbox"/>整组中心十字对位线</label><small class="crosshair-note" :class="{'crosshair-unavailable':centerCrosshair&&gridSize%2!==0}" data-testid="crosshair-note" role="status">{{centerCrosshairNote}}</small>
@@ -118,13 +155,13 @@ onBeforeUnmount(()=>{closed=true;clearTimeout(timer);sequence++;});
    <div class="pdf-summary"><div><span>子码总数</span><strong>{{plan?.memberCount??memberCount}} 个</strong></div><div><span>A4 页数</span><strong>{{plan?.pages??groupCount}} 页</strong></div><div v-if="plan"><span>子码黑边尺寸</span><strong>{{plan.childSizeMm.toFixed(2)}} mm</strong></div><div><span>子码编号</span><strong>{{label(startId)}} – {{label(endId)}}</strong></div></div>
    <div v-if="localError||error" class="pdf-error" role="alert"><AlertTriangle :size="20"/>{{localError||error}}</div>
          <div v-if="message" class="pdf-success" role="status"><CheckCircle2 :size="20"/>{{message}}</div>
-   <Button v-if="!gridOption&&!loadingOptions" class="download-button" variant="outline" @click="loadOptions">重新加载规格</Button>
+   <Button v-if="!gridOptions.length&&!loadingOptions" class="download-button" variant="outline" @click="loadOptions">重新加载规格</Button>
    <Button class="download-button" :disabled="busy||planning||!!localError||!plan" @click="download"><Download :size="20"/>{{busy?'正在生成…':'生成并下载 PDF'}}</Button>
-   <Button class="download-button" variant="outline" :disabled="!!localError||!gridOption" data-testid="print-board" @click="printBoard"><Printer :size="18"/>打印二维码板</Button>
+   <Button class="download-button" variant="outline" :disabled="!!localError||!gridOptions.length" data-testid="print-board" @click="printBoard"><Printer :size="18"/>打印二维码板</Button>
   </div>
   <div class="pdf-preview">
-   <div class="preview-toolbar"><strong>定位组预览 · {{boardLabel}}</strong><span>{{gridSize}} × {{gridSize}} · {{groupSizeMm}} mm</span></div>
-   <div class="board-area"><div class="board-preview print-surface" :style="{'--board-preview-size': boardPreviewSize}"><img v-if="!localError&&gridOption" :src="previewUrl" :alt="boardLabel+' 完整定位组'"/></div></div>
+   <div class="preview-toolbar"><strong>定位组预览 · {{boardLabel}}</strong><span>{{rows}} × {{cols}} · {{widthMm}} × {{heightMm}} mm</span></div>
+   <div class="board-area"><div class="board-preview print-surface" :style="{'--board-preview-size': boardPreviewSize, '--board-preview-ratio': boardPreviewRatio}"><img v-if="!localError&&gridOption" :src="previewUrl" :alt="boardLabel+' 完整定位组'"/></div></div>
    <details v-if="plan" class="board-list board-list-collapsed"><summary class="board-list-title">组编号与子码（{{plan.boards.length}} 组）</summary><div v-for="board in plan.boards" :key="board.id" class="board-row"><strong>{{board.id}}</strong><span>{{board.members.map(member=>label(member.id)).join(' · ')}}</span></div></details>
    <div class="preview-status preview-status-compact">tag36h11 · A4 · 每页 1 组</div>
   </div>
@@ -145,6 +182,7 @@ legend{font-size:14px;color:var(--muted);margin-bottom:12px}
 .grid-option.selected{border-color:var(--accent);background:var(--panel);color:var(--accent);box-shadow:none}
 .grid-option:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .size-status{font-size:14px;color:var(--muted);margin-top:8px}
+.rect-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 10px}
 .pdf-summary{display:grid;gap:15px;margin:20px 0;padding:16px;background:var(--panel);border:1px solid var(--panel);border-radius:8px}
 .pdf-summary>div{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px;line-height:1.5}
 .pdf-summary span{color:var(--muted)}
@@ -160,7 +198,7 @@ legend{font-size:14px;color:var(--muted);margin-bottom:12px}
 .preview-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 14px;background:var(--background);border-bottom:1px solid var(--panel);font-size:14px;flex-wrap:wrap}
 .preview-toolbar strong{font-weight:500;color:var(--ink)}.preview-toolbar span{color:var(--muted)}
 .board-area{padding:clamp(16px,1.6vw,34px);display:flex;justify-content:center;align-items:center;min-height:clamp(240px,30vh,360px);flex:1;min-width:0}
-.board-preview{width:min(100%,clamp(140px,var(--board-preview-size,320px),560px));aspect-ratio:1;background:var(--background);box-shadow:none;flex-shrink:0;min-width:0;margin:0 auto}
+.board-preview{width:min(100%,clamp(140px,var(--board-preview-size,320px),560px));aspect-ratio:var(--board-preview-ratio,1);background:var(--background);box-shadow:none;flex-shrink:0;min-width:0;margin:0 auto}
 .board-preview img{display:block;width:100%;height:auto;max-width:100%;object-fit:contain}
 .board-list{margin:0 26px 22px;background:var(--background);border:1px solid var(--panel);border-radius:8px;padding:10px 12px;max-height:240px;overflow-y:auto;flex-shrink:0}
 .board-list-title{font-size:14px;font-weight:600;color:var(--ink);margin-bottom:10px}
@@ -221,5 +259,4 @@ legend{font-size:14px;color:var(--muted);margin-bottom:12px}
 .app-shell .crosshair-note{font-size:11px;margin-top:5px}
 @media(max-width:940px){.app-shell .pdf-controls{width:clamp(220px,26vw,300px)}}
 @media(max-width:760px){.app-shell .pdf-controls{width:100%}}
-
 

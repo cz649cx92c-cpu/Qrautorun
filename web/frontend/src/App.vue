@@ -31,6 +31,7 @@ import CameraPreview from './components/CameraPreview.vue';
 import type {FieldMap,Point} from '../../shared/model';
 import {distance,exitPoint,orderedTagsById} from '../../shared/model';
 import {orthogonalRoute,routeCorners,snapRoutePoint,chainRouteGroups,routeGroupCenters,distanceToRoute,ROUTE_GRID,type SkippedRouteGroup} from '../../shared/route-design';
+import {createTag,createTagGrid,createTagLine} from '../../shared/map-tag-creation';
 import {previewLegDistance,MIN_LEG_DISTANCE_M,MAX_LEG_DISTANCE_M} from '../../shared/route-leg-distance';
 import {taskSchema,type Task} from '../../shared/task';
 import type {Board} from '../../shared/boards';
@@ -176,6 +177,7 @@ const canUseMapTools=computed(()=>!!field.value&&!busy.value&&!robot.value.runni
 const menuEnabled=computed<Record<string,boolean>>(()=>({
  'file-new-map':canUseMapTools.value,
  'file-open-map':!busy.value,
+ 'route-open':!!field.value?.id&&version.value>=1&&!busy.value,
  'route-new':!!field.value&&!routeLocked.value,
  'route-edit':!!field.value&&!routeLocked.value&&(!!selectedRouteId.value||!!field.value.rows.length),
  'route-save':editingRoute.value&&!routeLocked.value&&routeDrawing.value.length>=2,
@@ -257,8 +259,382 @@ function selectAllTags(){
  * 与「全选」同一条纪律——不另造选中状态，画布高亮和批量操作必须看同一份数据。
  */
 const canvasBoxCount=ref(0);
+// ===== 框选批量操作（选择模式下按住拖出矩形） =====
+const boxSelectedIds=ref<number[]>([]);
+const batchBusy=ref(false);
+const batchSizeMm=ref(60);
+/** 批量改规格的输入只写本地 ref（20..180 mm），点「批量改规格」才发请求。 */
+function setBatchSizeMm(raw:string){
+ const value=Math.round(Number(raw));
+ batchSizeMm.value=Number.isFinite(value)?Math.max(20,Math.min(180,value)):60;
+}
+// 横向/纵向间距用「字符串」持有输入值：它们默认来自选中集合的相邻间距中位数，
+// 但轮询刷新绝不能把正在输入的内容重写成数字——否则打「0.6」时小数点会被吞、光标会跳。
+const batchPitchXText=ref('0.20');
+const batchPitchYText=ref('0.20');
+const batchGapM=ref(0.2);
+// 二维阵列的「整组宽/高」是可编辑的派生值：改它等价于改对应的横向/纵向间距。
+// 与间距输入同一纪律——本地字符串 ref，轮询刷新不会重写正在输入的内容。
+const batchWidthMmText=ref('');
+const batchHeightMmText=ref('');
+const boxSelectedTags=computed(()=>{
+ const ids=new Set(boxSelectedIds.value);
+ return (field.value?.tags??[]).filter(t=>ids.has(t.id));
+});
+/** 选中的码里有多少属于定位组（整组规格只能整组改，单点尺寸不能动）。 */
+const boxSelectedGroupCount=computed(()=>{
+ const groups=new Set((field.value?.groups??[]).map(g=>g.referenceId));
+ return boxSelectedTags.value.filter(t=>groups.has(t.id)).length;
+});
+/**
+ * 选中集合的「派生真值」：行数/列数/长/高/相邻间距全部从真实坐标现算，
+ * 不另存一份计划值——刷新、轮询、别人改了地图之后，面板上看到的仍然是服务端真值。
+ */
+function medianGapM(values:number[]):number|null{
+ const sorted=[...new Set(values.map(value=>Math.round(value*1000)))].sort((a,b)=>a-b);
+ if(sorted.length<2)return null;
+ const gaps:number[]=[];
+ for(let i=1;i<sorted.length;i++)gaps.push(sorted[i]!-sorted[i-1]!);
+ const middle=Math.floor(gaps.length/2);
+ const median=gaps.length%2?gaps[middle]!:(gaps[middle-1]!+gaps[middle]!)/2;
+ return median/1000;
+}
+const boxSelectedMetrics=computed(()=>{
+ const list=boxSelectedTags.value;
+ if(list.length<2)return null;
+ const xs=list.map(tag=>tag.x),ys=list.map(tag=>tag.y);
+ const minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys);
+ // 整组尺寸=真实物理外廓：中心跨度 + 一个码的边长。单行时 Y 跨度为 0，
+ // 但整组高度仍然是一个码的边长——所以不会再出现「600×0 mm」这种零高度。
+ const sizeM=Math.max(...list.map(tag=>Number.isFinite(tag.size)&&tag.size>0?tag.size:0.06));
+ return {
+  rows:new Set(ys.map(value=>Math.round(value*1000))).size,
+  columns:new Set(xs.map(value=>Math.round(value*1000))).size,
+  sizeM,
+  lengthM:(maxX-minX)+sizeM,heightM:(maxY-minY)+sizeM,
+  pitchXM:medianGapM(xs),pitchYM:medianGapM(ys),
+ };
+});
+/**
+ * 框选只有三种形态：单行/单列、二维阵列、散点。
+ * - 单行/单列 → 只有「相邻间距」这一个模型（间距=相邻两码中心距），重排/横纵间距必须藏起来；
+ * - 二维阵列（行×列恰好等于选中数）→ 用「横向/纵向间距 + 整组宽/高」，不显示相邻间距卡；
+ * - 散点 → 只保留对齐/批量删除/批量改规格，不猜用户的排布意图。
+ * 两套间距模型绝不同屏出现，否则用户分不清点「应用」到底会按哪个数重排。
+ */
+const boxSelectionKind=computed<'line'|'array2d'|'scatter'>(()=>{
+ const metrics=boxSelectedMetrics.value;
+ const count=boxSelectedTags.value.length;
+ if(!metrics||count<2)return 'scatter';
+ if(metrics.rows===1&&metrics.columns>=2)return 'line';
+ if(metrics.columns===1&&metrics.rows>=2)return 'line';
+ if(metrics.rows>1&&metrics.columns>1&&metrics.rows*metrics.columns===count)return 'array2d';
+ return 'scatter';
+});
+/** 把选中矩形的整组宽/高写回本地输入框（只在选中集合变化或重排成功后调用）。 */
+function syncBatchRectTexts(){
+ const metrics=boxSelectedMetrics.value;
+ batchWidthMmText.value=metrics?String(Math.round(metrics.lengthM*1000)):'';
+ batchHeightMmText.value=metrics?String(Math.round(metrics.heightM*1000)):'';
+}
+/** 整组宽 = (列−1)×横向间距 + 单码边长 → 反算横向间距；低于 0.05 m 按 0.05 收口。 */
+function setBatchWidthMm(raw:string){
+ batchWidthMmText.value=raw;
+ const metrics=boxSelectedMetrics.value;
+ const mm=Number(String(raw??'').trim());
+ if(!metrics||metrics.columns<2||!Number.isFinite(mm)||mm<=0)return;
+ const pitchM=Math.max(0.05,(mm-metrics.sizeM*1000)/1000/(metrics.columns-1));
+ batchPitchXText.value=pitchM.toFixed(2);
+}
+/** 整组高 = (行−1)×纵向间距 + 单码边长 → 反算纵向间距。 */
+function setBatchHeightMm(raw:string){
+ batchHeightMmText.value=raw;
+ const metrics=boxSelectedMetrics.value;
+ const mm=Number(String(raw??'').trim());
+ if(!metrics||metrics.rows<2||!Number.isFinite(mm)||mm<=0)return;
+ const pitchM=Math.max(0.05,(mm-metrics.sizeM*1000)/1000/(metrics.rows-1));
+ batchPitchYText.value=pitchM.toFixed(2);
+}
+/** 反向：改横/纵向间距时，把整组宽/高显示成按这组间距算出的计划值（不写回服务端）。 */
+function setBatchPitchXText(raw:string){
+ batchPitchXText.value=raw;
+ const metrics=boxSelectedMetrics.value;
+ const pitchM=Number(String(raw??'').trim());
+ if(!metrics||!Number.isFinite(pitchM)||pitchM<=0)return;
+ batchWidthMmText.value=String(Math.round(((metrics.columns-1)*pitchM+metrics.sizeM)*1000));
+}
+function setBatchPitchYText(raw:string){
+ batchPitchYText.value=raw;
+ const metrics=boxSelectedMetrics.value;
+ const pitchM=Number(String(raw??'').trim());
+ if(!metrics||!Number.isFinite(pitchM)||pitchM<=0)return;
+ batchHeightMmText.value=String(Math.round(((metrics.rows-1)*pitchM+metrics.sizeM)*1000));
+}
+// 间距默认值只跟着「选中的这一批 id」走，不跟着坐标走：
+// 刷新/拖动改变坐标时，正在输入的间距不能被悄悄改写成另一个数。
+watch(()=>boxSelectedIds.value.slice().sort((a,b)=>a-b).join(','),()=>{
+ const metrics=boxSelectedMetrics.value;
+ batchPitchXText.value=metrics?.pitchXM!=null?metrics.pitchXM.toFixed(2):'0.20';
+ batchPitchYText.value=metrics?.pitchYM!=null?metrics.pitchYM.toFixed(2):'0.20';
+ syncBatchRectTexts();
+ // 「规格」默认就是选中码现在的尺寸：否则一按改规格就是“没有改动”的服务端 400。
+ const groupIds=new Set<number>();
+ for(const group of field.value?.groups??[]){groupIds.add(group.referenceId);for(const member of group.members)groupIds.add(member.id);}
+ const editableTag=boxSelectedTags.value.find(tag=>!groupIds.has(tag.id));
+ if(editableTag&&Number.isFinite(editableTag.size)&&editableTag.size>0){
+  batchSizeMm.value=Math.max(20,Math.min(180,Math.round(editableTag.size*1000)));
+ }
+});
+/**
+ * 两点距离卡：只认「恰好两个」的框选。起点=左/下，终点=右/上（与等间距同序），
+ * 因为服务端固定 fromId、只移动 toId。
+ */
+const pairSpec=computed(()=>{
+ const list=boxSelectedTags.value;
+ if(list.length!==2)return null;
+ const ordered=[...list].sort((a,b)=>a.x-b.x||a.y-b.y);
+ const from=ordered[0]!,to=ordered[1]!;
+ const dx=to.x-from.x,dy=to.y-from.y;
+ return {from,to,absDx:Math.abs(dx),absDy:Math.abs(dy),distance:Math.hypot(dx,dy)};
+});
+const pairTargetText=ref('');
+const pairBusy=ref(false);
+const pairError=ref('');
+/** 与服务端 MIN_TAG_DISTANCE_M = 0.10 对齐：低于它的值一定被服务端拒绝，绝不让它发到 API。 */
+const MIN_TAG_DISTANCE_M=0.10;
+const pairTargetValid=computed(()=>{
+ const v=Number((pairTargetText.value??'').trim());
+ return Number.isFinite(v)&&v>=MIN_TAG_DISTANCE_M;
+});
+/** 输入只写本地 ref；合法时顺手清掉上一次的拒绝原因，非法值不会被静默改成别的数。 */
+function setPairTargetText(raw:string){
+ pairTargetText.value=raw;
+ const v=Number(String(raw??'').trim());
+ if(Number.isFinite(v)&&v>=MIN_TAG_DISTANCE_M)pairError.value='';
+ else pairError.value='新距离至少 0.10 m：更近会让两个二维码互相压盖';
+}
+
+watch(()=>pairSpec.value?pairSpec.value.from.id+'>'+pairSpec.value.to.id:'',()=>{
+ pairError.value='';
+ pairTargetText.value=pairSpec.value?pairSpec.value.distance.toFixed(3):'';
+});
+/**
+ * 等间距卡：同一行/同一列的框选（恰好 2 个时就是 B2 的「相邻间距」）。
+ * 发送顺序就是沿轴顺序（左→右 / 下→上），服务端按这个顺序重排，且只重排这些 id。
+ */
+const spacingSpec=computed(()=>{
+ const list=boxSelectedTags.value;
+ if(list.length<2)return null;
+ const base=list[0]!;
+ const sameRow=list.every(tag=>Math.abs(tag.y-base.y)<=0.02);
+ const sameColumn=!sameRow&&list.every(tag=>Math.abs(tag.x-base.x)<=0.02);
+ if(!sameRow&&!sameColumn)return null;
+ const axis:'x'|'y'=sameRow?'x':'y';
+ const ordered=[...list].sort((a,b)=>axis==='x'?a.x-b.x:a.y-b.y);
+ const gaps:number[]=[];
+ for(let i=1;i<ordered.length;i++)gaps.push(Math.hypot(ordered[i]!.x-ordered[i-1]!.x,ordered[i]!.y-ordered[i-1]!.y));
+ const sorted=[...gaps].sort((a,b)=>a-b);
+ const middle=Math.floor(sorted.length/2);
+ const median=sorted.length%2?sorted[middle]!:(sorted[middle-1]!+sorted[middle]!)/2;
+ return {axis,ids:ordered.map(tag=>tag.id),gapM:median};
+});
+const spacingTargetText=ref('');
+const equalSpacingBusy=ref(false);
+const spacingError=ref('');
+/** 相邻间距同样受服务端 MIN_TAG_DISTANCE_M = 0.10 约束（tag-equal-spacing 用的是同一个下限）。 */
+const MIN_TAG_SPACING_M=0.10;
+const spacingTargetValid=computed(()=>{
+ const v=Number((spacingTargetText.value??'').trim());
+ return Number.isFinite(v)&&v>=MIN_TAG_SPACING_M;
+});
+/** 输入只写本地 ref；合法时清掉拒绝原因，非法值原样留在框里等用户自己改。 */
+function setSpacingTargetText(raw:string){
+ spacingTargetText.value=raw;
+ const v=Number(String(raw??'').trim());
+ if(Number.isFinite(v)&&v>=MIN_TAG_SPACING_M)spacingError.value='';
+ else spacingError.value='相邻间距至少 0.10 m：更近会让二维码互相压盖';
+}
+
+watch(()=>spacingSpec.value?spacingSpec.value.ids.join(','):'',()=>{
+ spacingError.value='';
+ spacingTargetText.value=spacingSpec.value?spacingSpec.value.gapM.toFixed(3):'';
+});
+/** B2 确定：真实端点 tag-distance（服务端固定 fromId、只移动 toId，定位组刚性平移）。 */
+async function applyPairDistance(){
+ const spec=pairSpec.value;
+ if(!spec||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ if(!pairTargetValid.value){pairError.value='新距离至少 0.10 m：更近会让两个二维码互相压盖';return;}
+ const targetM=Number((pairTargetText.value??'').trim());
+ if(Math.abs(targetM-spec.distance)<0.0005){
+  // 服务端会把「没有改动」判为失败；这里先给出可读结论，不发这次写请求。
+  pairError.value='';
+  pairTargetText.value=spec.distance.toFixed(3);
+  message.value=`Q${String(spec.from.id).padStart(3,'0')} 与 Q${String(spec.to.id).padStart(3,'0')} 已经是 ${spec.distance.toFixed(3)} m，无需改动`;
+  return;
+ }
+ pairError.value='';
+ await act(async()=>{
+  pairBusy.value=true;
+  try{
+   const result=await api(`/maps/${field.value!.id}/tag-distance`,{baseVersion:version.value,fromId:spec.from.id,toId:spec.to.id,targetM});
+   selectMap(result);
+   await refresh();
+   // 服务端只移动终点：两个 id 仍然保持选中，面板继续显示真实结果。
+   boxSelectedIds.value=[spec.from.id,spec.to.id];
+   const afterM=typeof result?.afterM==='number'?result.afterM:targetM;
+   pairTargetText.value=afterM.toFixed(3);
+   message.value=`Q${String(spec.from.id).padStart(3,'0')}→Q${String(spec.to.id).padStart(3,'0')} ${spec.distance.toFixed(3)} → ${afterM.toFixed(3)} m`;
+  }finally{pairBusy.value=false;}
+ });
+}
+/** 取消只把输入还原成当前真实距离，绝不发请求。 */
+function cancelPairEdit(){
+ pairError.value='';
+ pairTargetText.value=pairSpec.value?pairSpec.value.distance.toFixed(3):'';
+}
+/** B3 应用：真实端点 tag-equal-spacing，只发选中的这些 id（沿轴排序后的顺序）。 */
+async function applyEqualSpacing(){
+ const spec=spacingSpec.value;
+ if(!spec||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ if(!spacingTargetValid.value){spacingError.value='相邻间距至少 0.10 m：更近会让二维码互相压盖';return;}
+ const targetM=Number((spacingTargetText.value??'').trim());
+ spacingError.value='';
+ await act(async()=>{
+  equalSpacingBusy.value=true;
+  try{
+   const result=await api(`/maps/${field.value!.id}/tag-equal-spacing`,{baseVersion:version.value,ids:[...spec.ids],targetM});
+   selectMap(result);
+   await refresh();
+   boxSelectedIds.value=[...spec.ids];
+   const span=typeof result?.spanAfterM==='number'?`，跨度 ${result.spanAfterM.toFixed(3)} m`:'';
+   message.value=`已按 ${targetM.toFixed(3)} m 等间距排列 ${spec.ids.length} 个二维码${span} · 保存为 v${result.version}`;
+  }finally{equalSpacingBusy.value=false;}
+ });
+}
+function clearBoxSelection(){boxSelectedIds.value=[];canvasBoxCount.value=0;inspectedTagId.value=null;}
+// mapTool 必须在这个 watch 之前声明：watch 的 getter 在 setup 阶段就会执行，
+// 晚声明的 const 会触发 TDZ（开发环境整页空白、生产环境渲染中途抛错，
+// 表现为「点中了但没有高亮/属性面板不刷新/像拖不动」）。
+const mapTool=ref<'position'|'single'|'grid'|'line'|'table'|'spacing'|null>(null);
+watch([()=>page.value,()=>mapTool.value],()=>{boxSelectedIds.value=[];canvasBoxCount.value=0;});
+/** 批量改二维码尺寸（只对独立码生效；码组尺寸由整组打印布局决定）。 */
+async function batchSetSize(){
+ if(!field.value||!boxSelectedIds.value.length)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ const groupTags=new Set<number>();
+ for(const group of field.value.groups??[]){
+  groupTags.add(group.referenceId);
+  for(const member of group.members)groupTags.add(member.id);
+ }
+ // 定位组的单码尺寸由整组布局决定：中心与成员都不能在批量改规格里被改。
+ const editable=boxSelectedIds.value.filter(id=>!groupTags.has(id));
+ if(!editable.length){message.value='选中的都是定位组中心，规格由整组打印布局决定，不能单点改';return;}
+ const sizeM=batchSizeMm.value/1000;
+ // 服务端把「没有实际改动」判为失败（400），所以只提交真的要改的那几个；
+ // 一个都不用改时给可读提示，绝不让用户看到报错。
+ const changed=editable.filter(id=>{
+  const tag=field.value!.tags.find(item=>item.id===id);
+  return !tag||Math.abs(tag.size-sizeM)>1e-9;
+ });
+ if(!changed.length){message.value=`选中的二维码已经是 ${batchSizeMm.value} mm，无需修改`;return;}
+ await act(async()=>{
+  batchBusy.value=true;
+  try{
+   const result=await api(`/maps/${field.value!.id}/tags/update`,{baseVersion:version.value,edits:changed.map(id=>({id,size:sizeM}))});
+   if(result?.map)selectMap(result);else selectMap(await api('/maps/'+field.value!.id));
+   await refresh();
+   message.value=`已把 ${changed.length} 个二维码改为 ${batchSizeMm.value} mm`+(editable.length>changed.length?`（另有 ${editable.length-changed.length} 个本来就是该尺寸）`:'');
+  }finally{batchBusy.value=false;}
+ });
+}
+/** 批量删除选中的二维码（版本化删除，保留安全校验）。 */
+async function batchDelete(){
+ if(!field.value||!boxSelectedIds.value.length)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能删除点位';return;}
+ // 定位组中心不能单点删除（会破坏 groups 一致性）：先分拣，只删独立码。
+ const centerIds=new Set((field.value.groups??[]).map(g=>g.referenceId));
+ const ids=boxSelectedIds.value.filter(id=>!centerIds.has(id));
+ const blockedCount=boxSelectedIds.value.length-ids.length;
+ if(!ids.length){
+  message.value=`选中的 ${blockedCount} 个都是定位组中心：删除会破坏整组一致性，请改用「点位表」或整组下线流程`;
+  return;
+ }
+ await act(async()=>{
+  batchBusy.value=true;
+  try{
+   const result=await api(`/maps/${field.value!.id}/tags`,{ids,baseVersion:version.value},'DELETE');
+   if(result?.map)selectMap(result);else selectMap(await api('/maps/'+field.value!.id));
+   clearBoxSelection();
+   inspectedTagId.value=null;
+   await refresh();
+   message.value=`已删除 ${ids.length} 个二维码并保存为 v${result.version}`+(blockedCount?`（${blockedCount} 个定位组中心未删除）`:'');
+  }finally{batchBusy.value=false;}
+ });
+}
+/** 批量重排：把选中的点按「行 × 列 + 列距/行距」重新排成规则阵列。 */
+async function batchReshapeGrid(){
+ if(!field.value)return;
+ const ids=[...boxSelectedIds.value];
+ if(ids.length<2){message.value='至少框选两个二维码才能重排成阵列';return;}
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ // 行/列数按选中点的真实排布派生（unique Y / unique X）：面板显示的就是真值，
+ // 重排只接受「当前就是完整矩形」的集合，避免把不规则散点硬塞成阵列。
+ const metrics=boxSelectedMetrics.value;
+ const cols=Math.max(1,Math.round(metrics?.columns??1));
+ const rows=Math.max(1,Math.round(metrics?.rows??1));
+ if(cols*rows!==ids.length){
+  message.value=`框选 ${ids.length} 个，但按当前排布 ${rows}×${cols}=${rows*cols} 个，数量必须一致才能重排`;
+  return;
+ }
+ const pitchX=Math.max(0.05,Number(batchPitchXText.value)||0.2);
+ const pitchY=Math.max(0.05,Number(batchPitchYText.value)||0.2);
+ batchBusy.value=true;
+ try{
+  // 以选中点的左上角为原点，行优先排布；id 保持不变，只改坐标。
+  // 写锁由 commitPaletteMap 内部的 act() 持有：这里绝不能再套一层 act()，
+  // 否则内层会被「上一个操作还在处理中」挡掉，重排看起来点了没反应。
+  const sel=field.value!.tags.filter(t=>ids.includes(t.id));
+  const ox=Math.min(...sel.map(t=>t.x));
+  const oy=Math.min(...sel.map(t=>t.y));
+  const ordered=[...sel].sort((a,b)=>a.y-b.y||a.x-b.x);
+  const pos=new Map<number,{x:number;y:number}>();
+  ordered.forEach((t,i)=>pos.set(t.id,{x:ox+Math.floor(i%cols)*pitchX,y:oy+Math.floor(i/cols)*pitchY}));
+  const next={...field.value!,tags:field.value!.tags.map(t=>pos.has(t.id)?{...t,...pos.get(t.id)!}:t)};
+  await commitPaletteMap(next,`已把 ${ids.length} 个二维码重排为 ${rows}×${cols}`);
+  // 行/列数与长/高都是坐标的派生真值：重排落库后立刻按新坐标刷新整组宽/高显示。
+  syncBatchRectTexts();
+ }finally{batchBusy.value=false;}
+}
+/** 批量按当前选择对齐（保持既有 align 契约：mode 决定对齐方式）。 */
+async function batchAlign(mode:'left'|'right'|'top'|'bottom'|'hcenter'|'vcenter'|'equalSpacing'){
+ if(!field.value||boxSelectedIds.value.length<2)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ await act(async()=>{
+  batchBusy.value=true;
+  try{
+   const result=await api(`/maps/${field.value!.id}/tags/align`,{baseVersion:version.value,ids:[...boxSelectedIds.value],mode});
+   if(result?.map)selectMap(result);else selectMap(await api('/maps/'+field.value!.id));
+   await refresh();
+   message.value=`已对齐 ${boxSelectedIds.value.length} 个二维码并保存为 v${result.version}`;
+  }finally{batchBusy.value=false;}
+ });
+}
 function onCanvasBoxSelect(ids:number[]){
+ if(!editingRoute.value)return;
  canvasBoxCount.value=ids.length;
+ // 点位编辑（map-only）下框选即批量选区：与路径编辑无关。
+ if(field.value?.routeMode==='map-only'){
+  // 只命中 1 个等价于单选：不进入批量态。
+  boxSelectedIds.value=ids.length>1?ids:[];
+  inspectedTagId.value=ids[0]??null;
+  message.value=ids.length?`框选 ${ids.length} 个二维码`:'框选未命中任何二维码';
+  // 路径编辑里框选还要顺带选中命中的路点（map-only 地图常常一个路点都没有）。
+  if(!editingRoute.value)return;
+  // 多选时批量条优先；清掉路点选中，避免 route-inspector 与批量条同时出现。
+  if(ids.length>1)routeSelected.value=-1;
+ }
  if(!editingRoute.value||routeLocked.value)return;
  if(tagPositionEditing.value||tagTableEditing.value){
   spacingSelectedIds.value=ids;
@@ -286,6 +662,19 @@ function onCanvasConnect(payload:{fromId:number;toId:number}){
 function onCanvasLinkRejected(payload:{code:string;message:string}){
  error.value=payload.message;
 }
+/**
+ * 画布拒绝一次会造成二维码重叠的吸附：只把原因交给操作者，
+ * 绝不本地假装“已移动”——画布上的点仍然是服务端那份坐标。
+ */
+/** 画布拒绝/修正一次会造成重合的落点：原因单独留一条可见提示（6 秒），
+ *  不能放进 message——保存成功时 act() 会把 message 清空，操作者就再也看不到原因。 */
+const snapNotice=ref('');
+let snapNoticeTimer:ReturnType<typeof setTimeout>|undefined;
+function onSnapBlocked(payload:{message:string}){
+ snapNotice.value=payload.message;
+ if(snapNoticeTimer)clearTimeout(snapNoticeTimer);
+ snapNoticeTimer=setTimeout(()=>{snapNotice.value='';},6000);
+}
 function openTagCreate(){if(field.value?.routeMode!=='map-only')return;focusRouteToolCard('map-tag-create');}
 function openTagTable(){if(field.value?.routeMode!=='map-only')return;focusRouteToolCard('map-tag-table-panel');}
 function onEditorCommand(payload:{id:string}){
@@ -294,6 +683,7 @@ function onEditorCommand(payload:{id:string}){
  switch(id){
   case 'file-new-map': void createBlankMapNow(); break;
   case 'file-open-map': page.value='navigate'; break;
+  case 'route-open': openRouteDialog(); break;
   case 'route-new': beginNewRoute(); break;
   case 'route-edit': beginRoute(); break;
   case 'route-save': if(editingRoute.value) void saveRoute(false); break;
@@ -479,6 +869,11 @@ function onTagCreateGhostMove(index:number,point:Point){
  panel.moveGhost(index,{x:point.x,y:point.y});
  // 表单变了 → 预览地图随之重算，ghost 也要跟着更新（否则画布还停在旧位置）
  nextTick(()=>{tagCreateGhost.value=tagCreatePanel.value?.ghostTags??[];});
+}
+function onTagCreateDraft(map:FieldMap|null){
+ // 草稿即真值：新点直接进入画布按真实二维码渲染，可选中/拖动/删除；保存仍写新版本。
+ if(map){orthogonalPreviewMap.value=map;mapDraftSource.value='tag-create';tagCreateGhost.value=[];}
+ else if(mapDraftSource.value==='tag-create'){orthogonalPreviewMap.value=null;mapDraftSource.value=null;}
 }
 function onTagCreateEditing(active:boolean){
  tagCreateEditing.value=active;
@@ -945,6 +1340,8 @@ const spacingSelectedIds=ref<number[]>([]);
 const mapSelected=computed<number[]>(()=>{
  if(measuring.value)return measurementIds.value;
  if(tagPositionEditing.value)return spacingSelectedIds.value.length?spacingSelectedIds.value:EMPTY_TAG_IDS;
+ // 框选整批高亮：不能只亮第一个。
+ if(boxSelectedIds.value.length)return boxSelectedIds.value;
  return inspectedTagId.value===null?EMPTY_TAG_IDS:[inspectedTagId.value];
 });
 const mapMeasurement=computed<number[]>(()=>measuring.value?measurementIds.value:EMPTY_TAG_IDS);
@@ -1120,6 +1517,10 @@ const inspectedTagId=ref<number|null>(null),selectedSegmentKey=ref(''),routeMode
 // and drags only move that point's centre. Route waypoint/drawing events never
 // run while this stage is active.
 function mapCanvasSelect(id:number){
+ // 单击单点：这是单选，不是框选。清掉可能残留的框选集合与计数，
+ // 否则批量条、提示语与阵列/直线参数会错误地继续显示。
+ if(boxSelectedIds.value.length)boxSelectedIds.value=[];
+ canvasBoxCount.value=0;
  if(tagPositionEditing.value||tagTableEditing.value){
   // 画布直接点选：再点一次取消；支持连续点多码做批量等间距。
   inspectedTagId.value=id;
@@ -1128,13 +1529,94 @@ function mapCanvasSelect(id:number){
    :[...spacingSelectedIds.value,id];
   return;
  }
+ // 点位编辑（map-only）的默认视图：单击画布上的二维码就是**选中它本身**。
+ // 旧实现这里直接落到 measureSelect()，而 measureSelect 在非测量态立刻 return，
+ // 于是画布上的点永远选不中——属性浮窗、改规格、删除按钮全都无从触发。
+ // 这不是「按了什么键/什么工具」的问题，是选中链路的唯一入口整个丢了。
+ if(field.value?.routeMode==='map-only'&&!editingRoute.value){
+  inspectedTagId.value=id;
+  tagInspectorVisible.value=false;
+  return;
+ }
  measureSelect(id);
 }
+/** 写操作互斥（act 的 busy）正在被占用时，拖动不能被静默丢弃：等它释放再落库。 */
+async function waitForIdle(maxMs=4000){
+ const start=Date.now();
+ while(busy.value&&Date.now()-start<maxMs){
+  await new Promise(resolve=>setTimeout(resolve,40));
+ }
+ return !busy.value;
+}
+/** 画布上整批拖动（框选多选）：一次写入新版本，保留安全校验。 */
+async function moveTagsBatch(ids:number[],dx:number,dy:number){
+ if(!field.value||!ids.length)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ const hit=new Set(ids);
+ // 定位组是整组一致性约束：只要动了组里任何一个点（中心或成员），
+ // 整组都必须跟着刚性平移，否则后端 mapSchema 会拒绝、界面看起来就是「拖不动」。
+ const groupIds=new Set<number>();
+ for(const group of field.value.groups??[]){
+  const members=group.members.map(member=>member.id);
+  if(members.some(id=>hit.has(id)))members.forEach(id=>groupIds.add(id));
+ }
+ const moving=new Set<number>([...hit,...groupIds]);
+ const previous=field.value;
+ const next={...field.value,tags:field.value.tags.map(t=>moving.has(t.id)?{...t,x:t.x+dx,y:t.y+dy}:t)};
+ // 先把新坐标写进内存，画布下一次重绘才不会用旧快照把点拉回去。
+ field.value=next;
+ // 上一个写操作还没结束时不能直接放弃这次拖动（旧实现就是这样把位置丢了），
+ // 等互斥释放后再落库。
+ const idle=await waitForIdle();
+ const saved=idle?await commitPaletteMap(next,`已移动 ${ids.length} 个二维码`):false;
+ if(saved)return;
+ // 没落库（版本冲突/操作锁/校验拒绝）：只回滚这一批点的坐标，绝不整图回退。
+ const current=field.value;
+ if(current){
+  field.value={...current,tags:current.tags.map(t=>{
+   if(!moving.has(t.id))return t;
+   const before=previous.tags.find(item=>item.id===t.id);
+   return before?{...t,x:before.x,y:before.y}:t;
+  })};
+ }
+}
 function mapCanvasMove(ids:number[],dx:number,dy:number){
+ if(!editingRoute.value)return;
  if(!ids.length)return;
- if(tagTableEditing.value){tagTablePanel.value?.moveTags(ids,dx,dy);}
- else{tagPositionPanel.value?.moveTags(ids,dx,dy);}
- if(ids.length===1)inspectedTagId.value=ids[0]!;
+ // 框选多选：整批平移并立即保存，不走单点草稿链。
+ if(ids.length>1&&boxSelectedIds.value.length>1&&ids.every(id=>boxSelectedIds.value.includes(id))){
+  void moveTagsBatch(ids,dx,dy);
+  return;
+ }
+ if(paletteInstance.value&&ids.some(id=>paletteInstance.value!.ids.includes(id))){
+  if(ids.length===1)inspectedTagId.value=ids[0]!;
+  void movePaletteInstance(ids,dx,dy);
+  return;
+ }
+ if(tagCreateEditing.value){
+  const create:any=tagCreatePanel.value;
+  create?.moveDraft?.(ids,dx,dy);
+  if(ids.length===1)inspectedTagId.value=ids[0]!;
+  return;
+ }
+ if(tagTableEditing.value){
+  tagTablePanel.value?.moveTags(ids,dx,dy);
+  if(ids.length===1)inspectedTagId.value=ids[0]!;
+  return;
+ }
+ if(tagPositionEditing.value){
+  tagPositionPanel.value?.moveTags(ids,dx,dy);
+  if(ids.length===1)inspectedTagId.value=ids[0]!;
+  return;
+ }
+ // 点位编辑的默认视图（没有打开「调整点位」面板）：拖动必须直接落库。
+ // 旧实现只会把事件丢给未挂载的 tagPositionPanel，模型与画布立刻分叉，
+ // 下一次重绘（遥测/选中/刷新）就把点拉回旧坐标——这就是「拖动后又弹回去」。
+ if(field.value?.routeMode==='map-only'){
+  if(ids.length===1)inspectedTagId.value=ids[0]!;
+  void moveTagsBatch(ids,dx,dy);
+  return;
+ }
 }
 const routeHistory=ref<Point[][]>([]),routeSkippedHold=ref<SkippedRouteGroup[]>([]);
 const spacingFrom=ref<number|null>(null),spacingTo=ref<number|null>(null),spacingTargetM=ref<number|null>(null),spacingOverrides=ref<{fromId:number;toId:number;occurrence:number;targetM:number}[]>([]);
@@ -1170,7 +1652,12 @@ function adoptFirstLegHeading(){setInitialHeading(firstLegHeadingDeg());}
 function resetInitialHeading(){initialHeadingManual.value=false;bodyYawDeg.value=firstLegHeadingDeg();}
 watch(routeAnchors,()=>{if(editingRoute.value&&!initialHeadingManual.value)bodyYawDeg.value=firstLegHeadingDeg();},{deep:true});
 const lateralStrategyBlocked=computed(()=>field.value?.motionSegments?.some(segment=>segment.strategy==='left'||segment.strategy==='right')&&robot.value.mapping?.lateralSupported!==true);
-function inspectTag(id:number){if(editingRoute.value){inspectedTagId.value=id;tagInspectorVisible.value=false;}}
+function inspectTag(id:number){
+ // 单击一个码是一次新的单选：必须清掉之前的框选高亮，
+ // 否则 mapSelected 仍然按框选集合高亮，用户会觉得「点了没反应/高亮不对」。
+ if(boxSelectedIds.value.length){boxSelectedIds.value=[];canvasBoxCount.value=0;}
+ if(editingRoute.value){routeSelected.value=-1;inspectedTagId.value=id;tagInspectorVisible.value=false;}
+}
 function openTagInspector(){if(!field.value?.tags.length)return;inspectedTagId.value??=orderedTagsById(field.value.tags)[0]!.id;tagInspectorVisible.value=true;if(editingRoute.value)routeDetailsOpen.value=true;}
 function changeSegmentMode(plan:SegmentPlan,mode:StrategyMode){if(routeLocked.value)return;rememberRoute();routeModes.value=[...routeModes.value.filter(choice=>!(choice.fromId===plan.fromId&&choice.toId===plan.toId&&choice.occurrence===plan.occurrence)),{fromId:plan.fromId,toId:plan.toId,occurrence:plan.occurrence,mode}];selectedSegmentKey.value=plan.key;}
 function selectSegment(key:string){selectedSegmentKey.value=key;routeDetailsOpen.value=true;}
@@ -1185,6 +1672,8 @@ const routeLength=computed(()=>routeDrawing.value.slice(1).reduce((sum,p,i)=>sum
 // 铺码（tag-create）与点位调整（tag-position）只影响二维码，不锁路径编辑。
 const orthogonalDraft=computed(()=>orthogonalPreviewActive.value&&mapDraftSource.value==='orthogonal');
 const routeLocked=computed(()=>busy.value||robot.value.running||commandFeedback.value?.state==='waiting'||orthogonalDraft.value);
+/** 只读标只反映“真的不能改”：保存中的 busy 属于正常操作，不该闪一个黄色只读标。 */
+const routeReadonly=computed(()=>robot.value.running||commandFeedback.value?.state==='waiting'||orthogonalDraft.value);
 // 间距调整期间禁止的是会同时写地图/版本的动作，不是路径点编辑本身。
 const spacingBusy=computed(()=>tagPositionEditing.value);
 // 每一步改动都同时压进「会话撤销栈」与旧的 routeHistory。
@@ -1273,6 +1762,55 @@ function enterRouteLayout(){
 const routeExitConfirm=ref(false);
 // 只读调试钩子：让回归测试能核对「未保存改动」判定，而不是靠猜。
 watch(()=>editorSession.dirty.value,d=>{if(typeof document!=='undefined')document.documentElement.dataset.editorDirty=d?'1':'0';},{immediate:true});
+const routeOpenDialog=ref(false),routeOpenConfirm=ref<string|null>(null),routeOpenBusy=ref(false);
+/** Only routes that belong to the map version actually loaded in the editor. */
+const openableRoutes=computed(()=>{
+ const mapId=field.value?.id;
+ if(!mapId)return [];
+ return routes.value.filter(route=>route.mapId===mapId&&route.mapVersion===version.value);
+});
+function openRouteDialog(){
+ if(!field.value?.id){message.value='请先打开一张地图，再打开它的路径';return;}
+ if(busy.value)return;
+ error.value='';routeOpenDialog.value=true;
+}
+function closeRouteDialog(){if(routeOpenBusy.value)return;routeOpenDialog.value=false;}
+function chooseOpenRoute(routeId:string){
+ if(!field.value?.id||routeOpenBusy.value)return;
+ const route=routes.value.find(item=>item.routeId===routeId);
+ if(!route||route.mapId!==field.value.id||route.mapVersion!==version.value){
+  message.value='该路径不属于当前地图版本，已忽略';return;
+ }
+ if(routeLocked.value){
+  message.value=busy.value?'正在处理中，请稍候':'机器人运行中或存在未完成指令：暂不能切换编辑中的路径，请先停止导航';
+  return;
+ }
+ if(editorSession.dirty.value){routeOpenConfirm.value=routeId;return;}
+ void loadRouteIntoEditor(routeId);
+}
+async function loadRouteIntoEditor(routeId:string){
+ routeOpenBusy.value=true;
+ try{
+  const fresh=await api('/routes/'+routeId);
+  if(!field.value||fresh.mapId!==field.value.id||fresh.mapVersion!==version.value){
+   message.value='该路径不属于当前地图版本，已忽略';return;
+  }
+  routes.value=routes.value.map(item=>item.routeId===routeId?fresh:item);
+  selectedRouteId.value=routeId;selectedTask.value='';
+  routeOpenDialog.value=false;routeOpenConfirm.value=null;
+  // Reuse the single existing loader: it restores stored points, modes,
+  // revisit order, initial heading and binds routeEditId + updated for conflict checks.
+  if(editingRoute.value)beginRoute();
+  else enterRouteEditing();
+  message.value=`已打开路径「${fresh.name}」· ${fresh.points.length} 点`;
+ }catch(reason){
+  error.value='打开路径失败：'+(reason instanceof Error?reason.message:String(reason));
+ }finally{routeOpenBusy.value=false;}
+}
+function openNewRouteFromDialog(){
+ routeOpenDialog.value=false;
+ beginNewRoute();
+}
 function requestExitRoute(){
  if(!editingRoute.value)return;
  if(!editorSession.dirty.value){editingRoute.value=false;message.value='';return;}
@@ -1303,7 +1841,15 @@ function beginRoute(){
  // 进入编辑即建立撤销基线：第一次改动就能 Ctrl+Z 回退，且这次回退可重做。
  editorSession.reset();
  const orthogonal=points.every((p,i)=>!i||Math.abs(p.x-points[i-1]!.x)<1e-8||Math.abs(p.y-points[i-1]!.y)<1e-8);
- routeAnchors.value=orthogonal?routeCorners(points):[];
+ // 已保存路径实体：锚点=存储折线本身，逐点加载、不压缩。
+ // 旧实现 routeCorners(points) 会把同一直线上的中间停靠点全部丢掉
+ // （实测「办公室」路线 33 点只剩 14 锚点，19 个定位组访问连同其
+ // 前进/倒车/平移动作从步骤表消失——「路径步骤显示不全」的根因）。
+ // 重复经过同一码的折返点（如 A→B→A）天然保留：存储折线本身携带顺序。
+ // 只有「无路径实体的示教 rows 回退」仍用 corner 压缩（那类折线是 0.03m
+ // 采样弧，逐点加载会灌进上千个不可编辑的假步骤）。
+ const storedRoutePoints=selectedRoute?.points;
+ routeAnchors.value=orthogonal?(storedRoutePoints?storedRoutePoints.map(point=>({...point})):routeCorners(points)):[];
  const storedHeading=selectedRoute?.initialHeadingRad;
  initialHeadingManual.value=typeof storedHeading==='number'&&Number.isFinite(storedHeading);
  bodyYawDeg.value=initialHeadingManual.value?Math.round(norm360(storedHeading!*180/Math.PI)*100)/100:firstLegHeadingDeg(routeAnchors.value);
@@ -1353,6 +1899,22 @@ function autoChainRoute(){
  if(chain.points.length>501){error.value='自动串码后的控制点超过501个，请拆分路线';return;}
  const skipped=routeSkipped.value;commitRouteEdit(()=>{routeAnchors.value=chain.points.map(point=>({...point}));routeSkippedHold.value=skipped;routeSelected.value=-1;});error.value='';
  message.value=`已自动串起 ${new Set(chain.nodes.map(node=>node.id)).size} 个定位组 · 每到下一码纠正一次 · 跳过 ${routeSkipped.value.length} 个偏离码`;
+}
+/** 点击画布空白：先取消当前选中（单选/框选都清），再交给路径加点逻辑。 */
+/**
+ * 点击画布空白：取消选中。
+ * 点中二维码时走的是 select 事件（MapCanvas 里 tag 自己的 click 处理器），
+ * 与 blank 互斥，所以这里不需要按距离猜——真正的空点击就清空选中。
+ */
+function onCanvasBlank(point:Point){
+ if(inspectedTagId.value!==null)inspectedTagId.value=null;
+ if(boxSelectedIds.value.length){boxSelectedIds.value=[];canvasBoxCount.value=0;}
+ if(spacingSelectedIds.value.length)spacingSelectedIds.value=[];
+ if(tagPositionEditing.value||tagTableEditing.value)return;
+ // map-only 地图进入路径编辑后仍然要能加点：旧实现先按「map-only」直接 return，
+ // 于是「加点」工具在只铺码的地图上是死的（点两次画布一个控制点都不出）。
+ if(field.value?.routeMode==='map-only'&&!editingRoute.value)return;
+ appendRoute(point);
 }
 function appendRoute(point:Point){
  // 临时观测点（验证后移除）
@@ -1413,7 +1975,7 @@ function onToolbarAction(id:string){
 /** 分组展开状态：默认展开「路径编辑」与「路线拓扑」。
     拓扑是路径编辑的核心对象（有向区间/待确认边/策略），默认收起会把核心功能藏起来；
     点位与铺码、步骤属于按需展开项。 */
-const routePanelOpenGroups=ref<string[]>(['map','route','tags','topology']);
+const routePanelOpenGroups=ref<string[]>(['route']);
 /** 有待确认的有向边时，拓扑组必须强制展开：它是安全状态，不能被折叠藏起来。 */
 
 const routePanelRequiredGroups=computed<string[]>(()=>pendingConnect.value?['topology']:[]);
@@ -1430,7 +1992,8 @@ const routeSelectedObject=computed(()=>{
  const row=index>=0?stepRows.value[index]:undefined;
  if(row){
   return {kind:'waypoint' as const,index:row.index,coord:row.coord,qrLabel:row.qrLabel==='—'?'':row.qrLabel,
-   type:row.type,speedMps:row.speedMps,lengthM:row.lengthM,blocked:row.blocked};
+   type:row.type,speedMps:row.speedMps,lengthM:row.lengthM,blocked:row.blocked,
+   tagId:nearestGroupId(routeAnchors.value[row.key]!)};
  }
  if(inspectedTagId.value!==null){
   const tag=field.value?.tags.find(item=>item.id===inspectedTagId.value);
@@ -1443,12 +2006,573 @@ const routeSelectedObject=computed(()=>{
 // 共用按需属性区：选中二维码或路点就显示对应属性，没有选中对象时自动收起。
 // 用户仍可用工具条的「属性」按钮手动关/开，但默认跟随选中对象。
 /** 当前打开的地图工具：null=只显示 6 个紧凑按键；点开后才渲染对应面板。 */
-const mapTool=ref<'position'|'single'|'grid'|'line'|'table'|'spacing'|null>(null);
 
 /**
  * 点紧凑按键 → 直接进入对应功能（不要求再点一次「开始」）。
  * 复用各面板已暴露的 start/activate，与面板内按钮走同一条路径，不新增保存链。
  */
+// ===== 左侧工具牌：按住拖进画布，松手即落到当前草稿 =====
+type DragToolKind = 'single' | 'grid' | 'line';
+const toolDrag = ref<{kind:DragToolKind;startX:number;startY:number;x:number;y:number;over:boolean;enterX?:number;enterY?:number;worldX?:number;worldY?:number}|null>(null);
+// 拖拽一旦真正移动过，松手后的合成 click 必须被吞掉，否则取消拖放会误开面板。
+const toolDragMoved=ref(false);
+const mapCanvasRef = ref<{clientToWorld?:(x:number,y:number)=>{x:number;y:number}|null}|null>(null);
+// ===== palette 实例：拖入生成的那一批点，记住模板参数以便浮窗实时重算 =====
+type PaletteKind = 'single' | 'grid' | 'line';
+interface PaletteInstance {
+ kind:PaletteKind;ids:number[];
+ originX:number;originY:number;
+ columns:number;rows:number;pitchXM:number;pitchYM:number;
+ count:number;spacingM:number;axis:'horizontal'|'vertical';direction:1|-1;
+ angleDeg:number;sizeM:number;
+}
+const paletteInstance=ref<PaletteInstance|null>(null);
+// 拖入实例的 id 全在框选里时，批量条额外显示这份实例参数：行/列与间距是它的真实参数，
+// 长/高是派生量。编辑只写本地 ref（editInstance），提交走 commitInstance——
+// 绝不把输入框双向绑到轮询数据上，否则刷新会把正在输入的值改回旧值。
+const paletteInstanceFullySelected=computed(()=>{
+ const inst=paletteInstance.value;
+ if(!inst||inst.kind!=='grid'||!inst.ids.length)return false;
+ const selected=new Set(boxSelectedIds.value);
+ return inst.ids.every(id=>selected.has(id));
+});
+const paletteInstanceMetrics=computed(()=>{
+ const inst=paletteInstance.value;
+ if(!inst||!paletteInstanceFullySelected.value)return null;
+ const rows=Math.max(1,Math.round(inst.rows)),columns=Math.max(1,Math.round(inst.columns));
+ // 与框选同一套物理外廓语义：中心跨度 + 实例自己的单码边长（单行也有高度，不再是 0）。
+ const sizeM=Number.isFinite(inst.sizeM)&&inst.sizeM>0?inst.sizeM:0.06;
+ return {rows,columns,sizeM,lengthM:Math.max(0,(columns-1)*inst.pitchXM)+sizeM,heightM:Math.max(0,(rows-1)*inst.pitchYM)+sizeM};
+});
+// 创建面板尚未算完时的兜底参数（与面板默认一致）
+const gridFallback={columns:4,rows:3,pitchXM:0.2,pitchYM:0.2};
+/** 按实例参数算出这批点的目标坐标（与创建面板同一套语义）。 */
+function instancePoints(inst:PaletteInstance):{x:number;y:number}[]{
+ const rad=inst.angleDeg*Math.PI/180, cos=Math.cos(rad), sin=Math.sin(rad);
+ if(inst.kind==='single')return [{x:inst.originX,y:inst.originY}];
+ if(inst.kind==='grid'){
+  const out:{x:number;y:number}[]=[];
+  for(let r=0;r<Math.max(1,Math.round(inst.rows));r++){
+   for(let c=0;c<Math.max(1,Math.round(inst.columns));c++){
+    const lx=c*inst.pitchXM, ly=r*inst.pitchYM;
+    out.push({x:inst.originX+lx*cos-ly*sin,y:inst.originY+lx*sin+ly*cos});
+   }
+  }
+  return out;
+ }
+ const n=Math.max(1,Math.round(inst.count)), out:{x:number;y:number}[]=[];
+ for(let i=0;i<n;i++){
+  const d=i*inst.spacingM*inst.direction;
+  out.push(inst.axis==='horizontal'?{x:inst.originX+d,y:inst.originY}:{x:inst.originX,y:inst.originY+d});
+ }
+ return out;
+}
+/** 参数变化：重算这批点并立即提交（多退少补，复用同一批 id）。 */
+async function applyInstanceParams(){
+ const inst=paletteInstance.value;
+ if(!inst||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ const points=instancePoints(inst);
+ const oldIds=[...inst.ids];
+ const base=field.value.tags.filter(t=>!oldIds.includes(t.id));
+ const maxId=field.value.tags.reduce((m,t)=>Math.max(m,t.id),-1);
+ const tags=points.map((p,i)=>{
+  const id=oldIds[i]??(maxId+1+i);
+  return {id,groupId:undefined,rowId:'',x:p.x,y:p.y,angle:inst.angleDeg,size:inst.sizeM,kind:'waypoint' as const,rules:[]};
+ });
+ inst.ids=tags.map(t=>t.id);
+ await commitPaletteMap({...field.value,tags:[...base,...tags]},
+  `${inst.kind==='grid'?`阵列 ${inst.columns}×${inst.rows}`:inst.kind==='line'?`直线 ${inst.count} 点`:'单点'}已更新`);
+}
+/** 把整张候选地图提交为新版本（保留版本冲突与安全校验）。 */
+async function commitPaletteMap(next:FieldMap,note:string){
+ if(!field.value)return false;
+ // 返回「这次写入是否真的落库」：拖动路径需要据此决定是否回滚界面上的乐观坐标。
+ let saved=false;
+ await act(async()=>{
+  const result=await api('/maps',{map:next,baseVersion:version.value});
+  selectMap(result);
+  selectedMapId.value=result.map?.id??field.value!.id;
+  await refresh();
+  message.value=`${note} · 已保存为地图 v${result.version}`;
+  saved=true;
+ });
+ return saved;
+}
+/** 拖动画布上的实例点：移动后立即保存。 */
+async function movePaletteInstance(ids:number[],dx:number,dy:number){
+ const inst=paletteInstance.value;
+ if(!inst||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ const hit=ids.filter(id=>inst.ids.includes(id));
+ if(!hit.length)return;
+ const previous=field.value;
+ const next={...field.value,tags:field.value.tags.map(t=>hit.includes(t.id)?{...t,x:t.x+dx,y:t.y+dy}:t)};
+ // 与整批拖动同一条纪律：先写内存、等互斥、再落库；失败只回滚这批点。
+ field.value=next;
+ let saved=false;
+ if(await waitForIdle())saved=await commitPaletteMap(next,`已移动 ${hit.map(id=>'Q'+String(id).padStart(3,'0')).join('、')}`);
+ if(saved)return;
+ const latest=field.value;
+ if(latest){
+  field.value={...latest,tags:latest.tags.map(t=>{
+   if(!hit.includes(t.id))return t;
+   const before=previous.tags.find(item=>item.id===t.id);
+   return before?{...t,x:before.x,y:before.y}:t;
+  })};
+ }
+}
+// ===== 画布对象浮窗：选中草稿对象后出现，改参/删除立即提交 =====
+const draftObject=computed(()=>{
+ // 路径检查器（route-inspector）与对象浮窗互斥：只有「当前选中的是路点」时才让位。
+ // 路径编辑里点二维码仍然是编辑点位（移动/规格），必须能看到对象浮窗。
+ if(editingRoute.value&&routeSelectedObject.value?.kind==='waypoint')return null;
+ // 浮窗只在「当前选中一个画布对象」时出现；框选多个时让位给批量条。
+ if(boxSelectedIds.value.length>1)return null;
+ if(inspectedTagId.value===null||!field.value||field.value.routeMode!=='map-only')return null;
+ const tag=field.value.tags.find(t=>t.id===inspectedTagId.value);
+ return tag?{id:tag.id,x:tag.x,y:tag.y,angle:tag.angle,sizeM:tag.size,groupId:tag.groupId}:null;
+});
+const inspectorBusy=ref(false);
+/** 浮窗放在左/右：用真实节点在屏幕上的位置决定，绝不挡住正在编辑的那个点。 */
+const inspectorSide=ref<'left'|'right'>('right');
+function syncInspectorSide(){
+ const target=draftObject.value;
+ const api=(mapCanvasRef.value as unknown as {worldToClient?:(point:{x:number;y:number})=>{x:number;y:number}|null})??null;
+ if(!target||!api?.worldToClient){inspectorSide.value='right';return;}
+ const point=api.worldToClient({x:target.x,y:target.y});
+ if(!point){inspectorSide.value='right';return;}
+ // 浮窗宽约 300px：点落在右侧一屏内就换到左边，避免浮窗压住正在改的对象。
+ inspectorSide.value=point.x>window.innerWidth-360||point.x>window.innerWidth/2? 'left':'right';
+}
+watch(()=>[draftObject.value?.id,draftObject.value?.x,draftObject.value?.y],()=>{void nextTick(syncInspectorSide);});
+onMounted(()=>window.addEventListener('resize',syncInspectorSide));
+onBeforeUnmount(()=>window.removeEventListener('resize',syncInspectorSide));
+const inspectorStyle=computed(()=>inspectorSide.value==='left'?{left:'16px',right:'auto'}:{right:'16px',left:'auto'});
+/** 选中对象的行列/间距等参数：来自创建面板当前表单（阵列/直线）。 */
+const draftParams=computed(()=>{
+ const panel=createPanelApi() as any;
+ const pv=panel?.preview;
+ const value=unwrap<any>(pv)??null;
+ return {created:value?.created??0,spanXM:value?.spanXM??null,spanYM:value?.spanYM??null,spanM:value?.spanM??null};
+});
+/** 浮窗标题：只有当前点确实属于该实例时才显示阵列/直线。 */
+const inspectorKind=computed(()=>{
+ const inst=paletteInstance.value;
+ const id=draftObject.value?.id;
+ if(!inst||id===undefined||!inst.ids.includes(id))return '单点';
+ return inst.kind==='grid'?'阵列':inst.kind==='line'?'直线':'单点';
+});
+async function patchDraftObject(patch:{x?:number;y?:number;angle?:number;size?:number}){
+ if(!editingRoute.value)return;
+ const target=draftObject.value;
+ if(!target||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ await act(async()=>{
+  inspectorBusy.value=true;
+  try{
+   const result=await api(`/maps/${field.value!.id}/tags/update`,{baseVersion:version.value,edits:[{id:target.id,...patch}]});
+   if(result?.map)selectMap(result);else selectMap(await api('/maps/'+field.value!.id));
+   await refresh();
+   message.value=`Q${String(target.id).padStart(3,'0')} 已更新并保存为 v${result.version}`;
+  }finally{inspectorBusy.value=false;}
+ });
+}
+/** 删除当前选中的画布对象：只删这一个 id，删除后立即提交。 */
+/** 输入中：只更新实例参数，不提交（避免每次按键都写库，也避免被重渲染回写）。 */
+function editInstance(patch:Partial<PaletteInstance>){
+ const inst=paletteInstance.value;
+ if(!inst)return;
+ paletteInstance.value={...inst,...patch};
+}
+/** 编辑结束：按当前实例参数重算并提交一次。 */
+let lastCommitted='';
+const instanceSignature=()=>{
+ const i=paletteInstance.value;
+ return i?[i.kind,i.columns,i.rows,i.pitchXM,i.pitchYM,i.count,i.spacingM,i.axis,i.direction].join('|'):'';
+};
+/** change 与 blur 都会触发：同一份参数只提交一次。 */
+async function commitInstance(){
+ if(!paletteInstance.value)return;
+ const sig=instanceSignature();
+ if(sig===lastCommitted)return;
+ lastCommitted=sig;
+ await applyInstanceParams();
+}
+// ===== 定位组规格：行×列（彼此独立，1..6，行×列 ≤36）/ 整组宽×高 / 起始编号，改完立即保存 =====
+const groupSpecBusy=ref(false);
+const selectedGroup=computed(()=>{
+ const id=inspectedTagId.value;
+ if(id===null||!field.value)return null;
+ const tag=field.value.tags.find(t=>t.id===id);
+ if(!tag?.groupId)return null;
+ return (field.value.groups??[]).find(g=>g.id===tag.groupId)??null;
+});
+/**
+ * 后端给定位组新增了可选的 rows/cols/widthMm/heightMm，旧地图只有 gridSize/sizeMm。
+ * 这里按契约折算成矩形规格：缺省时回到旧的正方形值（rows=cols=gridSize、宽=高=sizeMm）；
+ * 本地仍用「Board & 可选新字段」断言，避免在共享类型还没升级时写出 any。
+ */
+type GroupRectFields={rows?:number|undefined;cols?:number|undefined;widthMm?:number|undefined;heightMm?:number|undefined};
+const GROUP_GRID_MAX=6,GROUP_CELL_MAX=36,GROUP_MM_MIN=20,GROUP_MM_MAX=500;
+function groupRectOf(g:Board){
+ const extra=g as Board & GroupRectFields;
+ const legacyAxis=Math.max(1,Math.min(GROUP_GRID_MAX,Math.round(g.gridSize||1)));
+ const legacyMm=Math.max(GROUP_MM_MIN,Math.min(GROUP_MM_MAX,Math.round(g.sizeMm)));
+ const rows=Math.max(1,Math.min(GROUP_GRID_MAX,Math.round(extra.rows??legacyAxis)));
+ const cols=Math.max(1,Math.min(GROUP_GRID_MAX,Math.round(extra.cols??legacyAxis)));
+ const widthMm=Math.max(GROUP_MM_MIN,Math.min(GROUP_MM_MAX,Math.round(extra.widthMm??legacyMm)));
+ const heightMm=Math.max(GROUP_MM_MIN,Math.min(GROUP_MM_MAX,Math.round(extra.heightMm??legacyMm)));
+ return {rows,cols,widthMm,heightMm};
+}
+// 4 个输入框的真实来源：只在「选中的码组变了」时由 watch 从服务端灌一次，
+// 渲染期间绝不回读 telemetry——否则改到一半的宽/高会被一次刷新改回旧值。
+const groupRows=ref(1),groupCols=ref(1),groupWidthMm=ref(60),groupHeightMm=ref(60),groupStartId=ref<number|null>(null);
+const groupSpecError=ref('');
+watch(selectedGroup,g=>{
+ if(!g)return;
+ const rect=groupRectOf(g);
+ groupRows.value=rect.rows;groupCols.value=rect.cols;
+ groupWidthMm.value=rect.widthMm;groupHeightMm.value=rect.heightMm;
+ groupStartId.value=g.referenceId;
+ groupSpecError.value='';
+},{immediate:true});
+/** 行/列 1..6 且 行×列 ≤36：改一边越过上限时，把另一边收紧到还能装下的最大值，并说明原因。 */
+function setGroupCols(raw:string){
+ const next=Math.max(1,Math.min(GROUP_GRID_MAX,Math.round(Number(raw)||1)));
+ const prevRows=groupRows.value;
+ groupCols.value=next;
+ if(next*prevRows>GROUP_CELL_MAX){
+  const rows=Math.max(1,Math.floor(GROUP_CELL_MAX/next));
+  groupRows.value=rows;
+  groupSpecError.value=`列数 ${next} × 行数 ${prevRows} = ${next*prevRows} 个码，超过 ${GROUP_CELL_MAX} 个上限：行数已收紧为 ${rows}`;
+  return;
+ }
+ groupSpecError.value='';
+}
+function setGroupRows(raw:string){
+ const next=Math.max(1,Math.min(GROUP_GRID_MAX,Math.round(Number(raw)||1)));
+ const prevCols=groupCols.value;
+ groupRows.value=next;
+ if(next*prevCols>GROUP_CELL_MAX){
+  const cols=Math.max(1,Math.floor(GROUP_CELL_MAX/next));
+  groupCols.value=cols;
+  groupSpecError.value=`行数 ${next} × 列数 ${prevCols} = ${next*prevCols} 个码，超过 ${GROUP_CELL_MAX} 个上限：列数已收紧为 ${cols}`;
+  return;
+ }
+ groupSpecError.value='';
+}
+/** 整组宽/高：20..500 mm。输入只写本地 ref，点「应用」才发请求。 */
+function setGroupWidthMm(raw:string){
+ const value=Math.round(Number(raw));
+ groupWidthMm.value=Number.isFinite(value)?Math.max(GROUP_MM_MIN,Math.min(GROUP_MM_MAX,value)):GROUP_MM_MIN;
+}
+function setGroupHeightMm(raw:string){
+ const value=Math.round(Number(raw));
+ groupHeightMm.value=Number.isFinite(value)?Math.max(GROUP_MM_MIN,Math.min(GROUP_MM_MAX,value)):GROUP_MM_MIN;
+}
+/** 间距只在多码组里存在（1×1 无白缝），固定 2 mm。 */
+const groupGapMm=computed(()=>((groupCols.value>1||groupRows.value>1)?2:null));
+const groupGapMmLabel=computed(()=>groupGapMm.value===null?'—':String(groupGapMm.value));
+/**
+ * 单码边长 = min(tileW,tileH)（tileW=(宽−(列−1)×2)/列，tileH=(高−(行−1)×2)/行），保留 0.1 mm。
+ * 1×1 时 tileW=宽，所以显示的就是整组宽。派生量，不另存。
+ */
+const groupTileMm=computed(()=>{
+ const cols=Math.max(1,groupCols.value),rows=Math.max(1,groupRows.value);
+ const widthMm=Math.max(GROUP_MM_MIN,groupWidthMm.value),heightMm=Math.max(GROUP_MM_MIN,groupHeightMm.value);
+ const tileW=(widthMm-(cols-1)*2)/cols;
+ const tileH=(heightMm-(rows-1)*2)/rows;
+ return Math.round(Math.min(tileW,tileH)*10)/10;
+});
+/** 改组规格：重建 members + 同步组中心 size，后端走新版本与全部安全门。 */
+async function applyGroupSpec(){
+ const g=selectedGroup.value;
+ if(!g||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能改组规格';return;}
+ const cols=Math.max(1,Math.min(GROUP_GRID_MAX,Math.round(groupCols.value)));
+ const rows=Math.max(1,Math.min(GROUP_GRID_MAX,Math.round(groupRows.value)));
+ const widthMm=Math.max(GROUP_MM_MIN,Math.min(GROUP_MM_MAX,Math.round(groupWidthMm.value)));
+ const heightMm=Math.max(GROUP_MM_MIN,Math.min(GROUP_MM_MAX,Math.round(groupHeightMm.value)));
+ await act(async()=>{
+  groupSpecBusy.value=true;
+  try{
+   const result=await api(`/maps/${field.value!.id}/groups/${g.id}/spec`,{
+    baseVersion:version.value,rows,cols,widthMm,heightMm,
+    ...(groupStartId.value===null?{}:{startId:groupStartId.value}),
+   });
+   selectMap(result);
+   await refresh();
+   inspectedTagId.value=result.centerId??inspectedTagId.value;
+   message.value=`${result.group?.id??g.id} 已改为 ${rows}×${cols} · ${widthMm}×${heightMm} mm，保存为 v${result.version}`;
+  }finally{groupSpecBusy.value=false;}
+ });
+}
+// ===== 批量改组规格：把选中的（或全部）定位组一次改成同一个 行×列 =====
+const batchGroupRows=ref(3),batchGroupCols=ref(3),batchGroupAll=ref(false),batchGroupBusy=ref(false);
+/** 框选里属于定位组中心的那些 tag → 对应的 group。 */
+const boxSelectedGroups=computed(()=>{
+ const groups=field.value?.groups??[];
+ if(!groups.length)return [];
+ const ids=new Set(boxSelectedIds.value);
+ return groups.filter(group=>ids.has(group.referenceId));
+});
+/** 批量动作的作用范围：勾了「全部」就是这张图的全部定位组，否则只作用于框选到的组。 */
+const batchGroupTargets=computed(()=>batchGroupAll.value?(field.value?.groups??[]):boxSelectedGroups.value);
+/** 选中单个定位组中心时，规格卡的「全部应用」也走这条路径（与单选规格同值）。 */
+async function applyGroupSpecBatch(scope:'selection'|'all'='selection',override?:{rows:number;cols:number;widthMm?:number;heightMm?:number}){
+ if(!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能改组规格';return;}
+ const rows=Math.max(1,Math.min(GROUP_GRID_MAX,Math.round(override?.rows??batchGroupRows.value)));
+ const cols=Math.max(1,Math.min(GROUP_GRID_MAX,Math.round(override?.cols??batchGroupCols.value)));
+ const all=scope==='all';
+ const targets=all?(field.value.groups??[]):boxSelectedGroups.value;
+ if(!targets.length){message.value=all?'这张地图还没有定位组':'框选里没有定位组中心：请选中整组中心的那个码';return;}
+ if(rows*cols>GROUP_CELL_MAX){message.value=`${rows}×${cols} 超过 ${GROUP_CELL_MAX} 个码上限`;return;}
+ batchGroupBusy.value=true;
+ await act(async()=>{
+  try{
+   const result=await api(`/maps/${field.value!.id}/groups/spec-batch`,{
+    baseVersion:version.value,rows,cols,
+    ...(override?.widthMm===undefined?{}:{widthMm:override.widthMm}),
+    ...(override?.heightMm===undefined?{}:{heightMm:override.heightMm}),
+    ...(all?{}:{groupIds:targets.map(group=>group.id)}),
+   });
+   selectMap(result);
+   await refresh();
+   message.value=`已把 ${result.changed??targets.length} 个定位组改为 ${rows}×${cols}`+(override?.widthMm?` · ${override.widthMm}×${override.heightMm} mm`:'')+`，保存为 v${result.version}`;
+  }finally{batchGroupBusy.value=false;}
+ });
+}
+/** 直接打印这台设备上的该组二维码 PDF（复用既有打印接口）。 */
+async function printGroupPdf(){
+ const g=selectedGroup.value;
+ if(!g)return;
+ try{
+  const blob=await fetch('/api/boards/pdf',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({gridSize:g.gridSize,groupSizeMm:g.sizeMm,groupCount:1,startId:g.referenceId,centerCrosshair:true})});
+  if(!blob.ok)throw new Error((await blob.json().catch(()=>({})))?.error??'打印失败');
+  const url=URL.createObjectURL(await blob.blob());
+  window.open(url,'_blank');
+  message.value=`已生成 ${g.id} 的 ${g.gridSize}×${g.gridSize} · ${g.sizeMm} mm 二维码 PDF`;
+ }catch(reason){
+  error.value=`打印失败：${reason instanceof Error?reason.message:String(reason)}`;
+ }
+}
+/** 浮窗改参：写入实例参数后立即重算并提交。 */
+async function updateInstance(patch:Partial<PaletteInstance>){
+ editInstance(patch);
+ await commitInstance();
+}
+async function deleteSelectedObject(){
+ const id=inspectedTagId.value;
+ if(id===null||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能删除点位';return;}
+ // 定位组中心不能单点删除：与批量删除同一套整组约束。
+ const target=field.value.tags.find(t=>t.id===id);
+ // 定位组是整组一致性约束：删中心会丢掉参考点，删成员会让 members 数量
+ // 与 gridSize² 不符（后端 mapSchema 直接拒绝）。两种都只能走整组下线流程。
+ if(target?.groupId){
+  const isCenter=(field.value.groups??[]).some(g=>g.referenceId===id);
+  message.value=isCenter
+   ? '该点是定位组中心，删除会破坏整组一致性；请用「点位表」或整组下线流程'
+   : `该点属于定位组 ${target.groupId}，删除会让整组成员不完整；请用「点位表」或整组下线流程`;
+  return;
+ }
+ await act(async()=>{
+  const result=await api(`/maps/${field.value!.id}/tags`,{ids:[id],baseVersion:version.value},'DELETE');
+  if(result?.map)selectMap(result);else selectMap(await api('/maps/'+field.value!.id));
+  const inst=paletteInstance.value;
+  if(inst){inst.ids=inst.ids.filter(x=>x!==id);if(!inst.ids.length)paletteInstance.value=null;}
+  inspectedTagId.value=null;
+  await refresh();
+  message.value=`已删除 Q${String(id).padStart(3,'0')} 并保存为 v${result.version}`;
+ });
+}
+async function deleteDraftObject(){
+ const target=draftObject.value;
+ if(!target||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能删除点位';return;}
+ await act(async()=>{
+  inspectorBusy.value=true;
+  try{
+   const result=await api(`/maps/${field.value!.id}/tags`,{ids:[target.id],baseVersion:version.value},'DELETE');
+   if(result?.map)selectMap(result);else selectMap(await api('/maps/'+field.value!.id));
+   inspectedTagId.value=null;
+   await refresh();
+   message.value=`已删除 Q${String(target.id).padStart(3,'0')} 并保存为 v${result.version}`;
+  }finally{inspectorBusy.value=false;}
+ });
+}
+const TAG_TOOL_LABELS:Record<DragToolKind,string>={single:'单个加码',grid:'阵列铺码',line:'直线铺码'};
+/** 落点是否在画布内：用画布容器的边界矩形判定，避免浮层/ghost 干扰命中。 */
+function pointOverCanvas(clientX:number,clientY:number):boolean{
+ const el=document.querySelector('[data-testid="map-canvas"]') as HTMLElement|null;
+ if(!el)return false;
+ const r=el.getBoundingClientRect();
+ return clientX>=r.left&&clientX<=r.right&&clientY>=r.top&&clientY<=r.bottom;
+}
+function beginToolDrag(kind:DragToolKind,event:PointerEvent){
+ // 只拦真正不能编辑的情况：上一次保存还没结束时也允许开始拖拽，
+ // 由 commitToolDrop/dropCreate 等写锁释放后再落库（否则连拖都拖不起来）。
+ if(robot.value.running||field.value?.routeMode!=='map-only')return;
+ if(event.button!==0&&event.pointerType==='mouse')return;
+ event.preventDefault();
+ toolDrag.value={kind,startX:event.clientX,startY:event.clientY,x:event.clientX,y:event.clientY,over:false};
+ toolDragMoved.value=false;
+ try{(event.currentTarget as HTMLElement|null)?.setPointerCapture?.(event.pointerId);}catch{/* capture is best-effort */}
+ const move=(e:PointerEvent)=>{
+  const current=toolDrag.value;if(!current)return;
+  if(Math.hypot(e.clientX-current.startX,e.clientY-current.startY)>4)toolDragMoved.value=true;
+  const over=pointOverCanvas(e.clientX,e.clientY);
+  // 首次进入画布的屏幕点：素材库拖入时 dragstart 在画布外，
+  // 直线铺码要用这个点当“画布内起点”，否则线的起点会落到画布外很远的地方。
+  const enterX=current.enterX??(over?e.clientX:undefined);
+  const enterY=current.enterY??(over?e.clientY:undefined);
+  // 落点世界坐标在拖动过程中就算好并保存：松手瞬间若布局微调让画布平移几像素，
+  // 用鼠标松开时的坐标再换算就会偏——这里锁定“用户看到指针压着的那个世界点”。
+  const world=over?(mapCanvasRef.value?.clientToWorld?.(e.clientX,e.clientY)??null):null;
+  toolDrag.value={...current,x:e.clientX,y:e.clientY,over,...(enterX===undefined?{}:{enterX,enterY}),
+   ...(world?{worldX:world.x,worldY:world.y}:{})};
+ };
+ const finish=(e:PointerEvent)=>{
+  window.removeEventListener('pointermove',move);
+  window.removeEventListener('pointerup',finish);
+  window.removeEventListener('pointercancel',finish);
+  window.removeEventListener('mouseup',finish as unknown as EventListener);
+  const current=toolDrag.value;
+  toolDrag.value=null;
+  if(!current)return;
+  const rect=(document.querySelector('[data-testid="map-canvas"]') as HTMLElement|null)?.getBoundingClientRect();
+  if(!pointOverCanvas(e.clientX,e.clientY))return;
+  commitToolDrop(current.kind,current.startX,current.startY,e.clientX,e.clientY,current.enterX,current.enterY,current.worldX,current.worldY);
+ };
+ window.addEventListener('pointermove',move,{passive:true});
+ window.addEventListener('pointerup',finish);
+ window.addEventListener('pointercancel',finish);
+ // 原生 HTML5 拖拽可能吞掉 pointerup：mouseup 作为兜底。
+ window.addEventListener('mouseup',finish as unknown as EventListener);
+}
+/** 松手：屏幕坐标 -> 地图米坐标，用共享创建函数直接生成这一批点并立即提交。 */
+function commitToolDrop(kind:DragToolKind,startX:number,startY:number,endX:number,endY:number,enterX?:number,enterY?:number,worldX?:number,worldY?:number){
+ const canvas=mapCanvasRef.value;
+ if(!canvas?.clientToWorld||!field.value)return;
+ // 优先用拖动过程中锁定的世界坐标（指针实际压着的位置）；只有没记录时才回退到松手点。
+ const to=(worldX!==undefined&&worldY!==undefined&&Number.isFinite(worldX)&&Number.isFinite(worldY))
+  ?{x:worldX,y:worldY}
+  :canvas.clientToWorld(endX,endY);
+ if(!to)return;
+ // 起点优先用「指针第一次进入画布」的位置；素材库里的按下点在画布外，
+ // 拿它换算出来的世界坐标会把直线铺码的起点丢到地图外面。
+ const from=(enterX!==undefined&&enterY!==undefined?canvas.clientToWorld(enterX,enterY):null)??canvas.clientToWorld(startX,startY)??to;
+ void dropCreate(kind,from,to);
+}
+const DROP_GRID={columns:4,rows:3,pitchX:0.2,pitchY:0.2};
+/**
+ * 落点即提交：单点/阵列/直线三种素材松手后立刻成为地图里的真实点位，
+ * 写入走 /api/maps 新版本（版本冲突、安全校验、运行中禁止写入均沿用）。
+ */
+async function dropCreate(kind:DragToolKind,from:{x:number;y:number},to:{x:number;y:number}){
+ if(!field.value)return;
+ if(robot.value.running){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ // 上一次拖入还在保存时，不能静默丢弃这一次（用户会觉得“第二个点拖不进去”）：
+ // 等写锁释放后再落库。
+ if(!(await waitForIdle())){message.value='上一个操作还在处理中，请稍候再拖入';return;}
+ const sizeM=0.06;
+ const angleDeg=0;
+ try{
+  let preview:any;
+  let inst:PaletteInstance;
+  if(kind==='single'){
+   preview=createTag(field.value,{x:to.x,y:to.y,angleDeg,sizeM});
+   inst={kind,ids:[],originX:to.x,originY:to.y,
+    columns:1,rows:1,pitchXM:DROP_GRID.pitchX,pitchYM:DROP_GRID.pitchY,
+    count:1,spacingM:0.2,axis:'horizontal',direction:1,angleDeg,sizeM};
+  }else if(kind==='grid'){
+   // 以指针落点为阵列中心：createTagGrid 的原点是左上（x+/y+ 展开）的单元格，
+   // 直接用落点当原点会让整片阵列看起来往右上偏。
+   const originX=to.x-(DROP_GRID.columns-1)*DROP_GRID.pitchX/2;
+   const originY=to.y-(DROP_GRID.rows-1)*DROP_GRID.pitchY/2;
+   preview=createTagGrid(field.value,{originX,originY,
+    columns:DROP_GRID.columns,rows:DROP_GRID.rows,
+    spacingXM:DROP_GRID.pitchX,spacingYM:DROP_GRID.pitchY,angleDeg,sizeM});
+   inst={kind,ids:[],originX,originY,
+    columns:DROP_GRID.columns,rows:DROP_GRID.rows,pitchXM:DROP_GRID.pitchX,pitchYM:DROP_GRID.pitchY,
+    count:DROP_GRID.columns*DROP_GRID.rows,spacingM:0.2,axis:'horizontal',direction:1,angleDeg,sizeM};
+  }else{
+   // 直线：拖出的向量同时决定轴向、方向与点数（间距固定 0.2 m）
+   const dx=to.x-from.x,dy=to.y-from.y;
+   const horizontal=Math.abs(dx)>=Math.abs(dy);
+   const span=horizontal?Math.abs(dx):Math.abs(dy);
+   const spacingM=0.2;
+   const count=Math.max(2,Math.min(20,Math.round(span/spacingM)+1));
+   const direction=(horizontal?dx:dy)>=0?1:-1;
+   preview=createTagLine(field.value,{startX:from.x,startY:from.y,count,spacingM,
+    axis:horizontal?'horizontal':'vertical',direction,angleDeg,sizeM});
+   inst={kind,ids:[],originX:from.x,originY:from.y,
+    columns:1,rows:1,pitchXM:DROP_GRID.pitchX,pitchYM:DROP_GRID.pitchY,
+    count,spacingM,axis:horizontal?'horizontal':'vertical',direction,angleDeg,sizeM};
+  }
+  if(!preview?.ready||!preview.map){
+   message.value=(preview?.reasons??[]).map((r:any)=>r.message).join('；')||'该位置无法生成点位';
+   return;
+  }
+  const before=new Set(field.value.tags.map(t=>t.id));
+  const created=preview.map.tags.filter((t:any)=>!before.has(t.id));
+  if(!created.length){message.value='该位置与已有点位重叠，未生成';return;}
+  inst.ids=created.map((t:any)=>t.id);
+  paletteInstance.value=inst;
+  inspectedTagId.value=created[0].id;
+  await commitPaletteMap(preview.map,`已拖入${TAG_TOOL_LABELS[kind]}（${created.length} 点）`);
+ }catch(reason){
+  error.value=`拖入失败：${reason instanceof Error?reason.message:String(reason)}`;
+ }
+}
+/** 单击仍可展开面板；但刚刚拖拽过就不当点击处理。 */
+/** Delete / Backspace 删除当前选中的画布对象（不误伤输入框）。 */
+function onObjectKeydown(event:KeyboardEvent){
+ if(event.key!=='Delete'&&event.key!=='Backspace')return;
+ const target=event.target as HTMLElement|null;
+ if(target&&(target.tagName==='INPUT'||target.tagName==='TEXTAREA'||target.tagName==='SELECT'||target.isContentEditable))return;
+ // 框选优先：Delete 删除整批选中的二维码。
+ if(boxSelectedIds.value.length){event.preventDefault();void batchDelete();return;}
+ if(inspectedTagId.value===null)return;
+ if(!field.value?.tags.some(t=>t.id===inspectedTagId.value))return;
+ event.preventDefault();
+ void deleteSelectedObject();
+}
+onMounted(()=>window.addEventListener('keydown',onObjectKeydown));
+onBeforeUnmount(()=>window.removeEventListener('keydown',onObjectKeydown));
+function onPaletteClick(kind:DragToolKind){
+ if(toolDragMoved.value){toolDragMoved.value=false;return;}
+ // 单击素材只提示拖放用法，不再展开左侧大编辑卡。
+ message.value=`把「${TAG_TOOL_LABELS[kind]}」按住拖到地图上松手，会立即生成并保存`;
+}
+/** 当前草稿面板是否就绪（拖入后需要它算出精确点位再提交）。 */
+function createPanelApi(){
+ return tagCreatePanel.value as unknown as {
+  placeAt?:(m:DragToolKind,p:{x:number;y:number},o?:{x:number;y:number})=>void;
+  placeLine?:(a:{x:number;y:number},b:{x:number;y:number})=>void;
+  draftMap?:{value?:FieldMap|null}|FieldMap|null;
+  draftTags?:{value?:{id:number;x:number;y:number;angle:number;size:number}[]}|{id:number;x:number;y:number;angle:number;size:number}[];
+ }|null;
+}
+function unwrap<T>(value:{value?:T}|T|undefined):T|undefined{
+ return value&&typeof value==='object'&&'value' in (value as object)?(value as {value?:T}).value:(value as T|undefined);
+}
+/** 拖入/移动/调参/删除后统一提交：走 /api/maps 新版本，保留冲突与安全校验。 */
+async function commitDraftMap(draft:FieldMap|null|undefined,note:string){
+ if(!draft||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ await act(async()=>{
+  const result=await api('/maps',{map:draft,baseVersion:version.value});
+  selectMap(result);
+  selectedMapId.value=result.map?.id??field.value!.id;
+  await refresh();
+  message.value=`${note} · 已保存为地图 v${result.version}`;
+ });
+}
+
 function openMapTool(tool:'position'|'single'|'grid'|'line'|'table'|'spacing'){
  if(mapTool.value===tool){mapTool.value=null;return;}
  mapTool.value=tool;
@@ -1547,7 +2671,10 @@ async function saveRoute(saveAs=false){await act(async()=>{
  for(let i=1;i<orthogonalPoints.length;i++){const a=orthogonalPoints[i-1]!,b=orthogonalPoints[i]!;
   if(Math.abs(a.x-b.x)>1e-6&&Math.abs(a.y-b.y)>1e-6)throw new Error('路径必须由水平/垂直直线段组成；斜线段请先在画布上正交拆分（拖动路点会自动正交）');
  }
- const skippedCount=routeSkipped.value.length;const initialHeadingDeg=wrapDeg180(bodyYawDeg.value);const payload:any={mapId:field.value.id,baseVersion:version.value,points:orthogonalPoints,bodyYawDeg:initialHeadingDeg,initialHeadingRad:initialHeadingManual.value?initialHeadingDeg*Math.PI/180:null,routeName:routeNameDraft.value.trim()||uniqueRouteName(field.value.name+'新路径'),segmentModes:routePlans.value.filter(plan=>plan.mode!=='auto').map(({fromId,toId,occurrence,mode})=>({fromId,toId,occurrence,mode})),distanceModel:'center-euclidean',spacingOverrides:spacingOverrides.value};if(routeEditId.value){payload.routeId=routeEditId.value;payload.routeUpdated=routeEditUpdated.value;}if(saveAs||!routeEditId.value)payload.saveAs=true;
+ const skippedCount=routeSkipped.value.length;const initialHeadingDeg=wrapDeg180(bodyYawDeg.value);const baseName=routeNameDraft.value.trim()||uniqueRouteName(field.value.name+'新路径');
+ // 摘要卡里的名称输入已移除：另存为时自动派生一个唯一名称，避免与已有路径同名被后端拒绝。
+ const saveName=saveAs?uniqueRouteName(baseName+' 副本'):baseName;routeNameDraft.value=saveName;
+ const payload:any={mapId:field.value.id,baseVersion:version.value,points:orthogonalPoints,bodyYawDeg:initialHeadingDeg,initialHeadingRad:initialHeadingManual.value?initialHeadingDeg*Math.PI/180:null,routeName:saveName,segmentModes:routePlans.value.filter(plan=>plan.mode!=='auto').map(({fromId,toId,occurrence,mode})=>({fromId,toId,occurrence,mode})),distanceModel:'center-euclidean',spacingOverrides:spacingOverrides.value};if(routeEditId.value){payload.routeId=routeEditId.value;payload.routeUpdated=routeEditUpdated.value;}if(saveAs||!routeEditId.value)payload.saveAs=true;
  const result=await api('/route/design',payload);selectMap(result);await refresh();selectedRouteId.value=result.route?.routeId??'';selectedTask.value=result.task?.id??selectedTask.value;selectedMapId.value=field.value.id;
  if(result.route){routeEditId.value=result.route.routeId;routeEditUpdated.value=result.route.updated;routeNameDraft.value=result.route.name;routeModes.value=result.route.motionSegments?choicesFromSegments(result.route.motionSegments):[];}
  editingRoute.value=false;
@@ -1562,7 +2689,7 @@ watch(()=>field.value?.id,id=>{void loadTagAliases(id??'');},{immediate:true});
 // 切换地图 → 清理旧草稿，但**留在统一工作区**：新建空图后正是要继续铺码，
 // 若把 editingRoute 置 false，刚新建完的地图就被弹出编辑器（实测工具条/面板消失）。
 // 真正的退出只由「退出」按钮、主导航其它页、打印入口负责。
-watch(()=>field.value?.id,()=>{routeSelected.value=-1;routeStepsOpen.value=false;inspectedTagId.value=null;tagInspectorVisible.value=false;orthogonalPreviewMap.value=null;mapDraftSource.value=null;tagPositionEditing.value=false;spacingSelectedIds.value=[];routeAnchors.value=[];routeEditId.value='';routeEditUpdated.value='';routeHistory.value=[];});
+watch(()=>field.value?.id,()=>{boxSelectedIds.value=[];routeOpenDialog.value=false;routeOpenConfirm.value=null;routeSelected.value=-1;routeStepsOpen.value=false;inspectedTagId.value=null;tagInspectorVisible.value=false;orthogonalPreviewMap.value=null;mapDraftSource.value=null;tagPositionEditing.value=false;spacingSelectedIds.value=[];routeAnchors.value=[];routeEditId.value='';routeEditUpdated.value='';routeHistory.value=[];});
 // 退出路径编辑时必须一并退出间距调整，否则面板与锁会残留到下一次进入。
 // 退出统一编辑工作区 → 回到导航消费场景：按既有路径补一次 scope 同步，
 // 保证编辑期间选的图在回到导航页后仍会切定位（与原行为一致，不新增/绕过门禁）。
@@ -1823,6 +2950,62 @@ function selectStep(index:number){
  const plan=planArrivingAt(index);
  selectedSegmentKey.value=plan?.key??'';
 }
+/** 单点删除确认：文案绑定当前选中的点/二维码编号，取消不改动草稿。 */
+const routePointConfirm=ref<number|null>(null);
+const routePointLabel=computed(()=>{
+ const i=routePointConfirm.value;
+ if(i===null||i<0||i>=stepRows.value.length)return '';
+ const qr=stepRows.value[i]!.qrLabel;
+ return qr&&qr!=='—'?qr:`第 ${i+1} 点`;
+});
+function openPointConfirm(){if(routeLocked.value||routeSelected.value<0)return;routePointConfirm.value=routeSelected.value;}
+function confirmDeletePoint(){const i=routePointConfirm.value;routePointConfirm.value=null;if(i===null||i<0)return;deleteStep(i);message.value=`已删除第 ${i+1} 点（可用撤销恢复）`;}
+/** 码组规格：整组打印布局（网格 N×N · 板宽 mm）只读展示；独立码支持改 size。 */
+const tagSpecPresets=[30,40,50,60,80];
+const tagSpecBusy=ref(false);
+const selectedTagSpec=computed(()=>{
+ const id=routeSelectedObject.value?.tagId;
+ if(id==null||!field.value)return null;
+ const tag=field.value.tags.find(item=>item.id===id);
+ if(!tag)return null;
+ const group=(field.value.groups??[]).find(item=>item.referenceId===id);
+ return {tagId:id,groupId:tag.groupId,isGroup:!!group,gridSize:group?.gridSize??null,
+  sizeMm:group?group.sizeMm:Math.round(tag.size*1000),gapMm:group?.gapMm??null,sizeM:tag.size};
+});
+// 独立码规格：当前选中点的边长（mm），改完立即按单点 size 契约保存。
+const tagSpecMm=ref(60);
+watch(()=>draftObject.value?.sizeM,(v)=>{if(typeof v==='number')tagSpecMm.value=Math.round(v*1000);},{immediate:true});
+async function applyDraftTagSize(){
+ const id=inspectedTagId.value;
+ if(id===null||!field.value)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能写入地图';return;}
+ await act(async()=>{
+  tagSpecBusy.value=true;
+  try{
+   const result=await api(`/maps/${field.value!.id}/tags/update`,{baseVersion:version.value,edits:[{id,size:tagSpecMm.value/1000}]});
+   if(result?.map)selectMap(result);else selectMap(await api('/maps/'+field.value!.id));
+   await refresh();
+   message.value=`Q${String(id).padStart(3,'0')} 规格已改为 ${tagSpecMm.value} mm`;
+  }finally{tagSpecBusy.value=false;}
+ });
+}
+async function applyTagSpec(mm:number){
+ const spec=selectedTagSpec.value;
+ if(!field.value||!spec)return;
+ if(spec.isGroup){message.value='码组规格属于整组打印布局，请在铺码流程中整体调整，此处不单独改组尺寸';return;}
+ if(mm===spec.sizeMm)return;
+ if(routeLocked.value){message.value='机器人运行中或存在未完成指令：暂不能修改二维码规格';return;}
+ await act(async()=>{
+  tagSpecBusy.value=true;
+  try{
+   const result=await api('/maps/'+field.value!.id+'/tags/update',{baseVersion:version.value,edits:[{id:spec.tagId,size:mm/1000}]});
+   if(result&&result.map&&Number.isFinite(result.version)){selectMap(result);selectedMapId.value=result.map.id;}
+   else{selectMap(await api('/maps/'+field.value!.id));}
+   await refresh();
+   message.value=`Q${String(spec.tagId).padStart(3,'0')} 码规格已保存为新版本 v${result.version}`;
+  }finally{tagSpecBusy.value=false;}
+ });
+}
 function deleteStep(index:number){
  if(routeLocked.value||index<0||index>=routeAnchors.value.length)return;
  rememberRoute();
@@ -1870,6 +3053,9 @@ useShortcuts({
  onRedo:()=>{if(editingRoute.value)redoEdit();},
  onDelete:()=>{if(editingRoute.value&&routeSelected.value>=0)deleteRoute();},
  onEscape:()=>{
+  if(routePointConfirm.value!==null){routePointConfirm.value=null;return;}
+  if(routeOpenConfirm.value){routeOpenConfirm.value=null;return;}
+  if(routeOpenDialog.value){routeOpenDialog.value=false;return;}
   if(gapEdit.value){cancelGapEdit();return;}
   if(measuring.value){measuring.value=false;clearMeasurement();return;}
   if(editorSession.selection.value.length){editorSession.clearSelection();return;}
@@ -2033,7 +3219,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
  <div :class="['app-shell',{'is-route-editing':editingRoute,'is-sidebar-collapsed':sidebarCollapsed}]">
   <aside class="sidebar"><div class="brand"><span class="brand-icon" aria-hidden="true"><i/><i/><i/><i/></span><div><strong>QR 导航控制台</strong></div></div><button type="button" class="sidebar-toggle" data-testid="sidebar-toggle" :aria-label="sidebarCollapsed?'展开左侧导航':'收起左侧导航'" :aria-expanded="!sidebarCollapsed" @click="sidebarCollapsed=!sidebarCollapsed">{{sidebarCollapsed?'»':'«'}}</button>
    <nav aria-label="主导航"><span class="nav-group-label">作业</span><button :class="['nav-item',{active:page==='scan'}]" :aria-current="page==='scan'?'page':undefined" title="扫描建图" @click="editingRoute=false;page='scan'"><ScanLine :size="19"/>扫描建图</button><button :class="['nav-item',{active:page==='navigate'&&!editingRoute}]" :aria-current="page==='navigate'&&!editingRoute?'page':undefined" title="开始导航" @click="editingRoute=false;page='navigate'"><Navigation :size="19"/>开始导航</button><button :class="['nav-item',{active:editingRoute}]" :aria-current="editingRoute?'page':undefined" title="路径编辑" data-testid="nav-route-edit" @click="enterRouteEditing"><PenLine :size="19"/>路径编辑</button><span class="nav-group-label">标定</span><button :class="['nav-item',{active:page==='calibration'}]" :aria-current="page==='calibration'?'page':undefined" title="融合标定" data-testid="nav-calibration" @click="editingRoute=false;page='calibration'"><Crosshair :size="19"/>融合标定</button><span class="nav-group-label">资源</span><button :class="['nav-item',{active:page==='print'}]" :aria-current="page==='print'?'page':undefined" title="二维码 PDF" @click="editingRoute=false;page='print'"><FileText :size="19"/>二维码 PDF</button></nav>
-   
+
   </aside>
   <main class="workspace">
    <!-- 编辑工作区已有自己的上下文（菜单条 context + 左栏地图组），这里不再重复大标题与「路径编辑中」标签，把纵向空间留给画布。 -->
@@ -2051,7 +3237,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
    <KeepAlive>
     <CalibrationWorkspace v-if="page==='calibration'" :maps="maps"/>
    </KeepAlive>
-   
+
    <PdfGenerator v-if="page==='print'" @generated="generated"/>
    <div v-else-if="page!=='calibration'" class="editor-body">
     <!-- drawio 式编辑器外壳：左=工具/参数，中=画布，下=步骤，右=属性。
@@ -2059,10 +3245,10 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
          布局由 usePanelLayout 持久化，刷新后自动恢复。 -->
     <EditorShell
       ref="editorShell"
-      storage-key="qrautorun.editor.layout.v1"
+      storage-key="qrautorun.editor.layout.v2"
       :show-left="editingRoute || page==='scan' || page==='navigate'"
       :show-right="!editingRoute"
-      :inspector-open="editingRoute&&routeInspectorOpen&&!!routeSelectedObject"
+             :show-inspector="false"
       :show-menubar="editingRoute"
       :show-palette="false"
       :show-bottom="editingRoute"
@@ -2084,7 +3270,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
       <RouteToolsPanel
        v-if="editingRoute"
        :tool="routeTool"
-       :locked="routeLocked"
+       :locked="routeLocked" :readonly="routeReadonly"
        :anchor-count="routeAnchors.length"
        :length-m="routeLength"
        :visited-count="routeGroupIds.length"
@@ -2120,23 +3306,14 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
              统一工作区内必须能从左侧直接开新路径（否则没有路线的地图无从开始）。 -->
         <div class="route-panel-actions" data-testid="route-panel-path-actions">
          <Button size="sm" variant="outline" data-testid="unified-new-route" :disabled="routeLocked" @click="beginNewRoute">＋ 新建路径</Button>
-         <Button v-if="availableRoutes.length" size="sm" variant="ghost" data-testid="unified-pick-route" :disabled="routeLocked" @click="beginRoute">编辑已选路径</Button>
+         <Button v-if="field?.id" size="sm" variant="ghost" data-testid="unified-pick-route" @click="openRouteDialog">编辑已选路径</Button>
         </div>
         <div class="route-panel-params" data-testid="route-panel-params">
-         <div class="route-param-row"><span>路点 / 长度</span><b class="route-metric" data-testid="route-anchors-length">{{routeAnchors.length}} 点 · {{routeLength.toFixed(2)}} m</b></div>
-         <div class="route-param-row"><span>经过 / 跳过</span><span class="badge route-group-badge" data-testid="route-group-badge" title="每到下一定位码纠正一次">经过 {{routeGroupIds.length}} · 跳过 {{routeSkipped.length}}</span></div>
-         <div class="route-param-row"><span>路径名称</span><span class="route-name-field route-name-auto" data-testid="route-name-field" :title="routeNameDraft">{{routeNameDraft||'保存时自动命名'}}</span></div>
          <div class="route-heading-panel" data-testid="route-initial-heading">
-          <div class="route-heading-summary"><strong>初始车头朝向</strong><b>{{bodyYawDeg.toFixed(1)}}°</b><span :class="['route-heading-tag',initialHeadingManual?'is-manual':'is-auto']">{{initialHeadingManual?'手动':'默认'}}</span></div>
-          <div class="route-heading-controls">
-           <Button size="sm" variant="outline" :disabled="routeLocked" aria-label="初始朝向减15度" @click="nudgeInitialHeading(-15)">−15°</Button>
-           <input class="route-heading-input" type="number" min="0" max="359" step="15" :value="bodyYawDeg" :disabled="routeLocked" aria-label="路径初始车头朝向（0-359度）" @input="setInitialHeading(($event.target as HTMLInputElement).valueAsNumber)"/>
-           <Button size="sm" variant="outline" :disabled="routeLocked" aria-label="初始朝向加15度" @click="nudgeInitialHeading(15)">+15°</Button>
-          </div>
-          <div class="route-heading-actions">
-           <Button size="sm" variant="ghost" data-testid="adopt-first-leg-heading" :disabled="routeLocked||routeAnchors.length<2" @click="adoptFirstLegHeading">用首段方向</Button>
-           <Button size="sm" variant="ghost" data-testid="reset-initial-heading" :disabled="routeLocked" @click="resetInitialHeading">恢复默认</Button>
-          </div>
+          <strong>初始车头朝向</strong>
+          <b data-testid="route-heading-value">{{bodyYawDeg.toFixed(1)}}°</b>
+          <span :class="['route-heading-tag',initialHeadingManual?'is-manual':'is-auto']">{{initialHeadingManual?'手动':'默认'}}</span>
+          <input class="route-heading-input" type="number" min="0" max="359" step="1" :value="bodyYawDeg" :disabled="routeLocked" aria-label="路径初始车头朝向（0-359度）" data-testid="route-heading-input" @input="setInitialHeading(($event.target as HTMLInputElement).valueAsNumber)"/>
          </div>
          <div v-if="routeSkipped.length" class="route-skipped-groups" data-testid="route-skipped-groups" role="status"><p v-for="tag in routeSkipped" :key="tag.id">Q{{String(tag.id).padStart(3,'0')}} · 偏离路线 {{(tag.distanceM*100).toFixed(1)}} cm，未串联：建议把路线画过此码或调整铺码</p></div>
         </div>
@@ -2145,32 +3322,49 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
             每个按键直接调用面板自身已暴露的 start/activate（与面板内「开始」同一条路径），
             不再要求「先点按钮再点开始」两次。 -->
        <template #group-tags>
-        <div v-if="field?.routeMode==='map-only'" class="route-tool-compact" data-testid="map-tool-compact" role="group" aria-label="点位与铺码">
-         <Button size="sm" variant="outline" data-testid="map-tool-position" :disabled="busy||robot.running"
-                 title="在画布上拖动二维码调整位置" aria-label="调整点位"
-                 @click="openMapTool('position')">调整点位</Button>
-         <Button size="sm" variant="outline" data-testid="map-tool-single" :disabled="busy||robot.running"
-                 title="在指定坐标新增一个二维码" aria-label="单个加码"
-                 @click="openMapTool('single')">单个加码</Button>
-         <Button size="sm" variant="outline" data-testid="map-tool-grid" :disabled="busy||robot.running"
-                 title="按行列矩形阵列整片铺码" aria-label="阵列铺码"
-                 @click="openMapTool('grid')">阵列铺码</Button>
-         <Button size="sm" variant="outline" data-testid="map-tool-line" :disabled="busy||robot.running"
-                 title="沿直线等距铺一排二维码" aria-label="直线铺码"
-                 @click="openMapTool('line')">直线铺码</Button>
-         <Button size="sm" variant="outline" data-testid="map-tool-table" :disabled="busy||robot.running"
-                 title="逐行改编号、坐标、朝向或删除" aria-label="点位表"
-                 @click="openMapTool('table')">点位表</Button>
-         <Button size="sm" variant="outline" data-testid="map-tool-spacing" :disabled="busy||robot.running"
-                 title="多选二维码后统一调整间距" aria-label="调整间距"
-                 @click="openMapTool('spacing')">调整间距</Button>
+        <div v-if="field?.routeMode==='map-only'" class="tag-palette" data-testid="palette-library" role="group" aria-label="点位与编码素材库">
+         <div class="tag-palette__group">
+          <span class="tag-palette__title">拖到画布生成</span>
+          <div class="tag-palette__grid">
+           <div class="palette-item" @dragstart.prevent data-testid="palette-single" role="button" tabindex="0" draggable="false"
+                :class="{'is-disabled':busy||robot.running}"
+                title="按住拖到地图上松手，立即在落点生成一个二维码"
+                aria-label="单个加码，拖到画布生成"
+                @pointerdown="beginToolDrag('single',$event)"
+                @click="onPaletteClick('single')">
+            <span class="palette-item__icon" aria-hidden="true"><i class="pi-dot"/></span>
+            <span class="palette-item__label">单个加码</span>
+           </div>
+           <div class="palette-item" @dragstart.prevent data-testid="palette-array" role="button" tabindex="0" draggable="false"
+                :class="{'is-disabled':busy||robot.running}"
+                title="按住拖到地图上松手，立即按当前行列参数铺一片阵列"
+                aria-label="阵列编码，拖到画布生成"
+                @pointerdown="beginToolDrag('grid',$event)"
+                @click="onPaletteClick('grid')">
+            <span class="palette-item__icon" aria-hidden="true"><i class="pi-grid"/></span>
+            <span class="palette-item__label">阵列编码</span>
+           </div>
+           <div class="palette-item" @dragstart.prevent data-testid="palette-line" role="button" tabindex="0" draggable="false"
+                :class="{'is-disabled':busy||robot.running}"
+                title="按住拖进地图并拖出方向，松手立即铺一排"
+                aria-label="直线编码，拖到画布生成"
+                @pointerdown="beginToolDrag('line',$event)"
+                @click="onPaletteClick('line')">
+            <span class="palette-item__icon" aria-hidden="true"><i class="pi-line"/></span>
+            <span class="palette-item__label">直线编码</span>
+           </div>
+           </div>
+          </div>
+
         </div>
 
         <!-- 调整点位（含进入编辑态的两种来源，沿用原契约） -->
         <div v-if="field?.routeMode==='map-only'&&mapTool==='position'&&!tagPositionEditing" class="route-tool-card route-tag-position-card"><MapTagPositionPanel ref="tagPositionPanel" :map="field" :version="version" :selected-tag-id="inspectedTagId" :disabled="busy||robot.running||(orthogonalPreviewActive&&mapDraftSource!=='tag-position')" @preview-map="setTagPositionPreview" @editing="onTagPositionEditing" @update:selected-tag-id="inspectedTagId=$event" @applied="onTagPositionApplied"/></div>
         <div v-else-if="field?.routeMode==='map-only'&&mapTool==='position'&&tagPositionEditing&&mapDraftSource!=='tag-position'" class="route-tool-card route-tag-position-card"><MapTagPositionPanel ref="tagPositionPanel" :map="field" :version="version" :selected-tag-id="inspectedTagId" :disabled="false" @preview-map="setTagPositionPreview" @editing="onTagPositionEditing" @update:selected-tag-id="inspectedTagId=$event" @applied="onTagPositionApplied"/></div>
 
-        <div v-if="field?.routeMode==='map-only'&&mapTool&&['single','grid','line'].includes(mapTool)" class="route-tool-card route-tag-create-card"><MapTagCreatePanel v-if="field" ref="tagCreatePanel" :map="field" :version="version" :disabled="busy||robot.running" @preview-map="onTagCreatePreview" @editing="onTagCreateEditing" @applied="onTagCreateApplied"/></div>
+        <!-- 创建面板不再在左侧展开：palette 拖入即提交，参数在画布对象浮窗里调。
+             仍挂载一个隐藏的实例，只作为拖放落点计算与草稿构造的引擎，不渲染任何 UI。 -->
+        <MapTagCreatePanel v-if="field" ref="tagCreatePanel" class="tag-create-engine" :map="field" :version="version" :disabled="busy||robot.running" :selected-tag-id="inspectedTagId" @update:selected-tag-id="inspectedTagId=$event" @preview-map="onTagCreatePreview" @draft-map="onTagCreateDraft" @editing="onTagCreateEditing" @applied="onTagCreateApplied"/>
 
         <div v-if="field?.routeMode==='map-only'&&mapTool==='table'" class="route-tool-card route-tag-table-card"><MapTagTablePanel v-if="field" ref="tagTablePanel" :map="field" :version="version" :disabled="busy||robot.running" :aliases="tagAliases" @preview-map="setTagTablePreview" @editing="onTagTableEditing" @applied="onTagPositionApplied" @save-aliases="onSaveTagAliases"/></div>
 
@@ -2211,11 +3405,10 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
          <MapDeleteConfirm :info="mapDeletion" :busy="busy" @confirm="confirmDeleteMap" @cancel="mapDeletion=null"/>
         </template>
         <p v-else class="scan-map-maintenance-hint">{{!session?'先在上方「已保存扫描」中选择一条记录。':session.state==='collecting'?'该扫描正在采集，停止后才能重建或校正地图。':'该扫描尚未保存地图；点击「完成扫描并保存地图」后此处会出现重建与校正入口。'}}</p>
-     
+
        </details>
       </section>
       <section v-else-if="page==='navigate'&&!editingRoute" class="left-panel navigation-panel"><div class="navigation-settings"><div class="panel-title"><Navigation :size="18"/>导航控制</div><label>导航地图<select v-model="selectedMapId" :disabled="busy||robot.running||editingRoute" data-testid="map-select" @change="chooseMap"><option value="">选择扫描地图</option><option v-for="mapOption in availableMaps" :key="mapOption.id" :value="mapOption.id">{{mapOption.name}}</option></select></label>
-       <div class="navigation-map-list" data-testid="map-list" aria-label="当前地图列表"><div class="navigation-map-head">当前地图 · {{availableMaps.length}}</div><div v-if="!availableMaps.length" class="navigation-map-empty">暂无地图</div><button v-for="mapOption in availableMaps" :key="mapOption.id" type="button" data-testid="map-list-item" :class="['navigation-map-item',{active:mapOption.id===selectedMapId}]" :disabled="busy||robot.running" @click="selectedMapId=mapOption.id;chooseMap()"><strong>{{mapOption.name}}</strong><span>v{{mapOption.version}} · {{routes.filter(route=>route.mapId===mapOption.id).length}}条路径</span></button></div>
        <Button class="w-full" variant="outline" data-testid="nav-open-map-editor" :disabled="busy||robot.running||editingRoute" @click="openUnifiedEditor">✎ 手动建图与路径编辑</Button>
        <label>执行路径<select v-model="selectedRouteId" :disabled="busy||robot.running||editingRoute" data-testid="route-select" @change="chooseRoute"><option value="">选择路径</option><option v-for="route in availableRoutes" :key="route.routeId" :value="route.routeId">{{route.name}}</option></select></label>
        <div v-if="availableRoutes.length" class="route-manage-list" data-testid="route-manage-list">
@@ -2231,16 +3424,16 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
        <fieldset class="navigation-speeds" :disabled="busy||robot.running||!selectedTask||commandFeedback?.state==='waiting'">
         <legend>目标速度 · 厘米/秒</legend>
         <div class="speed-grid"><label v-for="item in speedFields" :key="item.key" :for="'navigation-speed-'+item.key">{{item.label}}<input :id="'navigation-speed-'+item.key" v-model.number="speedSettings[item.key]" type="number" min="2" :max="item.max" step="1" :aria-label="item.label+'速度（厘米/秒）'"/></label></div>
-      
+
         <Button class="w-full mt-2" variant="outline" :disabled="busy||robot.running||!selectedTask||!speedDirty||commandFeedback?.state==='waiting'" @click="saveSpeeds">{{speedDirty?'保存速度':'速度已保存'}}</Button>
-      
+
        </fieldset>
        <Button class="w-full mt-3" :variant="returnToStart?'default':'outline'" :aria-pressed="returnToStart" :disabled="busy||robot.running||!selectedTask||commandFeedback?.state==='waiting'" data-testid="return-to-start-toggle" @click="toggleReturnToStart">完成后原路倒车：{{returnToStart?'开启':'关闭'}}</Button>
-     
-     
+
+
        <details v-if="field&&unifyAnglesInfo" class="scan-details" data-testid="unify-angles"><summary><Ruler :size="18"/>统一所有码朝向</summary><div class="unify-angle-list"><div v-for="a in unifyAnglesInfo.list" :key="a.id" class="unify-angle-row"><span>Q{{String(a.id).padStart(3,'0')}}</span><span>{{a.angleDeg.toFixed(2)}}°</span><span class="muted">→ {{unifyAnglesInfo.targetDeg.toFixed(2)}}°</span></div></div><Button class="w-full mt-2" :disabled="busy||unifyAnglesInfo.spreadDeg<0.5" @click="unifyAngles">统一朝向并保存新版本</Button></details>
        <div v-if="field?.routeMode==='map-only'" class="map-rebuild-actions"><Button class="w-full" variant="outline" data-testid="rebuild-map-from-survey" :disabled="busy||robot.running||!selectedMapSurvey||orthogonalPreviewActive||tagPositionEditing" @click="rebuildSelectedMap">从原始扫描重建新版本</Button></div><OrthogonalCorrectionPanel v-if="field?.routeMode==='map-only'" :map="field" :version="version" :disabled="busy||robot.running||tagPositionEditing||(orthogonalPreviewActive&&mapDraftSource!=='orthogonal')" @preview-map="setOrthogonalPreview" @applied="onOrthogonalApplied"/>
-     
+
        </div><div class="navigation-actions"><Button class="w-full mt-3" :disabled="busy||commandFeedback?.state==='waiting'||!canNavigate" @click="navigation('start')"><Play :size="20"/>开始导航</Button><div class="export-grid mt-2"><Button variant="outline" :disabled="!robot.running" @click="navigation(robot.paused?'resume':'pause')"><Pause :size="18"/>{{robot.paused?'继续':'暂停'}}</Button><Button variant="destructive" @click="navigation('stop')"><Square :size="18"/>停止</Button></div></div>
       </section>
      </template>
@@ -2257,13 +3450,30 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
         :can-save="!routeLocked&&routeDrawing.length>=2"
         :can-exit="!routeLocked"
         :saving="busy"
-        :locked="routeLocked"
+        :locked="routeLocked" :readonly="routeReadonly"
         :show-properties="true"
         :properties-active="routeInspectorOpen"
         :disabled="routeToolbarDisabled"
         @tool="onToolbarTool"
         @action="onToolbarAction"
-       />
+       >
+       <template #extra>
+        <details v-if="field?.groups?.length" class="re-tb__more re-tb__group-spec" data-testid="toolbar-group-spec">
+         <summary class="re-tb__more-summary" data-testid="toolbar-group-spec-toggle" aria-label="批量改定位组行列" title="把这张图的定位组批量改成 行×列">
+          <Layers :size="16" />
+          <span class="re-tb__label">定位组 {{batchGroupCols}}×{{batchGroupRows}}</span>
+         </summary>
+         <div class="re-tb__menu re-tb__spec-menu" role="menu" aria-label="定位组批量改规格">
+          <div class="re-tb__spec-row">
+           <label>列数<select :value="String(batchGroupCols)" :disabled="batchGroupBusy||routeLocked" data-testid="toolbar-group-cols" @change="batchGroupCols=Math.max(1,Math.min(6,Math.round(Number(($event.target as HTMLSelectElement).value)||1)))"><option v-for="n in 6" :key="'tc'+n" :value="String(n)">{{n}}</option></select></label>
+           <label>行数<select :value="String(batchGroupRows)" :disabled="batchGroupBusy||routeLocked" data-testid="toolbar-group-rows" @change="batchGroupRows=Math.max(1,Math.min(6,Math.round(Number(($event.target as HTMLSelectElement).value)||1)))"><option v-for="n in 6" :key="'tr'+n" :value="String(n)">{{n}}</option></select></label>
+          </div>
+          <label class="re-tb__spec-all"><input type="checkbox" :checked="batchGroupAll" data-testid="toolbar-group-all" @change="batchGroupAll=($event.target as HTMLInputElement).checked"/>全部 {{field?.groups?.length??0}} 个定位组</label>
+          <button type="button" class="re-tb__spec-apply" :disabled="batchGroupBusy||!batchGroupTargets.length||routeLocked" data-testid="toolbar-group-apply" @click="applyGroupSpecBatch(batchGroupAll?'all':'selection')">批量改为 {{batchGroupCols}}×{{batchGroupRows}}（{{batchGroupTargets.length}} 组）</button>
+         </div>
+        </details>
+       </template>
+       </RouteEditorToolbar>
        <!-- 模式状态行：工具条下方的轻量提示条（原来在左栏大卡里，删卡时一并丢了）。
             保留既有 testid 与语义，供真实回归断言「当前工具 / 拖动行为 / 被拒原因」。 -->
        <div class="route-tool-hint route-tool-hint--bar" role="status" data-testid="route-tool-hint">
@@ -2317,9 +3527,135 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
         <div class="distance-result" data-testid="center-distance-result" role="status"><strong v-if="centerDistance!==null">中心距离 {{centerDistance.toFixed(3)}} m <span>（{{(centerDistance*100).toFixed(1)}} cm）</span></strong><span v-else>{{measureFrom!==''&&measureTo===measureFrom?'请选择两个不同的定位组':measureFrom!==''?'请点击第二个定位组，或选择测距终点':'点击地图上的两个定位组，或选择起点和终点'}}</span><small class="distance-disclaimer" data-testid="center-distance-disclaimer">两块二维码板中心的平面直线距离 · 地图计算值{{mapApproval?.accepted?'，已按用户确认接纳':map&&(map.coordinateStatus!=='reviewed'||map.captureQuality==='draft')?'，尚未实测验收':''}}</small></div>
        </div>
        <CameraPreview v-if="page==='scan'&&scanView==='camera'" compact/>
-       <MapCanvas v-else-if="canvasMap" :map="canvasMap" :selected="mapSelected" :measurement="mapMeasurement" row-id="" :tool="measuring?'measure':tagPositionEditing?'select':editingRoute?(routeTool==='pan'?'pan':routeTool==='connect'?'connect':'route-design'):'pan'" @select="mapCanvasSelect" @inspect="inspectTag" @tag-detail="openTagDetail" :segment-plans="editingRoute?routePlans:undefined" :selected-segment="selectedSegmentKey" @segment-select="selectSegment" :editable="tagPositionEditing||tagTableEditing?true:(editingRoute?(editingRoute&&!routeLocked&&routeTool!=='pan'):false)" :drawing="mapDrawing" :pan-enabled="editingRoute?(routeTool==='pan'):true" :spacing-mode="tagPositionEditing||tagTableEditing" :tag-editing="tagPositionEditing||tagTableEditing" :pan-mode="editingRoute||tagPositionEditing||tagTableEditing?(canvasPansOnDrag?'pan':'select'):undefined" :mode-label="editorModeLabel" :tag-aliases="tagAliasByTagId" :spacing-line="spacingSelectedIds" :spacing-gaps="spacingCanvasGaps" :ghost-tags="tagCreateGhost" :route-group-ids="routeGroupIds" :route-skipped-groups="routeSkipped" :route-name="routeNameDraft||availableRoutes.find(r=>r.routeId===selectedRouteId)?.name" :route-anchors="routeAnchors" :route-selected="routeSelected" :draw-mode="editingRoute&&routeTool==='draw'" :initial-heading="editingRoute?bodyYawDeg*Math.PI/180:undefined" @heading="setInitialHeadingRad" @blank="appendRoute" @design-select="routeSelected=$event" @design-move="moveRoute" @gap-edit="onGapEdit" @move="mapCanvasMove" @box-select="onCanvasBoxSelect" @connect="onCanvasConnect" @ghost-move="onTagCreateGhostMove" @link-rejected="onCanvasLinkRejected" :vehicle="mapVehicle??undefined" :trail="mapTrail"/>
+       <MapCanvas v-else-if="canvasMap" ref="mapCanvasRef" :map="canvasMap" :selected="mapSelected" :measurement="mapMeasurement" row-id="" :tool="measuring?'measure':editingRoute?(routeTool==='pan'?'pan':routeTool==='connect'?'connect':'route-design'):(field?.routeMode==='map-only'||tagPositionEditing||tagCreateEditing?'select':'pan')" @select="mapCanvasSelect" @inspect="inspectTag" @tag-detail="openTagDetail" :segment-plans="editingRoute?routePlans:undefined" :selected-segment="selectedSegmentKey" @segment-select="selectSegment" :editable="(editingRoute&&!routeLocked&&routeTool!=='pan')||tagPositionEditing||tagTableEditing||tagCreateEditing" :drawing="mapDrawing" :pan-enabled="editingRoute?(routeTool==='pan'):true" :spacing-mode="tagPositionEditing||tagTableEditing" :tag-editing="editingRoute||tagPositionEditing||tagTableEditing" :pan-mode="editingRoute||tagPositionEditing||tagTableEditing?(canvasPansOnDrag?'pan':'select'):undefined" :mode-label="editorModeLabel" :tag-aliases="tagAliasByTagId" :spacing-line="spacingSelectedIds" :spacing-gaps="spacingCanvasGaps" :ghost-tags="tagCreateGhost" :route-group-ids="routeGroupIds" :route-skipped-groups="routeSkipped" :route-name="routeNameDraft||availableRoutes.find(r=>r.routeId===selectedRouteId)?.name" :route-anchors="routeAnchors" :route-selected="routeSelected" :draw-mode="editingRoute&&routeTool==='draw'" :initial-heading="editingRoute?bodyYawDeg*Math.PI/180:undefined" @heading="setInitialHeadingRad" @blank="onCanvasBlank" @design-select="routeSelected=$event" @design-move="moveRoute" @gap-edit="onGapEdit" @move="mapCanvasMove" @box-select="onCanvasBoxSelect" @connect="onCanvasConnect" @ghost-move="onTagCreateGhostMove" @link-rejected="onCanvasLinkRejected" @snap-blocked="onSnapBlocked" :vehicle="mapVehicle??undefined" :trail="mapTrail">
+       <div v-if="editingRoute&&boxSelectedIds.length>1&&page==='navigate'&&field?.routeMode==='map-only'" class="box-batch-bar" data-testid="box-batch-bar">
+         <div class="box-batch-bar__head">
+          <strong>已选 {{boxSelectedIds.length}} 个</strong>
+          <span>二维码</span>
+          <span v-if="boxSelectedGroupCount">（其中 {{boxSelectedGroupCount}} 个是定位组中心）</span>
+          <button type="button" class="box-batch-bar__close" aria-label="取消框选" data-testid="box-batch-clear" @click="clearBoxSelection">✕</button>
+         </div>
+         <!-- B2 两点距离：恰好选中 2 个。起点=左/下、终点=右/上；服务端固定起点只移动终点。 -->
+         <div v-if="pairSpec" class="box-batch-bar__card" data-testid="tag-distance-card">
+          <div class="box-batch-bar__card-head">
+           <strong>Q{{String(pairSpec.from.id).padStart(3,'0')}} → Q{{String(pairSpec.to.id).padStart(3,'0')}}</strong>
+           <span>中心距离 {{pairSpec.distance.toFixed(3)}} m</span>
+          </div>
+          <div class="box-batch-bar__facts">
+           <span>Q{{String(pairSpec.from.id).padStart(3,'0')}} X <b>{{pairSpec.from.x.toFixed(3)}}</b> / Y <b>{{pairSpec.from.y.toFixed(3)}}</b></span>
+           <span>Q{{String(pairSpec.to.id).padStart(3,'0')}} X <b>{{pairSpec.to.x.toFixed(3)}}</b> / Y <b>{{pairSpec.to.y.toFixed(3)}}</b></span>
+          </div>
+          <div class="box-batch-bar__facts">
+           <span>水平 |ΔX| <b>{{pairSpec.absDx.toFixed(3)}} m</b></span>
+           <span>垂直 |ΔY| <b>{{pairSpec.absDy.toFixed(3)}} m</b></span>
+          </div>
+          <div class="box-batch-bar__row">
+           <label>新距离 / m<input type="number" min="0.10" step="0.05" :value="pairTargetText" :disabled="pairBusy||routeLocked" data-testid="tag-distance-target" @input="setPairTargetText(($event.target as HTMLInputElement).value)"/></label>
+           <button type="button" :disabled="pairBusy||routeLocked||!pairTargetValid" data-testid="tag-distance-apply" @click="applyPairDistance">确定</button>
+           <button type="button" :disabled="pairBusy" data-testid="tag-distance-cancel" @click="cancelPairEdit">取消</button>
+          </div>
+          <small v-if="pairError" class="box-batch-bar__error" data-testid="tag-distance-error">{{pairError}}</small>
+         </div>
+         <!-- B2/B3 相邻间距：只属于「单行/单列」这一套模型（同一行/同一列，恰好 2 个时就是配对间距）。
+              二维阵列用的是下面的横/纵向间距，两套模型绝不同屏出现。 -->
+         <div v-if="spacingSpec&&boxSelectionKind!=='array2d'" class="box-batch-bar__card" data-testid="tag-spacing-card">
+          <div class="box-batch-bar__card-head">
+           <strong>相邻间距</strong>
+           <span>{{spacingSpec.axis==='x'?'同一行':'同一列'}} · {{spacingSpec.ids.map(id=>'Q'+String(id).padStart(3,'0')).join(' → ')}}</span>
+          </div>
+          <div class="box-batch-bar__row">
+           <label>相邻间距 / m<input type="number" min="0.10" step="0.05" :value="spacingTargetText" :disabled="equalSpacingBusy||routeLocked" data-testid="tag-spacing-target" @input="setSpacingTargetText(($event.target as HTMLInputElement).value)"/></label>
+           <button type="button" :disabled="equalSpacingBusy||routeLocked||!spacingTargetValid" data-testid="tag-spacing-apply" @click="applyEqualSpacing">应用</button>
+          </div>
+          <small v-if="spacingError" class="box-batch-bar__error" data-testid="tag-spacing-error">{{spacingError}}</small>
+         </div>
+         <!-- B4 选中集合的派生真值：行/列数、长/高、整组尺寸全部来自真实坐标 + 单码边长（物理外廓）。
+              二维阵列与单行/单列是两套间距模型：标签直接写在真值块里，避免同屏出现两种「间距」。 -->
+         <div class="box-batch-bar__facts" data-testid="box-batch-facts">
+          <span v-if="boxSelectionKind==='array2d'" data-testid="box-batch-array-label"><b>二维阵列</b></span>
+          <span v-else-if="boxSelectionKind==='line'" data-testid="box-batch-span"><b>{{boxSelectedMetrics?.rows===1?'单行 · '+(boxSelectedMetrics?.columns??0)+' 列':'单列 · '+(boxSelectedMetrics?.rows??0)+' 行'}}</b></span>
+          <span>行数 <b data-testid="box-batch-rows">{{boxSelectedMetrics?.rows??'—'}}</b></span>
+          <span>列数 <b data-testid="box-batch-cols">{{boxSelectedMetrics?.columns??'—'}}</b></span>
+          <span>长 <b>{{boxSelectedMetrics?boxSelectedMetrics.lengthM.toFixed(3):'—'}} m</b></span>
+          <span>高 <b>{{boxSelectedMetrics?boxSelectedMetrics.heightM.toFixed(3):'—'}} m</b></span>
+          <span>整组尺寸 <b>{{boxSelectedMetrics?(boxSelectedMetrics.lengthM*1000).toFixed(0)+'×'+(boxSelectedMetrics.heightM*1000).toFixed(0):'—'}} mm</b></span>
+          <span>单码边长 <b>{{boxSelectedMetrics?boxSelectedMetrics.sizeM.toFixed(3):'—'}} m</b></span>
+         </div>
+
+         <div class="box-batch-bar__row">
+          <label>规格 mm<input type="number" min="20" max="180" step="10" :value="batchSizeMm" :disabled="batchBusy||routeLocked" data-testid="box-batch-size" @input="setBatchSizeMm(($event.target as HTMLInputElement).value)"/></label>
+          <button type="button" :disabled="batchBusy||routeLocked" data-testid="box-batch-apply-size" @click="batchSetSize">批量改规格</button>
+         </div>
+         <!-- 二维阵列：整组宽/高与横/纵向间距是同一组参数（宽=(列−1)×横向间距+单码边长）。
+              改整组宽/高会反算对应的间距；「重排为阵列」只按这组参数重排选中的 id，行×列须等于选中数。
+              单行/单列时这一块整体不显示：它们只有上面的「相邻间距」模型。 -->
+         <div v-if="boxSelectionKind==='array2d'&&!paletteInstanceFullySelected" class="box-batch-bar__card" data-testid="box-batch-array">
+          <div class="box-batch-bar__card-head"><strong>二维阵列</strong><span>{{boxSelectedMetrics?.rows}} 行 × {{boxSelectedMetrics?.columns}} 列 · 改整组宽/高会同步算出横/纵向间距</span></div>
+          <div class="box-batch-bar__row">
+           <label>整组宽 / mm<input type="number" min="20" step="10" :value="batchWidthMmText" :disabled="batchBusy||routeLocked" data-testid="box-batch-width" @input="setBatchWidthMm(($event.target as HTMLInputElement).value)"/></label>
+           <label>整组高 / mm<input type="number" min="20" step="10" :value="batchHeightMmText" :disabled="batchBusy||routeLocked" data-testid="box-batch-height" @input="setBatchHeightMm(($event.target as HTMLInputElement).value)"/></label>
+          </div>
+          <div class="box-batch-bar__row">
+           <label>横向间距 / m<input type="number" min="0.05" step="0.01" :value="batchPitchXText" :disabled="batchBusy||routeLocked" data-testid="box-batch-pitch-x" @input="setBatchPitchXText(($event.target as HTMLInputElement).value)"/></label>
+           <label>纵向间距 / m<input type="number" min="0.05" step="0.01" :value="batchPitchYText" :disabled="batchBusy||routeLocked" data-testid="box-batch-pitch-y" @input="setBatchPitchYText(($event.target as HTMLInputElement).value)"/></label>
+           <button type="button" :disabled="batchBusy||routeLocked" data-testid="box-batch-reshape" @click="batchReshapeGrid">重排为阵列</button>
+          </div>
+         </div>
+         <!-- 拖入实例参数：实例的 id 全在框选里才显示；输入只写本地 ref，再经 commitInstance 提交。 -->
+         <div v-if="paletteInstanceFullySelected" class="box-batch-bar__card" data-testid="box-batch-instance">
+          <div class="box-batch-bar__card-head"><strong>拖入实例</strong><span>阵列 · 改完立即重算并保存</span></div>
+          <div class="box-batch-bar__row">
+           <label>行数<input type="number" min="1" step="1" :value="paletteInstance?.rows" :disabled="batchBusy||routeLocked" data-testid="box-batch-instance-rows" @input="editInstance({rows:Math.max(1,Math.round(Number(($event.target as HTMLInputElement).value)||1))})" @change="commitInstance" @blur="commitInstance"/></label>
+           <label>列数<input type="number" min="1" step="1" :value="paletteInstance?.columns" :disabled="batchBusy||routeLocked" data-testid="box-batch-instance-cols" @input="editInstance({columns:Math.max(1,Math.round(Number(($event.target as HTMLInputElement).value)||1))})" @change="commitInstance" @blur="commitInstance"/></label>
+           <label>横向间距 / m<input type="number" min="0.05" step="0.01" :value="paletteInstance?.pitchXM" :disabled="batchBusy||routeLocked" data-testid="box-batch-instance-pitch-x" @input="editInstance({pitchXM:Number(($event.target as HTMLInputElement).value)||0.2})" @change="commitInstance" @blur="commitInstance"/></label>
+           <label>纵向间距 / m<input type="number" min="0.05" step="0.01" :value="paletteInstance?.pitchYM" :disabled="batchBusy||routeLocked" data-testid="box-batch-instance-pitch-y" @input="editInstance({pitchYM:Number(($event.target as HTMLInputElement).value)||0.2})" @change="commitInstance" @blur="commitInstance"/></label>
+          </div>
+          <div class="box-batch-bar__facts">
+           <span>长 <b>{{paletteInstanceMetrics?paletteInstanceMetrics.lengthM.toFixed(3):'—'}} m</b></span>
+           <span>高 <b>{{paletteInstanceMetrics?paletteInstanceMetrics.heightM.toFixed(3):'—'}} m</b></span>
+          </div>
+         </div>
+         <div class="box-batch-bar__row">
+          <button type="button" :disabled="batchBusy||routeLocked||boxSelectedIds.length<2" data-testid="box-batch-align-row" @click="batchAlign('top')">水平对齐</button>
+          <button type="button" :disabled="batchBusy||routeLocked||boxSelectedIds.length<2" data-testid="box-batch-align-col" @click="batchAlign('left')">垂直对齐</button>
+          <button type="button" class="is-danger" :disabled="batchBusy||routeLocked" data-testid="box-batch-delete" @click="batchDelete">批量删除</button>
+         </div>
+        </div><section v-if="editingRoute&&routeInspectorOpen&&routeSelectedObject&&routeSelectedObject.kind==='waypoint'" class="route-inspector route-inspector-float" data-testid="route-inspector">
+       <div class="route-properties-heading">
+        <strong>{{routeSelectedObject.kind==='waypoint'?'路点属性':'二维码属性'}}</strong>
+        <div class="route-properties-actions">
+         <Button size="sm" variant="destructive" data-testid="route-point-delete" :disabled="routeLocked" @click="openPointConfirm">删除该点</Button>
+         <Button size="sm" variant="ghost" aria-label="关闭属性" data-testid="route-inspector-close" @click="closeRouteInspector">关闭</Button>
+        </div>
+       </div>
+       <dl class="route-inspector-rows">
+        <div><dt>序号</dt><dd>{{routeSelectedObject.index}}</dd></div>
+        <div><dt>坐标 (m)</dt><dd>{{routeSelectedObject.coord}}</dd></div>
+        <div v-if="routeSelectedObject.qrLabel"><dt>关联二维码</dt><dd>{{routeSelectedObject.qrLabel}}</dd></div>
+        <div v-if="routeSelectedObject.type"><dt>本段动作</dt><dd>{{routeSelectedObject.type}}</dd></div>
+        <div v-if="routeSelectedObject.speedMps!==undefined"><dt>速度 (m/s)</dt><dd>{{routeSelectedObject.speedMps.toFixed(2)}}</dd></div>
+        <div v-if="routeSelectedObject.lengthM"><dt>本段距离</dt><dd>{{routeSelectedObject.lengthM.toFixed(2)}} m</dd></div>
+       </dl>
+        <div v-if="selectedTagSpec" class="route-inspector-spec" data-testid="route-tag-spec">
+         <template v-if="selectedTagSpec.isGroup">
+          <div class="route-spec-line"><dt>码组规格</dt><dd data-testid="route-tag-spec-value">网格 {{selectedTagSpec.gridSize}}×{{selectedTagSpec.gridSize}} · 板宽 {{selectedTagSpec.sizeMm}} mm<template v-if="selectedTagSpec.gapMm"> · 间距 {{selectedTagSpec.gapMm}} mm</template></dd></div>
+          <small class="route-spec-note">码组规格属于整组打印布局，需在铺码流程整体调整；此处不单独修改组尺寸。</small>
+         </template>
+         <template v-else>
+          <label class="route-spec-edit">码规格（板宽）
+           <select :disabled="tagSpecBusy||routeLocked||busy||robot.running" data-testid="route-tag-spec-select" :value="selectedTagSpec.sizeMm" @change="applyTagSpec(Number(($event.target as HTMLSelectElement).value))">
+            <option v-for="preset in tagSpecPresets" :key="preset" :value="preset">{{preset}} mm</option>
+           </select>
+          </label>
+          <small class="route-spec-note">保存为新地图版本，仅修改当前选中的这个码。</small>
+         </template>
+        </div>
+       <p v-if="routeSelectedObject.blocked" class="route-inspector-warn" role="alert">该步骤存在阻断项，保存会被后端安全门拒绝</p>
+
+      </section></MapCanvas>
        <div v-else class="scan-empty"><div class="empty-illustration"><ScanLine v-if="page==='scan'" :size="32"/><Route v-else :size="32"/></div><strong>{{page==='scan'?'暂无扫描数据':'请选择地图'}}</strong><div class="getting-started" data-testid="getting-started"><h2>{{page==='scan'?'打印并铺设定位板后开始扫描':'选择地图与路径后开始导航'}}</h2><p>{{page==='scan'?'检查相机，点「开始扫描」即可。已有记录可从左侧打开继续整理。':'先选择地图，再选择或新建路径。'}}</p><div><Button size="sm" @click="page=page==='scan'?'print':'scan'">{{page==='scan'?'打印定位板':'前往扫描建图'}}<ArrowRight :size="15"/></Button></div></div></div>
-       <div class="legend"><span><i class="tag-dot"/>定位组</span><span><i class="line-green"/>作物行</span></div>
+
+<div class="legend"><span><i class="tag-dot"/>定位组</span><span><i class="line-green"/>作物行</span></div>
        <div v-if="editingRoute&&tagDetail" class="tag-detail-card" data-testid="tag-detail-card" role="status">
         <div class="tag-detail-head"><strong>{{tagDetail.label}}</strong><button type="button" aria-label="关闭二维码信息" @click="tagDetailId=null">✕</button></div>
         <TagInspector v-if="field&&tagDetail" :map="field" :version="version" :tag-id="tagDetail.id"/>
@@ -2329,7 +3665,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
      <template #bottom>
       <div v-if="editingRoute" class="route-steps-entry" data-testid="route-steps-entry">
        <button v-show="!routeStepsOpen" type="button" class="route-steps-trigger" data-testid="route-steps-trigger" :aria-expanded="routeStepsOpen" aria-haspopup="dialog" @click.stop="routeStepsOpen=!routeStepsOpen;routeStepsOpen&&nextTick(clampRouteStepsDockHeight)">
-        <strong>路径步骤 {{stepRows.length}}</strong><span :class="['route-steps-trigger-status','is-'+stepStatusTone]" data-testid="route-steps-status" :title="stepStatusHint">{{stepStatusLabel}}</span><span class="panel-caret">{{routeStepsOpen?'▴':'▾'}}</span>
+        <strong data-testid="route-steps-summary">路径步骤 {{stepRows.length}} · {{routeLength.toFixed(2)}} m</strong><span :class="['route-steps-trigger-status','is-'+stepStatusTone]" data-testid="route-steps-status" :title="stepStatusHint">{{stepStatusLabel}}</span><span class="panel-caret">{{routeStepsOpen?'▴':'▾'}}</span>
        </button>
        <div v-show="routeStepsOpen" class="route-steps-dock" data-testid="route-steps-dock" :style="routeStepsDockStyle">
        <div class="route-steps-resize-bar" data-testid="route-steps-resize-bar" role="separator" aria-orientation="horizontal"
@@ -2388,26 +3724,7 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
       </div>
       </div>
      </template>
-     <template #inspector>
-      <!-- 选中对象才显示属性：没选中就收起，避免常驻占位。
-           属性来自当前选中路点/二维码的真实数据，只读展示 + 可跳转到对应面板。 -->
-      <section v-if="editingRoute&&routeInspectorOpen&&routeSelectedObject" class="right-panel route-inspector" data-testid="route-inspector">
-       <div class="route-properties-heading">
-        <strong>{{routeSelectedObject.kind==='waypoint'?'路点属性':'二维码属性'}}</strong>
-        <Button size="sm" variant="ghost" aria-label="关闭属性" data-testid="route-inspector-close" @click="closeRouteInspector">关闭</Button>
-       </div>
-       <dl class="route-inspector-rows">
-        <div><dt>序号</dt><dd>{{routeSelectedObject.index}}</dd></div>
-        <div><dt>坐标 (m)</dt><dd>{{routeSelectedObject.coord}}</dd></div>
-        <div v-if="routeSelectedObject.qrLabel"><dt>关联二维码</dt><dd>{{routeSelectedObject.qrLabel}}</dd></div>
-        <div v-if="routeSelectedObject.type"><dt>本段动作</dt><dd>{{routeSelectedObject.type}}</dd></div>
-        <div v-if="routeSelectedObject.speedMps!==undefined"><dt>速度 (m/s)</dt><dd>{{routeSelectedObject.speedMps.toFixed(2)}}</dd></div>
-        <div v-if="routeSelectedObject.lengthM"><dt>本段距离</dt><dd>{{routeSelectedObject.lengthM.toFixed(2)}} m</dd></div>
-       </dl>
-       <p v-if="routeSelectedObject.blocked" class="route-inspector-warn" role="alert">该步骤存在阻断项，保存会被后端安全门拒绝</p>
-       <p class="route-inspector-hint">属性只读展示；修改请用画布拖动或左侧对应分组。</p>
-      </section>
-     </template>
+
      <template #right>
       <section v-if="!editingRoute" class="right-panel">
        <div v-if="page==='scan'" class="scan-detector-status" role="status">{{session?.state==='collecting'?'正在记录':session?'采集记录已保存':'等待开始采集'}} · {{capturePointCount}} 个定位点 · {{captureSampleCount}} 帧</div>
@@ -2424,6 +3741,104 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
    </div>
   </main>
  </div>
+
+  <!-- 画布对象属性浮窗：挂在 app 根节点，不放进左侧「点位与铺码」折叠区。
+       旧实现放在折叠区里，分组一收（v-show）整个浮窗就 display:none，
+       选中了却什么都看不到；浮窗也不该被工具面板的裁剪/层叠影响。 -->
+  <div v-if="snapNotice" class="snap-notice" data-testid="snap-blocked-notice" role="status">{{snapNotice}}</div>
+  <div v-if="draftObject" class="object-inspector" data-testid="object-inspector" :style="inspectorStyle">
+   <div class="object-inspector__head">
+    <strong>Q{{String(draftObject.id).padStart(3,'0')}}</strong>
+    <span>{{inspectorKind}}</span>
+    <button type="button" class="object-inspector__close" aria-label="关闭对象浮窗" @click="inspectedTagId=null">✕</button>
+   </div>
+   <div class="object-inspector__meta">
+    <span>序号 {{draftObject.id}}</span>
+    <span>{{draftObject.groupId??'独立码'}}</span>
+   </div>
+   <div class="object-inspector__rows">
+    <label>X / m<input type="number" step="0.01" :value="draftObject.x.toFixed(3)" :disabled="inspectorBusy||routeLocked||!!selectedGroup||!editingRoute" data-testid="object-x" @change="patchDraftObject({x:Number(($event.target as HTMLInputElement).value)})"/></label>
+    <label>Y / m<input type="number" step="0.01" :value="draftObject.y.toFixed(3)" :disabled="inspectorBusy||routeLocked||!!selectedGroup||!editingRoute" data-testid="object-y" @change="patchDraftObject({y:Number(($event.target as HTMLInputElement).value)})"/></label>
+    <label>朝向 / °<input type="number" step="1" :value="draftObject.angle.toFixed(1)" :disabled="inspectorBusy||routeLocked||!!selectedGroup||!editingRoute" data-testid="object-angle" @change="patchDraftObject({angle:Number(($event.target as HTMLInputElement).value)})"/></label>
+   </div>
+   <div v-if="editingRoute&&paletteInstance&&paletteInstance.kind==='grid'&&paletteInstance.ids.includes(draftObject.id)" class="object-inspector__rows" data-testid="object-grid-params">
+    <label>列数<input type="number" min="1" step="1" :value="paletteInstance.columns" :disabled="inspectorBusy||routeLocked" data-testid="object-grid-columns" @input="editInstance({columns:Math.max(1,Math.round(Number(($event.target as HTMLInputElement).value)||1))})" @change="commitInstance" @blur="commitInstance"/></label>
+    <label>行数<input type="number" min="1" step="1" :value="paletteInstance.rows" :disabled="inspectorBusy||routeLocked" data-testid="object-grid-rows" @input="editInstance({rows:Math.max(1,Math.round(Number(($event.target as HTMLInputElement).value)||1))})" @change="commitInstance" @blur="commitInstance"/></label>
+    <label>列距 / m<input type="number" min="0.05" step="0.01" :value="paletteInstance.pitchXM" :disabled="inspectorBusy||routeLocked" data-testid="object-grid-pitch-x" @input="editInstance({pitchXM:Number(($event.target as HTMLInputElement).value)||0.2})" @change="commitInstance" @blur="commitInstance"/></label>
+    <label>行距 / m<input type="number" min="0.05" step="0.01" :value="paletteInstance.pitchYM" :disabled="inspectorBusy||routeLocked" data-testid="object-grid-pitch-y" @input="editInstance({pitchYM:Number(($event.target as HTMLInputElement).value)||0.2})" @change="commitInstance" @blur="commitInstance"/></label>
+   </div>
+   <div v-else-if="editingRoute&&paletteInstance&&paletteInstance.kind==='line'&&paletteInstance.ids.includes(draftObject.id)" class="object-inspector__rows" data-testid="object-line-params">
+    <label>数量<input type="number" min="1" step="1" :value="paletteInstance.count" :disabled="inspectorBusy||routeLocked" data-testid="object-line-count" @input="editInstance({count:Math.max(1,Math.round(Number(($event.target as HTMLInputElement).value)||1))})" @change="commitInstance" @blur="commitInstance"/></label>
+    <label>间距 / m<input type="number" min="0.05" step="0.01" :value="paletteInstance.spacingM" :disabled="inspectorBusy||routeLocked" data-testid="object-line-spacing" @input="editInstance({spacingM:Number(($event.target as HTMLInputElement).value)||0.2})" @change="commitInstance" @blur="commitInstance"/></label>
+    <label>方向<select :value="paletteInstance.axis" :disabled="inspectorBusy||routeLocked" data-testid="object-line-axis" @change="editInstance({axis:(($event.target as HTMLSelectElement).value as 'horizontal'|'vertical')});commitInstance()">
+     <option value="horizontal">沿 X</option><option value="vertical">沿 Y</option>
+    </select></label>
+    <label>正向<select :value="String(paletteInstance.direction)" :disabled="inspectorBusy||routeLocked" data-testid="object-line-direction" @change="editInstance({direction:(Number(($event.target as HTMLSelectElement).value)===1?1:-1)});commitInstance()">
+     <option value="1">+</option><option value="-1">−</option>
+    </select></label>
+   </div>
+   <!-- 独立码规格：1×1 网格就是它自己，单码边长即整组尺寸；不再出现矩形网格的说法。 -->
+   <div v-else-if="!selectedGroup&&editingRoute" class="object-inspector__group" data-testid="object-tag-spec">
+    <div class="object-inspector__head"><strong>二维码规格</strong><span>{{tagSpecMm}} mm</span></div>
+    <div class="object-inspector__rows">
+     <label>单码边长 / mm<input type="number" min="20" max="180" step="10" :value="tagSpecMm" :disabled="tagSpecBusy||routeLocked" data-testid="object-tag-size" @input="tagSpecMm=Math.max(20,Math.min(180,Number(($event.target as HTMLInputElement).value)||60))" @change="applyDraftTagSize"/></label>
+     <label>网格<input type="text" value="1×1" readonly data-testid="object-tag-grid" title="独立码=1×1"/></label>
+     <label>整组尺寸 / mm<input type="number" :value="tagSpecMm" readonly data-testid="object-tag-group-size" title="独立码的整组尺寸就是它自己的边长"/></label>
+     <label>预设<select :value="String(tagSpecMm)" :disabled="tagSpecBusy||routeLocked" data-testid="object-tag-size-preset" @change="tagSpecMm=Number(($event.target as HTMLSelectElement).value);applyDraftTagSize()">
+      <option v-for="mm in [30,40,50,60,80,100]" :key="mm" :value="String(mm)">{{mm}} mm</option>
+     </select></label>
+    </div>
+    <small class="object-inspector__note">独立码=1×1：整组尺寸就是这一个码的边长，改完立即保存。</small>
+   </div>
+   <!-- 码组规格：行数/列数彼此独立（1..6，行×列 ≤36），整组宽/高也各自独立（20..500 mm）；
+        间距与单码边长是由「整组宽/高 + 行/列」派生的只读值（1×1 无白缝，单码边长 = min(宽,高)）。 -->
+   <div v-if="draftObject&&selectedGroup&&editingRoute" class="object-inspector__group" data-testid="object-group-spec">
+    <div class="object-inspector__head"><strong>码组规格</strong><span>{{selectedGroup.id}} · {{groupCols}}×{{groupRows}} · 整组尺寸 {{groupWidthMm}}×{{groupHeightMm}} mm</span></div>
+    <div class="object-inspector__rows">
+     <label data-testid="object-group-cols">列数<select :value="String(groupCols)" :disabled="groupSpecBusy||routeLocked" data-testid="object-group-grid" @change="setGroupCols(($event.target as HTMLSelectElement).value)">
+      <option v-for="n in [1,2,3,4,5,6]" :key="n" :value="String(n)">{{n}}</option>
+     </select></label>
+     <label>行数<select :value="String(groupRows)" :disabled="groupSpecBusy||routeLocked" data-testid="object-group-rows" @change="setGroupRows(($event.target as HTMLSelectElement).value)">
+      <option v-for="n in [1,2,3,4,5,6]" :key="n" :value="String(n)">{{n}}</option>
+     </select></label>
+     <label data-testid="object-group-width">整组宽 / mm<input type="number" min="20" max="500" step="10" :value="groupWidthMm" :disabled="groupSpecBusy||routeLocked" data-testid="object-group-size" @input="setGroupWidthMm(($event.target as HTMLInputElement).value)"/></label>
+     <label>整组高 / mm<input type="number" min="20" max="500" step="10" :value="groupHeightMm" :disabled="groupSpecBusy||routeLocked" data-testid="object-group-height" @input="setGroupHeightMm(($event.target as HTMLInputElement).value)"/></label>
+     <label>间距 / mm<input type="text" :value="groupGapMmLabel" readonly data-testid="object-group-gap" :title="groupGapMm===null?'1×1 无白缝':'码组白缝固定 2 mm'"/></label>
+     <label>起始编号<input type="number" min="0" max="586" step="1" :value="groupStartId??selectedGroup.referenceId" :disabled="groupSpecBusy||routeLocked" data-testid="object-group-start" @input="groupStartId=Math.max(0,Math.round(Number(($event.target as HTMLInputElement).value)||0))"/></label>
+     <label>单码边长 / mm<input type="number" :value="groupTileMm" readonly data-testid="object-group-tag-size" title="由整组宽/高与 行×列 网格共同决定，不能单点改"/></label>
+    </div>
+    <small v-if="groupSpecError" class="object-inspector__error" data-testid="object-group-error">{{groupSpecError}}</small>
+    <div class="object-inspector__row-actions">
+     <button type="button" :disabled="groupSpecBusy||routeLocked" data-testid="object-group-apply" @click="applyGroupSpec">应用</button>
+     <button type="button" :disabled="groupSpecBusy||batchGroupBusy||routeLocked||!(field?.groups?.length)" data-testid="object-group-apply-all" title="把这张图的全部定位组按当前 行×列/整组尺寸 一次改完" @click="applyGroupSpecBatch('all',{rows:groupRows,cols:groupCols,widthMm:groupWidthMm,heightMm:groupHeightMm})">全部定位组应用</button>
+     <button type="button" :disabled="groupSpecBusy" data-testid="object-group-print" @click="printGroupPdf">打印</button>
+    </div>
+    <small class="object-inspector__note">行数、列数、整组宽/高彼此独立，行×列 ≤36 个码。间距固定 2 mm（1×1 无白缝）；单码边长 = min((宽−(列−1)×2)/列, (高−(行−1)×2)/行)，随整组自动变化。</small>
+   </div>
+   <small class="object-inspector__note">参数修改后立即重算这批点并保存；拖动对象即时保存位置。</small>
+   <button type="button" class="object-inspector__delete" :disabled="inspectorBusy||routeLocked" data-testid="object-delete" @click="deleteSelectedObject">删除该对象</button>
+  </div>
+  <div v-if="toolDrag" class="tool-drag-ghost" :class="{'is-over':toolDrag.over}" data-testid="palette-drag-ghost" :style="{left:toolDrag.x+'px',top:toolDrag.y+'px'}">
+   <span>{{TAG_TOOL_LABELS[toolDrag.kind]}}</span>
+   <small>{{toolDrag.over?'松手落点':'拖到地图上'}}</small>
+  </div>
+  <div v-if="routeOpenDialog" class="route-exit-confirm-overlay" role="dialog" aria-modal="true" aria-label="打开路径" data-testid="route-open-dialog">
+   <div class="route-open-box">
+    <div class="route-open-head"><strong>打开路径</strong><button type="button" data-testid="route-open-close" :disabled="routeOpenBusy" aria-label="关闭打开路径" @click="closeRouteDialog">✕</button></div>
+    <p class="route-open-map">{{field?.name}} · v{{version}}</p>
+    <div v-if="!openableRoutes.length" class="route-open-empty" data-testid="route-open-empty">
+     <span>暂无路径</span>
+     <Button size="sm" variant="outline" :disabled="routeLocked" data-testid="route-open-new" @click="openNewRouteFromDialog">新建路径</Button>
+    </div>
+    <div v-else class="route-open-list" data-testid="route-open-list">
+     <button v-for="route in openableRoutes" :key="route.routeId" type="button" class="route-open-item" :class="{active:route.routeId===routeEditId}" :disabled="routeOpenBusy" :data-testid="'route-open-item-'+route.routeId" @click="chooseOpenRoute(route.routeId)">
+      <strong>{{route.name}}</strong><small>{{route.points.length}} 点 · 更新 {{route.updated.slice(0,16).replace('T',' ')}}</small>
+     </button>
+    </div>
+   </div>
+  </div>
+  <div v-if="routeOpenConfirm" class="route-exit-confirm-overlay" role="alertdialog" data-testid="route-open-confirm"><div class="route-exit-confirm-box"><span>当前路径有未保存的改动，打开其他路径将丢弃这些改动。是否继续？</span><div><Button variant="outline" size="sm" data-testid="route-open-cancel" @click="routeOpenConfirm=null">继续编辑</Button><Button variant="destructive" size="sm" data-testid="route-open-discard" @click="loadRouteIntoEditor(routeOpenConfirm!)">放弃并打开</Button></div></div></div>
+  <div v-if="routePointConfirm!==null" class="route-exit-confirm-overlay" role="alertdialog" data-testid="route-point-confirm"><div class="route-exit-confirm-box"><span>删除第 {{routePointConfirm+1}} 点{{routePointLabel?'（'+routePointLabel+'）':''}}？仅从当前编辑草稿移除该点，其他点、码组与顺序不受影响。</span><div><Button variant="outline" size="sm" data-testid="route-point-cancel" @click="routePointConfirm=null">取消</Button><Button variant="destructive" size="sm" data-testid="route-point-confirm-delete" @click="confirmDeletePoint">删除该点</Button></div></div></div>
   <div v-if="routeExitConfirm" class="route-exit-confirm-overlay" role="alertdialog" data-testid="route-exit-confirm" :data-dirty="editorSession.dirty.value?'1':'0'"><div class="route-exit-confirm-box"><span>当前路径有未保存的改动，退出将丢弃这些改动。是否继续？</span><div><Button variant="outline" size="sm" data-testid="route-exit-cancel" @click="cancelExitRoute">继续编辑</Button><Button variant="destructive" size="sm" data-testid="route-exit-discard" @click="confirmExitRoute">放弃并退出</Button></div></div></div>
 </template>
 <style scoped>
@@ -2647,7 +4062,6 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
 .gap-inline-row button[data-testid="gap-inline-apply"]{background:var(--accent);border-color:var(--accent);color:white}
 .gap-inline-row button:disabled{opacity:.5;cursor:default}
 .gap-inline-error{font-size:11px;color:#b91c1c}
-.navigation-map-list{display:flex;flex-direction:column;gap:4px;max-height:150px;overflow-y:auto;margin:7px 0 10px;padding:2px;border:1px solid var(--line);border-radius:7px;background:var(--panel)}
 .navigation-map-item{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;width:100%;padding:7px 9px;border:1px solid transparent;border-radius:5px;background:white;color:var(--text);text-align:left;cursor:pointer}
 .navigation-map-item:hover{background:#f8fbff}.navigation-map-item.active{border-color:var(--accent);background:#eff6ff}.navigation-map-item:disabled{cursor:not-allowed;opacity:.65}.navigation-map-item strong,.navigation-map-item span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.navigation-map-item span{flex:0 0 auto;color:var(--muted);font-size:11px}.navigation-map-head{padding:5px 8px 3px;color:var(--muted);font-size:11px}.navigation-map-empty{padding:9px;color:var(--muted);font-size:12px;text-align:center}
 .route-commands-panel{max-height:clamp(132px,18dvh,208px)}
@@ -2937,4 +4351,145 @@ onBeforeUnmount(()=>{closed=true;navigationAbort?.abort();clearInterval(poll);cl
  .route-rail{flex-direction:row;justify-content:center;margin-top:8px}
 }
 .scan-detector-inference{display:flex;flex-direction:column;gap:4px;margin-top:12px;padding:10px 12px;border:1px solid #bfdbfe;border-radius:8px;background:#eff6ff;color:#1e3a8a;font-size:12px;line-height:1.6}.scan-detector-inference strong{font-weight:600}.scan-detector-inference small{color:#475569}.scan-detector-inference.is-unregistered{border-color:#fed7aa;background:#fff7ed;color:#9a3412}.scan-detector-inference.is-unregistered small{color:#9a3412}
+
+/* Route properties belong to the canvas, with no docked column or empty rail. */
+.app-shell.is-route-editing .canvas-wrap>.route-inspector-float{position:absolute;z-index:45;top:8px;right:64px;bottom:auto;left:auto;box-sizing:border-box;width:min(260px,calc(100% - 72px));height:auto;min-height:0;max-height:calc(100% - 110px);overflow-y:auto;padding:10px;background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 4px 16px rgb(15 23 42 / 14%);gap:4px}
+.route-inspector-float .route-properties-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0;font-size:13px}
+.route-inspector-float .route-properties-heading button{height:28px;min-height:28px;padding:2px 6px;font-size:12px}
+.route-inspector-float .route-inspector-rows>div{grid-template-columns:72px minmax(0,1fr);gap:6px;padding:4px 0}
+.route-inspector-float .route-inspector-rows dt,.route-inspector-float .route-inspector-rows dd{font-size:12px;line-height:18px}
+
+.route-open-box{display:flex;flex-direction:column;gap:8px;min-width:min(360px,92vw);max-width:min(92vw,460px);background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 16px;box-shadow:0 12px 32px rgba(15,23,42,.24);font-size:13px;color:var(--ink)}
+.route-open-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.route-open-head strong{font-size:14px}
+.route-open-head button{width:28px;height:28px;border:0;border-radius:6px;background:transparent;color:var(--muted);cursor:pointer;font-size:14px}
+.route-open-head button:hover{background:#eef2f6;color:var(--ink)}
+.route-open-map{margin:0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.route-open-list{display:flex;flex-direction:column;gap:6px;max-height:min(320px,50vh);overflow-y:auto}
+.route-open-item{display:flex;flex-direction:column;align-items:flex-start;gap:2px;width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;text-align:left;cursor:pointer}
+.route-open-item:hover:not(:disabled){border-color:#93c5fd;background:#eff6ff}
+.route-open-item.active{border-color:var(--accent);background:#eff6ff}
+.route-open-item strong{font-size:13px;font-weight:600}
+.route-open-item small{font-size:11px;color:var(--muted)}
+.route-open-empty{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px;border:1px dashed var(--line);border-radius:8px;color:var(--muted)}
+
+/* 路径编辑工作区固定在视口内：不靠裁切内容，左侧工具栏/分组面板自行滚动。 */
+.app-shell.is-route-editing .editor-body{overflow:hidden!important;min-height:0;height:100%;}
+.app-shell.is-route-editing .editor-shell__row{min-height:0;overflow:hidden;}
+.app-shell.is-route-editing .editor-shell__left{min-height:0;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;}
+.app-shell.is-route-editing .route-tools__body{overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;}
+@media(max-width:1024px){
+ .app-shell.is-route-editing .editor-body{overflow:hidden!important;}
+ .app-shell.is-route-editing :deep(.editor-shell__row){min-height:0;height:100%;overflow:hidden;}
+ .app-shell.is-route-editing :deep(.editor-shell__row)>.editor-shell__left{max-height:min(40dvh,360px)!important;min-height:0;overflow-y:auto!important;overflow-x:hidden!important;}
+ .app-shell.is-route-editing :deep(.route-tools__body){max-height:none;overflow-y:auto;}
+}
+@media(max-width:760px){
+ .app-shell.is-route-editing .editor-body{overflow:hidden!important;}
+ .app-shell.is-route-editing :deep(.editor-shell__row)>.editor-shell__left{max-height:min(38dvh,310px)!important;overflow-y:auto!important;}
+}
+
+/* 初始车头朝向：紧凑单行，不再竖向占位。 */
+.route-heading-panel{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;margin:4px 0 0;padding:2px 8px;border:1px solid var(--line);border-radius:8px;background:var(--background);min-height:26px;line-height:1.2}
+.route-heading-panel strong{font-size:11.5px;font-weight:600;color:var(--ink);white-space:nowrap;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}
+.route-heading-panel b{font:11.5px monospace;color:var(--ink);white-space:nowrap}
+.route-heading-panel .route-heading-input{width:64px;min-width:64px;height:26px;flex:0 0 auto;padding:2px 6px;border:1px solid var(--line);border-radius:6px;font:12px monospace;text-align:center;background:white;color:var(--ink)}
+.route-properties-actions{display:flex;align-items:center;gap:6px;margin-left:auto}
+.route-inspector-spec{margin-top:8px;padding-top:8px;border-top:1px solid var(--line);font-size:12px;color:var(--ink)}
+.route-spec-line{display:grid;grid-template-columns:72px minmax(0,1fr);gap:6px;align-items:start}
+.route-spec-line dd{overflow-wrap:anywhere;font-family:var(--mono);font-size:11.5px;color:#334155}
+.route-spec-note{display:block;margin-top:4px;color:var(--muted);font-size:11px;line-height:1.5}
+.route-spec-edit{display:flex;align-items:center;gap:6px}
+.route-spec-edit select{height:28px;min-width:110px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:white;font-size:12px}
+
+.map-tool-drag{cursor:grab;touch-action:none}
+.map-tool-drag:active{cursor:grabbing}
+.tool-drag-ghost{position:fixed;z-index:200;transform:translate(-50%,-50%);display:flex;flex-direction:column;gap:1px;padding:5px 9px;border-radius:8px;background:rgba(37,99,166,.92);color:#fff;font-size:12px;line-height:1.25;pointer-events:none;box-shadow:0 6px 18px rgba(15,23,42,.28);white-space:nowrap}
+.tool-drag-ghost small{font-size:10px;opacity:.82}
+.tool-drag-ghost.is-over{background:rgba(21,128,61,.95);outline:2px solid rgba(134,239,172,.9)}
+
+.tag-palette{display:flex;flex-direction:column;gap:8px}
+.tag-palette__group{display:flex;flex-direction:column;gap:4px}
+.tag-palette__title{font-size:10.5px;letter-spacing:.4px;color:#94a3b8}
+.tag-palette__grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
+.palette-item{display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px 3px 5px;border:1px solid var(--line,#e2e8f0);border-radius:7px;background:#fff;cursor:grab;user-select:none;touch-action:none;transition:border-color .12s,background .12s,box-shadow .12s}
+.palette-item:hover{border-color:#93c5fd;background:#f8fbff;box-shadow:0 1px 4px rgba(37,99,166,.12)}
+.palette-item:active{cursor:grabbing}
+.palette-item.is-disabled{opacity:.45;cursor:not-allowed}
+.palette-item__icon{display:grid;place-items:center;width:26px;height:22px}
+.palette-item__label{font-size:11px;line-height:1.2;color:#334155;text-align:center;white-space:nowrap}
+.palette-item__icon i{display:block;background:#2563a6}
+.pi-dot{width:9px;height:9px;border-radius:50%}
+.pi-grid{width:16px;height:12px;background-image:radial-gradient(circle,#2563a6 2px,transparent 2.2px)!important;background-size:8px 6px;background-color:transparent!important}
+.pi-line{width:18px;height:2px;border-radius:2px;box-shadow:0 -5px 0 -1px #2563a6,0 5px 0 -1px #2563a6}
+.tag-palette__tools{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px}
+.palette-tool{height:24px;padding:0 4px;border:1px solid var(--line,#e2e8f0);border-radius:6px;background:#fff;color:#475569;font-size:11px;cursor:pointer;white-space:nowrap}
+.palette-tool:hover:not(:disabled){background:#f1f5f9;border-color:#cbd5e1}
+.palette-tool:disabled{opacity:.45;cursor:not-allowed}
+
+.tag-create-engine{display:none!important}
+.snap-notice{position:fixed;z-index:130;left:50%;top:56px;transform:translateX(-50%);max-width:min(520px,calc(100vw - 32px));padding:6px 10px;border:1px solid #fca5a5;border-radius:8px;background:#fef2f2;color:#b91c1c;font-size:11.5px;line-height:1.45;box-shadow:0 4px 14px rgba(15,23,42,.12)}
+.object-inspector{position:fixed;z-index:110;top:auto;bottom:16px;right:16px;left:auto;transform:none;box-sizing:border-box;max-height:calc(100dvh - 120px);overflow-y:auto;display:flex;flex-direction:column;gap:5px;width:min(300px,calc(100% - 32px));padding:8px 10px;background:#fff;border:1px solid var(--line);border-radius:9px;box-shadow:0 6px 20px rgba(15,23,42,.16);font-size:11px}
+.object-inspector__head{display:flex;align-items:center;gap:6px}
+.object-inspector__head strong{font:12px monospace;color:#1d4ed8}
+.object-inspector__head span{color:#94a3b8;font-size:10.5px}
+.object-inspector__close{margin-left:auto;border:0;background:none;color:#94a3b8;cursor:pointer;font-size:12px;line-height:1}
+.object-inspector__rows{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px}
+.object-inspector__rows label{display:flex;flex-direction:column;gap:2px;font-size:10px;color:#64748b}
+.object-inspector__rows input,.object-inspector__rows select{box-sizing:border-box;width:100%;min-width:0;height:24px;padding:1px 4px;border:1px solid var(--line);border-radius:5px;font:11px monospace;text-align:center;background:#fff}
+.object-inspector__note{color:#94a3b8;font-size:10px;line-height:1.4}
+.object-inspector__error{color:#b91c1c;font-size:10px;line-height:1.4}
+.object-inspector__delete{align-self:flex-start;height:24px;padding:0 8px;border:1px solid #fecaca;border-radius:6px;background:#fff;color:#b91c1c;font-size:11px;cursor:pointer}
+.object-inspector__delete:hover:not(:disabled){background:#fef2f2}
+.object-inspector__delete:disabled{opacity:.45;cursor:not-allowed}
+
+/* 批量条挂在画布容器内（MapCanvas 的 slot）：固定贴在画布右上角，
+   不会再盖住顶部工具栏的「更多 / 保存路径 / 退出」。 */
+.box-batch-bar{position:absolute;z-index:110;top:10px;right:10px;left:auto;bottom:auto;transform:none;box-sizing:border-box;max-height:calc(100% - 20px);max-width:calc(100% - 20px);overflow-y:auto;overscroll-behavior:contain;display:flex;flex-direction:column;gap:5px;width:min(330px,100%);padding:8px 10px;background:#fff;border:1px solid #bfdbfe;border-radius:9px;box-shadow:0 6px 20px rgba(15,23,42,.16);font-size:11.5px}
+.box-batch-bar{pointer-events:none}
+.box-batch-bar button,.box-batch-bar input,.box-batch-bar select,.box-batch-bar label{pointer-events:auto}
+.box-batch-bar__head{display:flex;align-items:center;gap:6px}
+.box-batch-bar__head strong{color:#1d4ed8;font-size:12px}
+.box-batch-bar__head span{color:#64748b;font-size:10.5px}
+.box-batch-bar__close{margin-left:auto;border:0;background:none;color:#94a3b8;cursor:pointer;font-size:12px}
+.box-batch-bar__row{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.box-batch-bar__row label{display:flex;align-items:center;gap:4px;font-size:10px;color:#64748b}
+.box-batch-bar__row input{box-sizing:border-box;width:64px;height:24px;padding:1px 4px;border:1px solid var(--line);border-radius:5px;font:11px monospace;text-align:center}
+.box-batch-bar__row button{height:24px;padding:0 8px;border:1px solid var(--line);border-radius:6px;background:#fff;color:#334155;font-size:11px;cursor:pointer}
+.box-batch-bar__row button:hover:not(:disabled){background:#f1f5f9}
+.box-batch-bar__row button.is-danger{border-color:#fecaca;color:#b91c1c}
+.box-batch-bar__row button.is-danger:hover:not(:disabled){background:#fef2f2}
+.box-batch-bar__row button:disabled{opacity:.45;cursor:not-allowed}
+.box-batch-bar__note{color:#94a3b8;font-size:10px;line-height:1.4}
+.box-batch-bar__check{display:flex;align-items:center;gap:5px;font-size:11px;color:#475569}
+.re-tb__group-spec{display:inline-flex;align-items:center;gap:4px;padding:0 6px;margin-right:4px;border-right:1px solid var(--line);font-size:11px;color:#475569}
+.re-tb__group-spec select{height:26px;width:46px;padding:0 2px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;font-size:11px}
+.re-tb__spec-menu{display:flex;flex-direction:column;gap:6px;padding:8px;min-width:210px}
+.re-tb__spec-row{display:flex;align-items:center;gap:8px}
+.re-tb__spec-row label{display:inline-flex;align-items:center;gap:4px;font-size:11px;color:#475569}
+.re-tb__spec-apply{height:28px;padding:0 8px;border:1px solid #bfdbfe;border-radius:6px;background:#eff6ff;color:#1d4ed8;font-size:11px}
+.re-tb__spec-all{display:inline-flex;align-items:center;gap:3px;white-space:nowrap}
+.re-tb__spec-apply{height:26px;padding:0 8px;border:1px solid #bfdbfe;border-radius:6px;background:#eff6ff;color:#1d4ed8;font-size:11px;white-space:nowrap}
+.re-tb__spec-apply:disabled{opacity:.45;cursor:not-allowed}
+/* 批量条里的子卡（两点距离 / 相邻间距 / 拖入实例）：都挂在同一个弹层里，
+   这样 1024×768 下不会有两块浮层互相压住，滚动也只滚这一块。 */
+.box-batch-bar__card{display:flex;flex-direction:column;gap:4px;padding:6px 7px;border:1px solid #dbeafe;border-radius:7px;background:#f8fbff}
+.box-batch-bar__card-head{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 8px}
+.box-batch-bar__card-head strong{font:11.5px monospace;color:#1d4ed8}
+.box-batch-bar__card-head span{color:#64748b;font-size:10px;line-height:1.35}
+.box-batch-bar__facts{display:flex;flex-wrap:wrap;gap:3px 10px;color:#475569;font-size:10px;line-height:1.4}
+.box-batch-bar__facts b{font:10.5px monospace;color:#0f172a;font-weight:600}
+.box-batch-bar__error{color:#b91c1c;font-size:10px;line-height:1.4}
+
+.object-inspector__group{display:flex;flex-direction:column;gap:4px;padding-top:6px;border-top:1px solid var(--line)}
+.object-inspector__row-actions{display:flex;gap:5px}
+.object-inspector__row-actions button{height:24px;padding:0 8px;border:1px solid var(--line);border-radius:6px;background:#fff;color:#334155;font-size:11px;cursor:pointer}
+.object-inspector__row-actions button:hover:not(:disabled){background:#f1f5f9}
+.object-inspector__row-actions button:disabled{opacity:.45;cursor:not-allowed}
+
+@media(max-width:760px){
+ .object-inspector{position:static;margin:8px 0;max-height:none;width:auto}
+ .box-batch-bar{position:absolute;top:8px;left:8px;right:8px;bottom:auto;width:auto;max-width:none;max-height:calc(100% - 16px);overflow-y:auto}
+}
+.object-inspector__meta{display:flex;gap:8px;color:#94a3b8;font-size:10.5px}
 </style>

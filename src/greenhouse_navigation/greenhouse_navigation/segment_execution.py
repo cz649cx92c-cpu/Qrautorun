@@ -1087,16 +1087,41 @@ class SegmentExecutor:
             limit=float(m.config.get('dr_steer_distance_m',self.dr_correction_travel()))
             timeout=float(m.config.get('dr_steer_timeout_s',6.0))
             if ep['distance']>limit:
-                ep['blocked']=True
-                self.steer_episode_end(state,'distance')
+                # 4T4D forward 连续纠偏：走完一段只是换段重新计距离，不再永久 blocked。
+                if s.get('mode')=='4t4d' and s.get('direction')=='forward':
+                    ep['distance']=0.
+                    ep['startedMono']=time.monotonic()
+                    ep['convergedSamples']=0
+                    self.steer_episode_end(state,'distance_rearm',clear_ref=False)
+                else:
+                    ep['blocked']=True
+                    self.steer_episode_end(state,'distance')
             elif time.monotonic()-float(ep.get('startedMono') or time.monotonic())>timeout:
                 ep['blocked']=True
                 self.steer_episode_end(state,'timeout')
-        budget=(int(ep.get('attempts',0))<self.dr_correction_limit()
-                and not ep.get('blocked')
-                and (not ep.get('active') or ep.get('reason')=='init'))
-        if (s.get('mode')=='4t4d' and s.get('direction')=='forward'
-                and abs(dr_cross)>=trigger and budget and remaining>=self.dr_min_remaining()
+        # 4T4D forward：偏差一旦超出控制目标就持续纠偏，不消耗有限 episode 预算。
+        # 旧逻辑用 dr_correction_limit(2) + dr_steer_distance_m 卡预算，走完即 blocked，
+        # 于是剩余偏差会跨码累积（实测 -0.7 → -1.1 → -2.2 cm）而不再纠正。
+        continuous=(s.get('mode')=='4t4d' and s.get('direction')=='forward')
+        if continuous:
+            # 连续模式：只要超过控制目标就纠，episode 仅用于距离/超时诊断。
+            want=abs(dr_cross)>self.dr_target()
+            if ep.get('blocked') and abs(dr_cross)>self.dr_target():
+                # 旧的预算用尽不应永久封死纠偏；重新开一段并保留硬限与失联门禁。
+                ep['blocked']=False
+                ep['attempts']=0
+                ep['distance']=0.
+                ep['convergedSamples']=0
+                self.steer_episode_end(state,'rearm',clear_ref=False)
+        else:
+            budget=(int(ep.get('attempts',0))<self.dr_correction_limit()
+                    and not ep.get('blocked')
+                    and (not ep.get('active') or ep.get('reason')=='init'))
+            want=abs(dr_cross)>=trigger and budget
+        # 4T4D forward 连续纠偏不再要求剩余距离 >=0.15 m：临近终点仍有误差也要纠，
+        # 否则最后 15 cm 的横向偏差会原样带进终点（实测终点 -3.06 cm）。
+        enough_room=(continuous or remaining>=self.dr_min_remaining())
+        if (want and enough_room
                 and stale_s>=self.dr_min_stale_s() and not state.get('needs_anchor')
                 and state.get('yawSourceOk',True)):
             self.steer_episode_begin(state,dr_cross)
@@ -1104,8 +1129,9 @@ class SegmentExecutor:
             state['steerBiasM']=round(dr_cross,4)
             state['steeringActive']=True
             self.exit_info.update({'status':'steering_4t4d','centeringUsed':False,
-                                   'steerCrossM':round(dr_cross,4)})
-            m.log(f"DR 4T4D 转向纠偏：预测横向 {dr_cross*100:+.1f} cm（QR 失联 {stale_s:.1f}s），保持 vy=0，仅左右行进转向")
+                                   'steerCrossM':round(dr_cross,4),
+                                   'steerContinuous':bool(continuous)})
+            m.log(f"DR 4T4D 转向纠偏：预测横向 {dr_cross*100:+.1f} cm（QR 失联 {stale_s:.1f}s，目标 {self.dr_target()*100:.1f} cm），保持 vy=0，仅左右行进转向")
             return pose_cross,None
         return pose_cross,None
 

@@ -21,9 +21,21 @@ def validate_boards(boards):
         if not isinstance(board,dict):raise ValueError('多码布局必须包含对象')
         n = board.get('gridSize')
         size_mm, gap_mm = board.get('sizeMm'), board.get('gapMm')
-        if type(n) is not int or not 1 <= n <= 6 or not _finite(size_mm) or not 20 <= size_mm <= 180:
+        rows = board.get('rows', n)
+        cols = board.get('cols', n)
+        width_mm = board.get('widthMm', size_mm)
+        height_mm = board.get('heightMm', size_mm)
+        if type(n) is not int or not 1 <= n <= 6 or not _finite(size_mm) or not 20 <= size_mm <= 500:
             raise ValueError('多码组规格或整组尺寸错误')
-        if not _finite(gap_mm) or gap_mm != 2 or size_mm <= (n - 1) * gap_mm:
+        if type(rows) is not int or type(cols) is not int or not 1 <= rows <= 6 or not 1 <= cols <= 6 or rows * cols > 36:
+            raise ValueError('多码组行列数错误')
+        if max(rows, cols) != n:
+            raise ValueError('多码组 gridSize 必须等于行列数的较大值')
+        if not _finite(width_mm) or not _finite(height_mm) or not 20 <= width_mm <= 500 or not 20 <= height_mm <= 500:
+            raise ValueError('多码组整组宽/高错误')
+        if abs(size_mm - max(width_mm, height_mm)) > 1e-9:
+            raise ValueError('多码组整组尺寸必须等于整组宽/高的较大值')
+        if not _finite(gap_mm) or gap_mm != 2 or width_mm <= (cols - 1) * gap_mm or height_mm <= (rows - 1) * gap_mm:
             raise ValueError('多码组间隔错误')
         reference_id=board.get('referenceId')
         if type(reference_id) is not int or not 0<=reference_id<=586:
@@ -32,21 +44,24 @@ def validate_boards(boards):
             raise ValueError('多码组编号重复或缺失')
         names.add(board['id'])
         members = board.get('members')
-        if not isinstance(members, list) or len(members) != n * n:
+        if not isinstance(members, list) or len(members) != rows * cols:
             raise ValueError('多码组成员数量错误')
-        tile = (size_mm - (n - 1) * gap_mm) / n / 1000
+        # 正方形/矩形同一套公式：tileW/tileH 各自按列/行计算，单码取较小边的二维码。
+        tile_w = (width_mm - (cols - 1) * gap_mm) / cols
+        tile_h = (height_mm - (rows - 1) * gap_mm) / rows
+        tile = min(tile_w, tile_h)
         for index, member in enumerate(members):
             if not isinstance(member,dict):raise ValueError('子码几何必须为对象')
             marker_id = member.get('id')
             if type(marker_id) is not int or not 0 <= marker_id <= 586 or marker_id in ids or marker_id!=reference_id+index:
                 raise ValueError('子码 ID 必须全局唯一且在 tag36h11 范围内')
             ids.add(marker_id)
-            if not all(_finite(member.get(k)) for k in ('x', 'y', 'angle', 'size')) or not .01<=member['size']<=.15 or member['angle']!=0:
+            if not all(_finite(member.get(k)) for k in ('x', 'y', 'angle', 'size')) or not .01<=member['size']<=.4 or member['angle']!=0:
                 raise ValueError('子码几何必须有限且尺寸为正')
-            col, row = index % n, index // n
-            expected_x = (col - (n - 1) / 2) * (tile + gap_mm / 1000)
-            expected_y = ((n - 1) / 2 - row) * (tile + gap_mm / 1000)
-            if abs(member['size'] - tile / 1.25) > 1e-7 or abs(member['x'] - expected_x) > 1e-7 or abs(member['y'] - expected_y) > 1e-7:
+            col, row = index % cols, index // cols
+            expected_x = (-width_mm / 2 + tile_w / 2 + col * (tile_w + gap_mm)) / 1000
+            expected_y = (height_mm / 2 - tile_h / 2 - row * (tile_h + gap_mm)) / 1000
+            if abs(member['size'] - tile / 1.25 / 1000) > 1e-7 or abs(member['x'] - expected_x) > 1e-7 or abs(member['y'] - expected_y) > 1e-7:
                 raise ValueError('子码尺寸/位置与整组打印规格不一致')
         if type(board.get('referenceId')) is not int or board['referenceId'] != members[0]['id']:
             raise ValueError('逻辑 ID 必须为已注册首个子码 ID')
@@ -126,8 +141,18 @@ def collapse_group_observations(tags, boards, position_tolerance=.04, angle_tole
 
 
 def same_board_layout(a,b):
-    """比较打印几何，无视额外存储元数据；严格禁止错误布局共用逻辑 ID。"""
+    """比较打印几何，无视额外存储元数据；严格禁止错误布局共用逻辑 ID。
+
+    旧方形数据只有 gridSize/sizeMm，新数据会显式写 rows/cols/widthMm/heightMm；
+    比较必须用「有效值」，否则同一块方形板会被当成两种布局。
+    """
+    def effective(board):
+        n=board.get('gridSize')
+        size=board.get('sizeMm')
+        return (board.get('rows',n),board.get('cols',n),
+                board.get('widthMm',size),board.get('heightMm',size))
     if any(a.get(k)!=b.get(k) for k in ('id','referenceId','gridSize')):return False
+    if effective(a)!=effective(b):return False
     if any(abs(a[k]-b[k])>1e-9 for k in ('sizeMm','gapMm')):return False
     return len(a['members'])==len(b['members']) and all(
         x['id']==y['id'] and all(abs(x[k]-y[k])<=1e-9 for k in ('x','y','angle','size'))

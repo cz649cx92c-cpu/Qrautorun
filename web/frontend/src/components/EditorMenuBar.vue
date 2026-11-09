@@ -67,6 +67,7 @@ const groups=computed<MenuGroup[]>(()=>{
       items:[
         {id:'file-new-map',label:'新建空白地图',icon:'FilePlus2'},
         {id:'file-open-map',label:'打开地图…',icon:'FolderOpen'},
+        {id:'route-open',label:'打开路径…',icon:'FolderOpen'},
         {separator:true,id:'sep-file-1',label:''},
         ...routeItems,
         {separator:true,id:'sep-file-2',label:''},
